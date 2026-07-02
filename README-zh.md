@@ -1,12 +1,8 @@
-# Tokenscope
+# Tokenscope Remix
 
 [English](README.md) · **中文**
 
-<a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
-
 **macOS 菜单栏 / Windows 系统托盘工具**，统一展示本机 **AI 编码 Agent**（Claude Code **与 Codex CLI**）的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**——所有 Agent 一个仪表盘。
-
-> 本项目是 [HduSy/tokenscope](https://github.com/HduSy/tokenscope) 的 remix 版，扩展了多 Agent 支持（Codex 先行，更多 Agent 规划中——见 [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)）。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -168,3 +164,9 @@ src-tauri/src/
 
 开发过程中遇到的典型 bug（现象、根因、解决办法）汇总在
 [docs/BUGFIXES.md](docs/BUGFIXES.md)。
+
+## 致谢
+
+本项目源自 [@HduSy](https://github.com/HduSy) 的 [tokenscope](https://github.com/HduSy/tokenscope)——一个非常出色的 macOS 菜单栏 Claude CLI 用量仪表盘。本仓库继承的 Rust 数据摄取/聚合架构与面板设计均出自原作者之手，并沿用原项目的 MIT 协议，在此致以诚挚感谢！🙏
+
+Tokenscope Remix 在其基础上扩展为多 Agent 仪表盘（Codex 已支持，更多 Agent 规划中——见 [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)），并独立维护：问题与需求请在本仓库提交，不要打扰上游。
