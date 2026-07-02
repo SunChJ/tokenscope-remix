@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
+import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   Dashboard, PeriodReport, ModelStat, Scope, Quota, Theme, TH,
   fetchDashboard, fmtInt, fmtTokens, pct, themeForScope,
@@ -127,6 +129,107 @@ function SplitLegend({ t, inputM, outputM, cachedPct }:
       <span><span style={{ color: t.accent }}>●</span> {compact ? "In" : "Input"} {inputM.toFixed(2)}M</span>
       <span><span style={{ color: t.accentSoft }}>●</span> {compact ? "Out" : "Output"} {outputM.toFixed(2)}M</span>
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
+    </div>
+  );
+}
+
+// ── In-app updates ──────────────────────────────────────────────
+// Poll the GitHub release feed (plugin-updater endpoint) on launch and every
+// 6h; surface a slim banner when a newer signed build exists. Download +
+// install happen in-app, then a relaunch finishes the update. A dismissed
+// version stays hidden until the *next* version appears (localStorage).
+type UpdateState =
+  | { phase: "idle" }
+  | { phase: "available"; update: Update }
+  | { phase: "downloading"; version: string; pct: number }
+  | { phase: "ready"; version: string }
+  | { phase: "error"; version: string };
+
+function useUpdater(): [UpdateState, () => void, () => void] {
+  const [st, setSt] = useState<UpdateState>({ phase: "idle" });
+  const updRef = useRef<Update | null>(null);
+  useEffect(() => {
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!inTauri) return;
+    let dead = false;
+    const probe = async () => {
+      try {
+        const u = await checkUpdate();
+        if (dead || !u) return;
+        if (localStorage.getItem("tokenscope-skip-update") === u.version) return;
+        updRef.current = u;
+        setSt({ phase: "available", update: u });
+      } catch {
+        // offline / rate-limited / no latest.json yet — stay quiet, retry later
+      }
+    };
+    probe();
+    const t = window.setInterval(probe, 6 * 60 * 60 * 1000);
+    return () => { dead = true; window.clearInterval(t); };
+  }, []);
+  const install = async () => {
+    const u = updRef.current;
+    if (!u) return;
+    setSt({ phase: "downloading", version: u.version, pct: 0 });
+    try {
+      let total = 0, got = 0;
+      await u.downloadAndInstall((e) => {
+        if (e.event === "Started") total = e.data.contentLength ?? 0;
+        else if (e.event === "Progress") {
+          got += e.data.chunkLength;
+          if (total > 0) setSt({ phase: "downloading", version: u.version, pct: Math.min(99, Math.round((got / total) * 100)) });
+        } else if (e.event === "Finished") setSt({ phase: "ready", version: u.version });
+      });
+      setSt({ phase: "ready", version: u.version });
+    } catch {
+      setSt({ phase: "error", version: u.version });
+    }
+  };
+  const dismiss = () => {
+    const u = updRef.current;
+    if (u) try { localStorage.setItem("tokenscope-skip-update", u.version); } catch {}
+    setSt({ phase: "idle" });
+  };
+  return [st, install, dismiss];
+}
+
+function UpdateBanner({ st, theme, onInstall, onDismiss }:
+  { st: UpdateState; theme: Theme; onInstall: () => void; onDismiss: () => void }) {
+  const t = theme;
+  if (st.phase === "idle") return null;
+  const Btn = ({ label, onClick }: { label: string; onClick: () => void }) => (
+    <button onClick={onClick} style={{
+      font: `600 10px ${t.ui}`, color: "#fff", background: t.accent, border: "none",
+      borderRadius: 6, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap",
+    }}>{label}</button>
+  );
+  return (
+    <div data-no-drag="" style={{
+      display: "flex", alignItems: "center", gap: 8, marginBottom: 12,
+      padding: "7px 10px", borderRadius: 8,
+      background: `color-mix(in srgb, ${t.accent} 10%, transparent)`,
+      border: `1px solid color-mix(in srgb, ${t.accent} 25%, transparent)`,
+      font: `500 10.5px ${t.mono}`, color: t.text,
+    }}>
+      {st.phase === "available" && <>
+        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ color: t.accent, fontWeight: 600 }}>v{st.update.version}</span> is available
+        </span>
+        <Btn label="Update" onClick={onInstall} />
+        <span onClick={onDismiss} title="Skip this version" style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+      </>}
+      {st.phase === "downloading" && <>
+        <span style={{ flex: 1 }}>Downloading v{st.version}…</span>
+        <span style={{ color: t.accent, fontWeight: 600 }}>{st.pct}%</span>
+      </>}
+      {st.phase === "ready" && <>
+        <span style={{ flex: 1 }}>v{st.version} installed</span>
+        <Btn label="Restart" onClick={() => relaunch().catch(() => {})} />
+      </>}
+      {st.phase === "error" && <>
+        <span style={{ flex: 1, color: "#e0795f" }}>Update failed — try again later</span>
+        <span onClick={onDismiss} style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+      </>}
     </div>
   );
 }
@@ -282,6 +385,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const scope = scopes.find((s) => s.id === scopeId) ?? scopes[0];
   // Filtering to one agent re-tints the whole panel with its accent.
   const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
+  // In-app update lifecycle (idle → available → downloading → ready).
+  const [updSt, updInstall, updDismiss] = useUpdater();
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
   // NSPanel and is gated out). A real OS window-drag begins only once the
   // pointer moves past a small threshold, so a plain click still clicks through
@@ -411,6 +516,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         </div>
         {/* scrolling body */}
         <div style={{ padding: "14px 15px 15px" }}>
+        {/* in-app update prompt */}
+        <UpdateBanner st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
         {/* agent filter — only when several sources have data */}
         {scopes.length > 1 && (
           <AgentChips scopes={scopes} value={scope.id} theme={t} onSelect={setScopeId} />
