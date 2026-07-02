@@ -34,19 +34,25 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn update_tray_label(app: &tauri::AppHandle, label: String) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = handle.tray_by_id("main") {
+            // macOS shows the label next to the menu-bar icon (set_title).
+            // Windows' taskbar tray has no equivalent, so mirror it into the
+            // tooltip there. Both APIs touch native tray state; on macOS that
+            // must happen on the main thread.
+            let _ = tray.set_title(Some(label.clone()));
+            let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
+        }
+    });
+}
+
 /// Rebuild the dashboard (incremental), update the tray's token count, and push
 /// the fresh data to the UI so an open popover updates live.
 fn refresh(app: &tauri::AppHandle) {
     let dash = parser::build_dashboard();
-    if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
-        // macOS shows the label next to the menu-bar icon (set_title). Windows'
-        // taskbar tray has no equivalent — set_title is a no-op there — so we
-        // surface the same number through the hover tooltip instead, the only
-        // text channel Shell_NotifyIcon exposes for a tray icon.
-        let _ = tray.set_title(Some(label.clone()));
-        let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
-    }
+    update_tray_label(app, fmt_tokens_m(dash.today_tokens));
     check_milestones(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
 }
@@ -645,13 +651,27 @@ fn watch_system_theme(app: &tauri::AppHandle) {
 /// Show the panel as a popover anchored under the tray icon, and focus it.
 /// Always reset the scroll to the top so it doesn't reopen mid-scroll.
 fn show_popover(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_popover_inner(&handle));
+}
+
+fn show_popover_inner(app: &tauri::AppHandle) {
     // On macOS the window is an NSPanel — position it manually, then show()
     // (makes it key and orders it front, incl. over fullscreen Spaces).
     #[cfg(target_os = "macos")]
     {
         position_panel(app);
-        if let Ok(panel) = app.get_webview_panel("main") {
-            panel.show();
+        match app.get_webview_panel("main") {
+            Ok(panel) => panel.show(),
+            Err(_) => {
+                // If the panel state is ever unavailable (for example after a
+                // plugin/setup ordering regression), still surface the window
+                // instead of making a tray click look like a no-op.
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -681,13 +701,7 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // Sync the tray count to this freshly-fetched value. The panel refetches the
     // instant it opens, while the tray otherwise only refreshes every 30s — so
     // without this the two could disagree for up to 30s during heavy usage.
-    if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
-        let _ = tray.set_title(Some(label.clone()));
-        // Mirror refresh(): keep the tooltip in sync for Windows, where the
-        // title isn't shown next to the icon.
-        let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
-    }
+    update_tray_label(&app, fmt_tokens_m(dash.today_tokens));
     check_milestones(&app, &dash);
     dash
 }

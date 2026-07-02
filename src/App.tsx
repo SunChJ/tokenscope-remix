@@ -681,6 +681,10 @@ export default function App() {
     // failure must not pin the error page for the whole session — the next
     // successful fetch (focus refetch or the 30s background push) recovers it.
     const apply = (d: Dashboard) => {
+      if (!d.scopes?.length) {
+        setErr("dashboard returned no scopes");
+        return;
+      }
       setDash(d);
       setErr(null);
     };
@@ -762,6 +766,9 @@ export default function App() {
           font: `500 12px ${t.mono}`, color: t.dim }}>Loading…</div>
       </div>
     );
+  }
+  if (!dash.scopes.length) {
+    return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>Failed to load: dashboard returned no scopes</div>;
   }
   return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme} openGen={openGen} active={focused} />;
 }
