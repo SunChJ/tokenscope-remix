@@ -1,12 +1,8 @@
-# Tokenscope
+# Tokenscope Remix
 
 **English** · [中文](README-zh.md)
 
-<a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
-
 A **menu-bar / system-tray app for macOS and Windows** that shows your **local AI coding agents'** (Claude Code **and Codex CLI**) **daily token usage, estimated cost, and per-model / MCP / Skill call breakdown** — one unified dashboard for every agent on your machine.
-
-> This is a remix of [HduSy/tokenscope](https://github.com/HduSy/tokenscope), extended with multi-agent support (Codex first; more agents planned — see [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)).
 
 Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
@@ -169,3 +165,9 @@ src-tauri/src/
 
 Notable bugs found during development — symptom, root cause, and fix — are
 collected in [docs/BUGFIXES.md](docs/BUGFIXES.md).
+
+## Acknowledgements
+
+This project started as a remix of [tokenscope](https://github.com/HduSy/tokenscope) by [@HduSy](https://github.com/HduSy) — a beautifully built macOS menu-bar dashboard for Claude CLI usage. The clean Rust ingest/aggregation architecture and the panel design this project inherits are his work, and this repo remains under the original MIT license. Huge thanks! 🙏
+
+Tokenscope Remix extends it into a multi-agent dashboard (Codex today, more planned — see [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)) and is maintained independently: please file issues and feature requests here, not upstream.
