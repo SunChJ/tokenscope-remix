@@ -193,10 +193,39 @@ function useUpdater(): [UpdateState, () => void, () => void] {
   return [st, install, dismiss];
 }
 
+function releaseNotesSummary(body?: string) {
+  if (!body) return null;
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) =>
+      line
+        .replace(/^[-*]\s+/, "")
+        .replace(/\*\*/g, "")
+        .replace(/`/g, "")
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+        .replace(/\s+by @\S+.*$/, "")
+        .trim()
+    )
+    .filter((line) =>
+      line &&
+      !line.startsWith("#") &&
+      !/^install$/i.test(line) &&
+      !/^what'?s changed$/i.test(line) &&
+      !/^full changelog/i.test(line) &&
+      !line.startsWith("Menu-bar / system-tray")
+    );
+  if (!lines.length) return null;
+  const text = lines.slice(0, 2).join("; ");
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
 function UpdateBanner({ st, theme, onInstall, onDismiss }:
   { st: UpdateState; theme: Theme; onInstall: () => void; onDismiss: () => void }) {
   const t = theme;
   if (st.phase === "idle") return null;
+  const notes = st.phase === "available" ? releaseNotesSummary(st.update.body) : null;
   const Btn = ({ label, onClick }: { label: string; onClick: () => void }) => (
     <button onClick={onClick} style={{
       font: `600 10px ${t.ui}`, color: "#fff", background: t.accent, border: "none",
@@ -205,30 +234,46 @@ function UpdateBanner({ st, theme, onInstall, onDismiss }:
   );
   return (
     <div data-no-drag="" style={{
-      display: "flex", alignItems: "center", gap: 8, marginBottom: 12,
+      display: "flex", flexDirection: "column", gap: 5, marginBottom: 12,
       padding: "7px 10px", borderRadius: 8,
       background: `color-mix(in srgb, ${t.accent} 10%, transparent)`,
       border: `1px solid color-mix(in srgb, ${t.accent} 25%, transparent)`,
       font: `500 10.5px ${t.mono}`, color: t.text,
     }}>
       {st.phase === "available" && <>
-        <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          <span style={{ color: t.accent, fontWeight: 600 }}>v{st.update.version}</span> is available
-        </span>
-        <Btn label="Update" onClick={onInstall} />
-        <span onClick={onDismiss} title="Skip this version" style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ color: t.accent, fontWeight: 600 }}>v{st.update.version}</span> is available
+          </span>
+          <Btn label="Update" onClick={onInstall} />
+          <span onClick={onDismiss} title="Skip this version" style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+        </div>
+        {notes && (
+          <div title={st.update.body} style={{
+            color: t.dim, font: `500 9.5px/1.35 ${t.ui}`,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>
+            What's changed: {notes}
+          </div>
+        )}
       </>}
       {st.phase === "downloading" && <>
-        <span style={{ flex: 1 }}>Downloading v{st.version}…</span>
-        <span style={{ color: t.accent, fontWeight: 600 }}>{st.pct}%</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ flex: 1 }}>Downloading v{st.version}…</span>
+          <span style={{ color: t.accent, fontWeight: 600 }}>{st.pct}%</span>
+        </div>
       </>}
       {st.phase === "ready" && <>
-        <span style={{ flex: 1 }}>v{st.version} installed</span>
-        <Btn label="Restart" onClick={() => relaunch().catch(() => {})} />
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ flex: 1 }}>v{st.version} installed</span>
+          <Btn label="Restart" onClick={() => relaunch().catch(() => {})} />
+        </div>
       </>}
       {st.phase === "error" && <>
-        <span style={{ flex: 1, color: "#e0795f" }}>Update failed — try again later</span>
-        <span onClick={onDismiss} style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ flex: 1, color: "#e0795f" }}>Update failed — try again later</span>
+          <span onClick={onDismiss} style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
+        </div>
       </>}
     </div>
   );

@@ -55,6 +55,38 @@ jobs:
       - name: Install frontend deps
         run: pnpm install
 
+      - name: Prepare release notes
+        id: release_notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gen=$(gh api --method POST \
+            "repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.ref_name }}" --jq '.body' || true)
+
+          {
+            cat <<'BODY'
+          Menu-bar / system-tray dashboard for local AI coding agent token usage (Claude Code + Codex).
+
+          ## Install
+
+          **macOS**: download `Tokenscope_*_universal.dmg` (Apple Silicon + Intel). Unsigned — right-click → **Open** on first launch, or install via `brew install --cask sunchj/tokenscope/tokenscope`.
+
+          **Windows**: download `Tokenscope_*_x64-setup.exe`. Unsigned — on first launch click **More info → Run anyway** to dismiss SmartScreen.
+          BODY
+            if [ -n "$gen" ]; then
+              printf '\n%s\n' "$gen"
+            else
+              printf '\n## What changed\n\n- Changes included since the previous release.\n'
+            fi
+          } > release-body.md
+
+          {
+            echo "body<<RELEASE_BODY"
+            cat release-body.md
+            echo "RELEASE_BODY"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -85,37 +117,13 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Tokenscope ${{ github.ref_name }}"
-          releaseBody: |
-            Menu-bar / system-tray dashboard for local AI coding agent token usage (Claude Code + Codex).
-
-            **macOS**: download `Tokenscope_*_universal.dmg` (Apple Silicon + Intel). Unsigned — right-click → **Open** on first launch, or install via `brew install --cask sunchj/tokenscope/tokenscope`.
-
-            **Windows**: download `Tokenscope_*_x64-setup.exe`. Unsigned — on first launch click **More info → Run anyway** to dismiss SmartScreen.
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           # Publish immediately (not a draft): the asset's public download URL
           # must be live for the Homebrew Cask step below to fetch it and for
           # `brew install` to work.
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
-
-      # Append an auto-generated changelog (PRs/commits since the previous tag)
-      # to the release notes. Best-effort: never fail the release over notes.
-      # Only run once (on the macOS leg) — both jobs publish to the same release.
-      - name: Add changelog to release
-        if: matrix.os == 'macos-latest'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gen=$(gh api --method POST \
-            "repos/${{ github.repository }}/releases/generate-notes" \
-            -f tag_name="${{ github.ref_name }}" --jq '.body' || true)
-          cur=$(gh release view "${{ github.ref_name }}" --json body --jq '.body' || true)
-          {
-            printf '%s\n' "$cur"
-            if [ -n "$gen" ]; then printf '\n%s\n' "$gen"; fi
-          } > release-body.md
-          gh release edit "${{ github.ref_name }}" --notes-file release-body.md
 
       - name: Update Homebrew Cask
         if: matrix.os == 'macos-latest'
