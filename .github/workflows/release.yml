@@ -80,9 +80,9 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Tokenscope ${{ github.ref_name }}"
           releaseBody: |
-            Menu-bar / system-tray dashboard for Claude CLI token usage.
+            Menu-bar / system-tray dashboard for local AI coding agent token usage (Claude Code + Codex).
 
-            **macOS**: download `Tokenscope_*_universal.dmg` (Apple Silicon + Intel). Unsigned — right-click → **Open** on first launch, or install via `brew install --cask hdusy/tokenscope/tokenscope`.
+            **macOS**: download `Tokenscope_*_universal.dmg` (Apple Silicon + Intel). Unsigned — right-click → **Open** on first launch, or install via `brew install --cask sunchj/tokenscope/tokenscope`.
 
             **Windows**: download `Tokenscope_*_x64-setup.exe`. Unsigned — on first launch click **More info → Run anyway** to dismiss SmartScreen.
           # Publish immediately (not a draft): the asset's public download URL
@@ -116,9 +116,15 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
+          # No tap token configured → skip quietly (the release itself is done;
+          # the cask can be bumped by hand — see the tap repo's README).
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set; skipping tap update."
+            exit 0
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           DMG_NAME="Tokenscope_${VERSION}_universal.dmg"
-          DOWNLOAD_URL="https://github.com/HduSy/tokenscope/releases/download/${GITHUB_REF_NAME}/${DMG_NAME}"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${DMG_NAME}"
 
           # Wait for the release asset to be available, then compute sha256.
           # -f makes curl fail (non-zero) on a 404 so we keep retrying instead
@@ -137,7 +143,7 @@ jobs:
           fi
 
           # Clone the tap repo and update the cask
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/HduSy/homebrew-tokenscope.git /tmp/homebrew-tap
+          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/SunChJ/homebrew-tokenscope.git /tmp/homebrew-tap
           cat > /tmp/homebrew-tap/Casks/tokenscope.rb <<CASK
           cask "tokenscope" do
             version "${VERSION}"
@@ -145,8 +151,8 @@ jobs:
 
             url "${DOWNLOAD_URL}"
             name "Tokenscope"
-            desc "macOS menu-bar dashboard for Claude CLI token usage"
-            homepage "https://github.com/HduSy/tokenscope"
+            desc "Menu-bar dashboard for local AI coding agent token usage (Claude Code, Codex)"
+            homepage "https://github.com/${{ github.repository }}"
 
             depends_on macos: :catalina
 

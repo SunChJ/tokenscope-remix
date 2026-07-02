@@ -4,7 +4,9 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-**macOS 菜单栏 / Windows 系统托盘工具**，展示 Claude CLI 的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**。
+**macOS 菜单栏 / Windows 系统托盘工具**，统一展示本机 **AI 编码 Agent**（Claude Code **与 Codex CLI**）的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**——所有 Agent 一个仪表盘。
+
+> 本项目是 [HduSy/tokenscope](https://github.com/HduSy/tokenscope) 的 remix 版，扩展了多 Agent 支持（Codex 先行，更多 Agent 规划中——见 [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)）。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -12,29 +14,34 @@
 
 ## 它做什么
 
-- 菜单栏图标旁显示当日 Token 数（如 `⬡ 14.00M`）
+- 菜单栏图标旁显示当日 Token 数（所有 Agent 合计，如 `⬡ 14.00M`）
 - 点击打开面板：Day / Week / Month 切换
+- **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿）；只装一个 Agent 则界面与经典版完全一致
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
+- **Codex 配额卡**：直接从 Codex 自己的日志读取 5 小时窗口与周窗口的已用百分比、plan、重置倒计时
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
-- **只统计用户自己安装的 MCP / Skill**，过滤所有 Claude 内置工具与 Anthropic 自带 MCP
+- **只统计用户自己安装的 MCP / Skill**，过滤所有内置工具与自带 MCP
 
 ## 数据来源（零侵入，只读）
 
 | 用途 | 路径 |
 |------|------|
-| 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
-| 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Claude 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
+| Codex 会话日志（Token / 模型 / 配额） | `~/.codex/sessions/**/*.jsonl`（支持 `CODEX_HOME`） |
+| Claude 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Codex 用户 MCP 白名单 | `~/.codex/config.toml` → `[mcp_servers.*]` |
 | 用户 Skill 白名单 | `~/.claude/skills/` 目录 |
-| 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+| 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
 
 ### 关键处理
-- 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
+- Claude：按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
+- Codex：取 `token_count` 事件的每回合增量（`last_token_usage`），模型归属来自前置的 `turn_context`；Codex 的 `cached_input_tokens` 是其 `input_tokens` 的**子集**，已拆分成与 Claude 一致的独立 cache-read 口径——跨 Agent 的 token 数可直接对比
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
 - 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**
 - 日志只有裸模型名、无厂商信息 → 第三方模型默认取官方厂商价（估算）
-- 工具分类：`mcp__<server>__*` 且 server 在用户配置中 → MCP；Skill 调用（`Skill` 工具的 `input.skill`，或 `/skill` 斜杠命令）且在 skills 目录中 → Skill；其余忽略
+- 工具分类：`mcp__<server>__*` 且 server 在**所属 Agent** 的配置中 → MCP；Skill 调用（`Skill` 工具的 `input.skill`，或 `/skill` 斜杠命令）且在 skills 目录中 → Skill（仅 Claude）；其余忽略
 
 > 花费为按公开价格的**估算**；订阅用户应理解为「等效消费价值」。
 
@@ -72,7 +79,7 @@ cost = input            × price.input
 ### 方式一：Homebrew（推荐）
 
 ```bash
-brew install --cask hdusy/tokenscope/tokenscope
+brew install --cask sunchj/tokenscope/tokenscope
 ```
 
 安装后会自动清除隔离属性（cask 的 `postflight` 已内置 `xattr -cr`），**首次直接打开即可，不会弹「Apple 无法验证」**。
@@ -87,7 +94,7 @@ brew update && brew upgrade --cask tokenscope
 
 ### 方式二：下载 .dmg
 
-1. 从 [Releases](https://github.com/HduSy/tokenscope/releases) 下载最新的 `Tokenscope_*_universal.dmg`（同时支持 Apple Silicon 与 Intel）
+1. 从 [Releases](https://github.com/SunChJ/tokenscope-remix/releases) 下载最新的 `Tokenscope_*_universal.dmg`（同时支持 Apple Silicon 与 Intel）
 2. 拖入「应用程序」
 3. 因为是**未签名 / 未公证**构建，首次打开会被 Gatekeeper 拦截，二选一：
    - 右键 App →「打开」→ 再次确认「打开」，或
@@ -100,7 +107,7 @@ brew update && brew upgrade --cask tokenscope
 
 ### 方式三：Windows 安装
 
-1. 从 [Releases](https://github.com/HduSy/tokenscope/releases) 下载最新的 `Tokenscope_*_x64-setup.exe`
+1. 从 [Releases](https://github.com/SunChJ/tokenscope-remix/releases) 下载最新的 `Tokenscope_*_x64-setup.exe`
 2. 双击安装。因为是**未签名**构建，首次运行会被 SmartScreen 拦截 —— 点 **"更多信息" → "仍要运行"** 即可
 3. 安装器按当前用户安装（无需管理员权限），并**自动注册开机自启**
 4. 系统要求：**Windows 10 1803 及以上 / Windows 11**，需要 WebView2 运行时（Win 11 预装；Win 10 用户若没装，安装器会引导补装）
@@ -143,10 +150,10 @@ src/                  React 前端
   charts.tsx          图表原语（柱状/甜甜圈/sparkline/热力图/分段控件）
   App.tsx             主面板
 src-tauri/src/
-  store.rs            JSONL 增量摄取（按 message.id 去重 + 多行合并）
-  parser.rs           聚合（Day/Week/Month + 热力图）
+  store.rs            多源 JSONL 增量摄取（Claude + Codex 适配器）
+  parser.rs           按 Scope 聚合（All / 单 Agent；Day/Week/Month + 热力图）
   pricing.rs          models.dev / LiteLLM 价格加载与计价
-  config.rs           用户 MCP / Skill 白名单
+  config.rs           用户 MCP / Skill 白名单（Claude + Codex）
   model.rs            返回给前端的数据结构
   lib.rs              Tauri 命令 + 菜单栏托盘
 ```

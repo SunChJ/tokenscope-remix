@@ -4,7 +4,9 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-A **menu-bar / system-tray app for macOS and Windows** that shows your Claude CLI **daily token usage, estimated cost, and per-model / MCP / Skill call breakdown**.
+A **menu-bar / system-tray app for macOS and Windows** that shows your **local AI coding agents'** (Claude Code **and Codex CLI**) **daily token usage, estimated cost, and per-model / MCP / Skill call breakdown** — one unified dashboard for every agent on your machine.
+
+> This is a remix of [HduSy/tokenscope](https://github.com/HduSy/tokenscope), extended with multi-agent support (Codex first; more agents planned — see [docs/DESIGN-multi-agent.md](docs/DESIGN-multi-agent.md)).
 
 Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
@@ -12,29 +14,34 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
 ## What it does
 
-- Shows today's token count next to the menu-bar icon (e.g. `⬡ 14.00M`)
+- Shows today's token count (all agents combined) next to the menu-bar icon (e.g. `⬡ 14.00M`)
 - Click to open the panel: Day / Week / Month toggle
+- **Multi-agent**: with more than one agent detected, filter chips (All / Claude / Codex) appear — the All view stacks usage **by agent**, and filtering to one agent re-tints the whole panel with its accent (Claude coral / Codex teal). With a single agent the classic UI is unchanged
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
+- **Codex quota card**: the 5-hour and weekly rate-limit windows (used %, plan, reset countdown) read straight from Codex's own logs
 - Cost donut (hover for a single model), year-long activity heatmap
-- **Counts only the MCP servers / Skills you installed yourself** — all Claude built-in tools and Anthropic's bundled MCP servers are filtered out
+- **Counts only the MCP servers / Skills you installed yourself** — all built-in tools and bundled MCP servers are filtered out
 
 ## Data sources (zero-intrusion, read-only)
 
 | Purpose | Path |
 |---------|------|
-| Session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
-| User MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Claude session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
+| Codex session logs (tokens / model / rate limits) | `~/.codex/sessions/**/*.jsonl` (honors `CODEX_HOME`) |
+| Claude user MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| Codex user MCP whitelist | `~/.codex/config.toml` → `[mcp_servers.*]` |
 | User Skill whitelist | `~/.claude/skills/` directory |
-| Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching Claude CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
+| Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching the CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 
 ### Key processing
-- Deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
+- Claude: deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
+- Codex: per-turn deltas from `token_count` events (`last_token_usage`), model attribution from the preceding `turn_context`; Codex's `cached_input_tokens` is a *subset* of its `input_tokens`, so it's split out to match Claude's separate cache-read accounting — token math is comparable across agents
 - Token split: `input` (uncached) / `cache` (creation+read) / `output`; the UI folds cache into "In" by default and shows a separate "cached %"
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins
 - Cost is priced per the four token types; each model carries a `priced` flag — **models not found in either source still count tokens but are labelled "no price" in the UI**
 - Logs contain only the bare model name (no vendor) → third-party models default to the official vendor price (an estimate)
-- Tool classification: `mcp__<server>__*` where the server is in your config → MCP; a Skill call (the `Skill` tool's `input.skill`, or a `/skill` slash command) whose name is in your skills directory → Skill; everything else is ignored
+- Tool classification: `mcp__<server>__*` where the server is in the owning agent's config → MCP; a Skill call (the `Skill` tool's `input.skill`, or a `/skill` slash command) whose name is in your skills directory → Skill (Claude only); everything else is ignored
 
 > Cost is an **estimate** based on public prices; subscription users should read it as "equivalent spend value".
 
@@ -72,7 +79,7 @@ So a cache hit is **not** billed as normal input — it uses the dedicated (chea
 ### Option 1: Homebrew (recommended)
 
 ```bash
-brew install --cask hdusy/tokenscope/tokenscope
+brew install --cask sunchj/tokenscope/tokenscope
 ```
 
 The cask's `postflight` strips the quarantine attribute (`xattr -cr`) automatically, so **it opens on first launch without the "Apple cannot verify" prompt**.
@@ -87,7 +94,7 @@ brew update && brew upgrade --cask tokenscope
 
 ### Option 2: Download the .dmg
 
-1. Download the latest `Tokenscope_*_universal.dmg` from [Releases](https://github.com/HduSy/tokenscope/releases) (works on both Apple Silicon and Intel)
+1. Download the latest `Tokenscope_*_universal.dmg` from [Releases](https://github.com/SunChJ/tokenscope-remix/releases) (works on both Apple Silicon and Intel)
 2. Drag it into Applications
 3. Because the build is **unsigned / unnotarized**, Gatekeeper blocks the first launch — pick one:
    - Right-click the app → **Open** → confirm **Open** again, or
@@ -100,7 +107,7 @@ brew update && brew upgrade --cask tokenscope
 
 ### Option 3: Install on Windows
 
-1. Download the latest `Tokenscope_*_x64-setup.exe` from [Releases](https://github.com/HduSy/tokenscope/releases)
+1. Download the latest `Tokenscope_*_x64-setup.exe` from [Releases](https://github.com/SunChJ/tokenscope-remix/releases)
 2. Double-click to install. Because the build is **unsigned**, Windows SmartScreen will warn on first run — click **More info → Run anyway**
 3. The app installs per-user (no admin required) and registers itself for **launch at login** automatically
 4. Requirements: **Windows 10 1803+ / Windows 11** with the WebView2 runtime (preinstalled on Windows 11; Windows 10 users without it will be prompted by the installer)
@@ -143,10 +150,10 @@ src/                  React frontend
   charts.tsx          chart primitives (bars / donut / sparkline / heatmap / segmented control)
   App.tsx             main panel
 src-tauri/src/
-  store.rs            incremental JSONL ingest (dedup by message.id + multi-line merge)
-  parser.rs           aggregation (Day/Week/Month + heatmap)
+  store.rs            incremental multi-source JSONL ingest (Claude + Codex adapters)
+  parser.rs           aggregation into scopes (All / per-agent; Day/Week/Month + heatmap)
   pricing.rs          models.dev / LiteLLM price loading and costing
-  config.rs           user MCP / Skill whitelist
+  config.rs           user MCP / Skill whitelists (Claude + Codex)
   model.rs            data structures returned to the frontend
   lib.rs              Tauri commands + menu-bar tray
 ```
