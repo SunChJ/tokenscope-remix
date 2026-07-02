@@ -4,8 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, PeriodReport, ModelStat, Theme, TH,
-  fetchDashboard, fmtInt, fmtTokens, pct,
+  Dashboard, PeriodReport, ModelStat, Scope, Quota, Theme, TH,
+  fetchDashboard, fmtInt, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
@@ -131,6 +131,91 @@ function SplitLegend({ t, inputM, outputM, cachedPct }:
   );
 }
 
+// Agent filter chips (All / Claude / Codex …). Rendered only when several
+// sources have data; a single-source install never sees them.
+function AgentChips({ scopes, value, theme, onSelect }:
+  { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void }) {
+  const t = theme;
+  return (
+    <div data-no-drag="" style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+      {scopes.map((s) => {
+        const on = s.id === value;
+        return (
+          <div key={s.id} onClick={() => onSelect(s.id)} style={{
+            display: "inline-flex", alignItems: "center", gap: 6,
+            font: `600 10.5px ${t.ui}`, letterSpacing: ".02em", padding: "4px 11px",
+            borderRadius: 20, cursor: "pointer", userSelect: "none",
+            color: on ? t.segOnText : t.segOffText,
+            background: on ? t.segOnBg : t.segBg,
+            border: `1px solid ${on ? t.segBorder : "transparent"}`,
+            boxShadow: on ? t.segOnShadow : "none", transition: "color .15s, background .15s",
+          }}>
+            {s.color && <span style={{ width: 7, height: 7, borderRadius: "50%", background: s.color, opacity: on ? 1 : 0.75 }} />}
+            {s.label}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Hero legend for the All scope: one entry per agent instead of Input/Output.
+function AgentLegend({ t, slices, cachedPct }:
+  { t: Theme; slices: { label: string; color: string; tokens: number }[]; cachedPct: number }) {
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 14,
+      font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
+    }}>
+      {slices.map((s) => (
+        <span key={s.label}><span style={{ color: s.color }}>●</span> {s.label} {fmtTokens(s.tokens)}</span>
+      ))}
+      <span style={{ color: t.faint }}>{cachedPct}% cached</span>
+    </div>
+  );
+}
+
+// Codex rate-limit card: the two rolling windows (5h + weekly) straight from
+// the session logs — data Claude doesn't expose. Bars turn amber near the cap.
+function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
+  const t = theme;
+  const now = Date.now();
+  const stale = now - q.asOfMs > 60 * 60 * 1000;
+  const winLabel = (min: number) =>
+    min === 10080 ? "Weekly" : min % 60 === 0 && min > 0 ? `${min / 60}h window` : `${min}m window`;
+  const resetsIn = (unixS: number) => {
+    const ms = unixS * 1000 - now;
+    if (ms <= 0) return "resetting…";
+    const h = Math.floor(ms / 3.6e6), m = Math.round((ms % 3.6e6) / 6e4);
+    if (h >= 48) return `resets in ${Math.round(h / 24)}d`;
+    return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
+  };
+  const asOf = new Date(q.asOfMs).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
+    const p = Math.max(0, Math.min(100, pctUsed));
+    const col = p >= 80 ? "#e0795f" : t.accent;
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "4px 0" }}>
+        <span style={{ font: `500 10.5px ${t.mono}`, color: t.text, flex: "0 0 84px" }}>{label}</span>
+        <div style={{ flex: 1, height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
+          <div style={{ width: `${p}%`, height: "100%", background: col, borderRadius: 3 }} />
+        </div>
+        <span style={{ font: `600 10.5px ${t.mono}`, color: p >= 80 ? col : t.text, flex: "0 0 34px", textAlign: "right" }}>{Math.round(p)}%</span>
+        <span style={{ font: `500 9px ${t.mono}`, color: t.faint, flex: "0 0 92px", textAlign: "right", whiteSpace: "nowrap" }}>{sub}</span>
+      </div>
+    );
+  };
+  return (
+    <div style={{ opacity: stale ? 0.65 : 1 }}>
+      <Bar label={winLabel(q.primaryMinutes)} pctUsed={q.primaryPct} sub={resetsIn(q.primaryResetsAt)} />
+      <Bar label={winLabel(q.secondaryMinutes)} pctUsed={q.secondaryPct} sub={resetsIn(q.secondaryResetsAt)} />
+      <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
+        {q.plan && <>Plan: {q.plan}</>}{stale && <span> · as of {asOf}</span>}
+      </div>
+    </div>
+  );
+}
+
 const SectionRule = ({ t, m = "12px 0 10px" }: { t: Theme; m?: string }) => (
   <div style={{ height: 1, background: t.gridLine, margin: m }} />
 );
@@ -190,7 +275,13 @@ function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolea
 }
 
 function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean }) {
-  const t = TH[dark ? "dark" : "light"];
+  // Agent scope filter. scopes[0] is always the aggregate; a stale selection
+  // (e.g. a source disappeared after a rescan) falls back to it.
+  const scopes = dash.scopes;
+  const [scopeId, setScopeId] = useState(scopes[0].id);
+  const scope = scopes.find((s) => s.id === scopeId) ?? scopes[0];
+  // Filtering to one agent re-tints the whole panel with its accent.
+  const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
   // NSPanel and is gated out). A real OS window-drag begins only once the
   // pointer moves past a small threshold, so a plain click still clicks through
@@ -198,11 +289,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
-  const P: PeriodReport = period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+  const P: PeriodReport = period === "Day" ? scope.day : period === "Month" ? scope.month : scope.week;
   const M = P.metrics;
-  // animated Total tokens: counts up from 0 on each open / period switch;
-  // held at 0 while the popover is hidden so it never flashes the final value.
-  const animTotal = useCountUp(M.totalTokens, `${period}:${openGen}`, active);
+  // Per-agent slices — non-empty only in the All scope with >=2 sources; they
+  // switch the hero bar + chart from Input/Output to a by-agent breakdown.
+  const slices = P.agents;
+  // animated Total tokens: counts up from 0 on each open / period / scope
+  // switch; held at 0 while the popover is hidden so it never flashes.
+  const animTotal = useCountUp(M.totalTokens, `${period}:${scope.id}:${openGen}`, active);
   const models = P.models;
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
@@ -317,6 +411,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         </div>
         {/* scrolling body */}
         <div style={{ padding: "14px 15px 15px" }}>
+        {/* agent filter — only when several sources have data */}
+        {scopes.length > 1 && (
+          <AgentChips scopes={scopes} value={scope.id} theme={t} onSelect={setScopeId} />
+        )}
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
           <div>
@@ -331,17 +429,25 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
           </div>
         </div>
-        {/* input(+cache) / output split — 2-colour; cache hits fold into input.
+        {/* hero split bar. All scope with several agents: one segment per agent
+            ("who is burning"); otherwise the classic input(+cache)/output split.
             When there's no usage the bar is just the empty track (no slivers). */}
         <div style={{ display: "flex", gap: 0, height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
-          {M.totalTokens > 0 && <>
+          {M.totalTokens > 0 && (slices.length > 0 ? (
+            slices.map((s) => (
+              <div key={s.id} style={{ flexGrow: Math.max(s.tokens, 1e-6), flexBasis: 0, minWidth: 4, background: s.color }} />
+            ))
+          ) : <>
             <div style={{ flexGrow: Math.max(M.inputTokens + M.cacheTokens, 1e-6), flexBasis: 0, minWidth: 4, background: t.accent }} />
             <div style={{ flexGrow: Math.max(M.outputTokens, 1e-6), flexBasis: 0, minWidth: 4, background: t.accentSoft }} />
-          </>}
+          </>)}
         </div>
-        <SplitLegend t={t} inputM={M.inputTokens + M.cacheTokens} outputM={M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
-        {/* bar chart */}
-        <BarChart data={P.series} theme={t} height={84} />
+        {slices.length > 0
+          ? <AgentLegend t={t} slices={slices} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
+          : <SplitLegend t={t} inputM={M.inputTokens + M.cacheTokens} outputM={M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />}
+        {/* bar chart — stacked by agent in the All scope, In/Out elsewhere */}
+        <BarChart data={P.series} theme={t} height={84}
+          segs={slices.length > 0 ? [...slices].reverse().map((s) => ({ color: s.color, values: s.values })) : undefined} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
@@ -351,7 +457,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         {/* cost donut */}
         <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
         {costModels.length > 0
-          ? <CostDonut models={costModels} theme={t} size={100} thickness={15} />
+          ? <CostDonut models={costModels} theme={t} size={100} thickness={15} keepColors={scopes.length > 1} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
@@ -369,6 +475,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
         </div>
+        {/* Codex quota — rate-limit windows read straight from the session logs */}
+        {scope.quota && (
+          <>
+            <SectionRule t={t} />
+            <div style={{ marginBottom: 4 }}><Label t={t}>Codex quota</Label></div>
+            <QuotaCard q={scope.quota} theme={t} />
+          </>
+        )}
         {/* MCP — shown whenever the user has installed MCP servers */}
         {M.servers > 0 && (
           <>
@@ -378,7 +492,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
               <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} servers</span>
             </div>
             {P.mcp.length > 0
-              ? <BarList key={period} items={P.mcp} theme={t} accent={t.accent} />
+              ? <BarList key={`${period}:${scope.id}`} items={P.mcp} theme={t} accent={t.accent} />
               : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No MCP calls in this period</div>}
           </>
         )}
@@ -391,14 +505,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
               <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} skills</span>
             </div>
             {P.skills.length > 0
-              ? <BarList key={period} items={P.skills} theme={t} accent={t.accent} />
+              ? <BarList key={`${period}:${scope.id}`} items={P.skills} theme={t} accent={t.accent} />
               : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No skill calls in this period</div>}
           </>
         )}
         {/* heatmap */}
         <SectionRule t={t} />
         <div style={{ marginBottom: 9 }}><Label t={t}>Daily activity</Label></div>
-        <Heatmap days={dash.heatmap} theme={t} accent={t.accent} />
+        <Heatmap days={scope.heatmap} theme={t} accent={t.accent} />
         {/* footer note */}
         <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
           Est. cost via models.dev / LiteLLM · estimate

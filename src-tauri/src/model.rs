@@ -18,6 +18,9 @@ pub struct ModelStat {
     pub cost: f64,   // USD estimate
     pub color: String,
     pub priced: bool, // false = no pricing data in LiteLLM (cost is unknown, not $0)
+    // Owning agent id ("claude" / "codex"). In the All scope the same model name
+    // can appear once per agent (e.g. gpt-5 via a router AND via Codex).
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +54,17 @@ pub struct Metrics {
     pub skills: u64,
 }
 
+/// Per-agent share of a period, used only by the All scope: `tokens` drives the
+/// hero split bar, `values` (aligned with `series`) drives the stacked chart.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentSlice {
+    pub id: String,    // "claude" | "codex"
+    pub label: String, // "Claude" | "Codex"
+    pub color: String, // base hex, same across charts
+    pub tokens: f64,   // M tokens in the period
+    pub values: Vec<f64>, // M tokens per series bucket
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PeriodReport {
     pub metrics: Metrics,
@@ -62,6 +76,8 @@ pub struct PeriodReport {
     pub req_trend: Vec<f64>,
     #[serde(rename = "costTrend")]
     pub cost_trend: Vec<f64>,
+    // Non-empty only in the All scope when >=2 agents have data.
+    pub agents: Vec<AgentSlice>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,14 +87,48 @@ pub struct HeatDay {
     pub level: u8,    // 0..4
 }
 
+/// Codex rate-limit snapshot, straight from the newest token_count event's
+/// rate_limits. `as_of_ms` lets the UI flag a stale reading.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct Quota {
+    pub plan: String,
+    #[serde(rename = "primaryPct")]
+    pub primary_pct: f64,
+    #[serde(rename = "primaryMinutes")]
+    pub primary_minutes: u64,
+    #[serde(rename = "primaryResetsAt")]
+    pub primary_resets_at: i64, // unix seconds
+    #[serde(rename = "secondaryPct")]
+    pub secondary_pct: f64,
+    #[serde(rename = "secondaryMinutes")]
+    pub secondary_minutes: u64,
+    #[serde(rename = "secondaryResetsAt")]
+    pub secondary_resets_at: i64, // unix seconds
+    #[serde(rename = "asOfMs")]
+    pub as_of_ms: i64,
+}
+
+/// One selectable view of the dashboard. With a single data source there is
+/// exactly one scope (id "all", empty color → default theme, UI unchanged);
+/// with several sources the first scope is the aggregate ("all") followed by
+/// one scope per agent, and the UI shows filter chips.
 #[derive(Debug, Clone, Serialize)]
-pub struct Dashboard {
+pub struct Scope {
+    pub id: String,    // "all" | "claude" | "codex"
+    pub label: String, // "All" | "Claude" | "Codex"
+    pub color: String, // agent accent hex; "" = default theme accent
     pub day: PeriodReport,
     pub week: PeriodReport,
     pub month: PeriodReport,
     pub heatmap: Vec<HeatDay>,
+    pub quota: Option<Quota>, // Codex only
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Dashboard {
+    pub scopes: Vec<Scope>,
     #[serde(rename = "todayTokens")]
-    pub today_tokens: f64, // M tokens, for the tray label
+    pub today_tokens: f64, // M tokens across all agents, for the tray label
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
 }

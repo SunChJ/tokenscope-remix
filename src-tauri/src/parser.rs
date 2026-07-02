@@ -1,10 +1,12 @@
-// Parse ~/.claude/projects/**/*.jsonl, dedupe assistant messages by id,
-// classify tool calls (user-installed MCP / Skill only), and aggregate
-// into Day / Week / Month reports + a daily heatmap.
+// Aggregate the store's normalized events (Claude + Codex) into per-scope
+// Day / Week / Month reports + a daily heatmap. With one data source the
+// dashboard has a single scope and looks exactly like the classic single-agent
+// UI; with several, the first scope aggregates everything ("All") and is
+// followed by one scope per agent, each with its own accent palette.
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
-use crate::store::{RawEvent, Store};
+use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -13,8 +15,8 @@ use std::sync::Mutex;
 // handler never touch the incremental cache files concurrently.
 static BUILD_LOCK: Mutex<()> = Mutex::new(());
 
-// One assistant API response, with config + pricing applied (derived per request
-// from a RawEvent, since user config / prices / time windows can all change).
+// One API response, with config + pricing applied (derived per request from a
+// RawEvent, since user config / prices / time windows can all change).
 struct Event {
     ts: DateTime<Local>,
     session: String,
@@ -24,11 +26,42 @@ struct Event {
     output: f64, // raw tokens
     cost: f64,   // USD (differentiated by token type), 0 if unknown model
     priced: bool, // whether a price was found for this model
+    agent: &'static str, // owning agent id (interned via agent_def)
     mcp: Vec<String>,   // user-installed server names called in this msg
     skills: Vec<String>, // user-installed skill names called in this msg
 }
 
-// Top-5 models keep the green/slate scheme; everything beyond is uniform gray.
+/// Static per-agent identity: label + accent + a 5-step chart palette (rank
+/// shades of the accent, ending in a muted overflow tone).
+pub struct AgentDef {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub color: &'static str,
+    palette: [&'static str; 5],
+}
+
+/// Registry order = display order (chips, stacked charts, slices).
+const AGENTS: &[AgentDef] = &[
+    AgentDef {
+        id: AGENT_CLAUDE,
+        label: "Claude",
+        color: "#d97757", // Anthropic coral
+        palette: ["#c9683f", "#d97757", "#e59a78", "#f0c0a8", "#6d5147"],
+    },
+    AgentDef {
+        id: AGENT_CODEX,
+        label: "Codex",
+        color: "#10a37f", // OpenAI teal
+        palette: ["#0f8a6c", "#10a37f", "#4dbf9f", "#93dcc5", "#4a5f57"],
+    },
+];
+
+fn agent_def(id: &str) -> &'static AgentDef {
+    AGENTS.iter().find(|a| a.id == id).unwrap_or(&AGENTS[0])
+}
+
+// Single-source palette: the classic green/slate scheme (kept so a one-agent
+// install looks exactly like before). Top-5 models get these; beyond is gray.
 const PALETTE: &[&str] = &["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const OVERFLOW_GRAY: &str = "#79817b";
 
@@ -52,7 +85,7 @@ fn vendor_of(model: &str) -> &'static str {
     let m = model.to_lowercase();
     if m.contains("claude") {
         "Anthropic"
-    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") {
+    } else if m.contains("gpt") || m.contains("o1") || m.contains("o3") || m.contains("codex") {
         "OpenAI"
     } else if m.contains("gemini") {
         "Google"
@@ -84,6 +117,7 @@ pub fn build_dashboard() -> Dashboard {
     if dirty {
         store.save();
     }
+    let codex_quota = store.codex_quota.clone();
 
     // 2. Aggregate: apply current config + prices, slice by current time.
     let cfg = UserConfig::load();
@@ -99,21 +133,66 @@ pub fn build_dashboard() -> Dashboard {
     let now = Local::now();
     let today = now.date_naive();
 
-    let mut day = report_day(&events, now);
-    let mut week = report_week(&events, now);
-    let mut month = report_month(&events, now);
-    let heatmap = build_heatmap(&events, today);
+    // Agents that actually have data, in registry order.
+    let present_ids: HashSet<&str> = events.iter().map(|e| e.agent).collect();
+    let present: Vec<&AgentDef> = AGENTS.iter().filter(|a| present_ids.contains(a.id)).collect();
 
-    // "servers"/"skills" = how many the user has *installed* (global, constant
-    // across periods), not how many were called in the window.
-    let installed_servers = cfg.mcp_servers.len() as u64;
-    let installed_skills = cfg.skills.len() as u64;
-    for r in [&mut day, &mut week, &mut month] {
-        r.metrics.servers = installed_servers;
-        r.metrics.skills = installed_skills;
-    }
+    let scopes = if present.len() <= 1 {
+        // Single (or no) source → one scope, classic green UI, no chips.
+        let agent = present.first().map(|a| a.id).unwrap_or(AGENT_CLAUDE);
+        let mut scope = build_scope("all", "All", "", &events, PALETTE, agent, &cfg, now);
+        if agent == AGENT_CODEX {
+            scope.quota = codex_quota;
+        }
+        vec![scope]
+    } else {
+        // Aggregate scope first (default palette; models/slices merged below),
+        // then one accent-colored scope per agent.
+        let mut per_agent: Vec<Scope> = Vec::new();
+        for a in &present {
+            let filtered: Vec<Event> = events.iter().filter(|e| e.agent == a.id).map(clone_event).collect();
+            let mut s = build_scope(a.id, a.label, a.color, &filtered, &a.palette, a.id, &cfg, now);
+            if a.id == AGENT_CODEX {
+                s.quota = codex_quota.clone();
+            }
+            per_agent.push(s);
+        }
+        let mut all = build_scope("all", "All", "", &events, PALETTE, "", &cfg, now);
+        // All-scope model rows keep each agent's palette (rank within agent), and
+        // each period gains per-agent slices for the split bar + stacked chart.
+        for idx in 0..3usize {
+            let mut models: Vec<ModelStat> = Vec::new();
+            let mut slices: Vec<AgentSlice> = Vec::new();
+            for (a, s) in present.iter().zip(per_agent.iter()) {
+                let p = match idx {
+                    0 => &s.day,
+                    1 => &s.week,
+                    _ => &s.month,
+                };
+                models.extend(p.models.iter().cloned());
+                slices.push(AgentSlice {
+                    id: a.id.to_string(),
+                    label: a.label.to_string(),
+                    color: a.color.to_string(),
+                    tokens: p.metrics.total_tokens,
+                    values: p.series.iter().map(|pt| pt.input + pt.cache + pt.output).collect(),
+                });
+            }
+            models.sort_by(|x, y| y.tokens.partial_cmp(&x.tokens).unwrap_or(std::cmp::Ordering::Equal));
+            let target = match idx {
+                0 => &mut all.day,
+                1 => &mut all.week,
+                _ => &mut all.month,
+            };
+            target.models = models;
+            target.agents = slices;
+        }
+        let mut v = vec![all];
+        v.extend(per_agent);
+        v
+    };
 
-    // today's displayed tokens (M) for the tray
+    // today's displayed tokens (M) for the tray — across all agents
     let today_tokens: f64 = events
         .iter()
         .filter(|e| e.ts.date_naive() == today)
@@ -121,12 +200,76 @@ pub fn build_dashboard() -> Dashboard {
         .sum();
 
     Dashboard {
+        scopes,
+        today_tokens,
+        generated_at: now.to_rfc3339(),
+    }
+}
+
+/// Cheap manual clone (Event holds Vec<String>s; used only for per-agent
+/// filtering during multi-agent builds).
+fn clone_event(e: &Event) -> Event {
+    Event {
+        ts: e.ts,
+        session: e.session.clone(),
+        model: e.model.clone(),
+        input: e.input,
+        cache: e.cache,
+        output: e.output,
+        cost: e.cost,
+        priced: e.priced,
+        agent: e.agent,
+        mcp: e.mcp.clone(),
+        skills: e.skills.clone(),
+    }
+}
+
+/// Build one scope (all three period reports + heatmap) over `events`.
+/// `agent_scope` is the agent id the scope represents ("" for the aggregate) —
+/// it decides which installed-server/skill counts the metrics carry.
+#[allow(clippy::too_many_arguments)]
+fn build_scope(
+    id: &str,
+    label: &str,
+    color: &str,
+    events: &[Event],
+    palette: &[&str],
+    agent_scope: &str,
+    cfg: &UserConfig,
+    now: DateTime<Local>,
+) -> Scope {
+    let today = now.date_naive();
+    let mut day = report_day(events, now, palette);
+    let mut week = report_week(events, now, palette);
+    let mut month = report_month(events, now, palette);
+    let heatmap = build_heatmap(events, today);
+
+    // "servers"/"skills" = how many the user has *installed* (global, constant
+    // across periods), not how many were called in the window. Per agent:
+    // skills are a Claude-only concept, so a pure-Codex scope reports 0 and the
+    // UI hides the section.
+    let (installed_servers, installed_skills) = match agent_scope {
+        AGENT_CODEX => (cfg.codex_mcp_servers.len() as u64, 0u64),
+        AGENT_CLAUDE => (cfg.mcp_servers.len() as u64, cfg.skills.len() as u64),
+        _ => (
+            (cfg.mcp_servers.len() + cfg.codex_mcp_servers.len()) as u64,
+            cfg.skills.len() as u64,
+        ),
+    };
+    for r in [&mut day, &mut week, &mut month] {
+        r.metrics.servers = installed_servers;
+        r.metrics.skills = installed_skills;
+    }
+
+    Scope {
+        id: id.to_string(),
+        label: label.to_string(),
+        color: color.to_string(),
         day,
         week,
         month,
         heatmap,
-        today_tokens,
-        generated_at: now.to_rfc3339(),
+        quota: None,
     }
 }
 
@@ -145,7 +288,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
     let mcp = r
         .mcp
         .iter()
-        .filter(|s| cfg.is_user_mcp(s))
+        .filter(|s| cfg.is_user_mcp(&r.agent, s))
         .cloned()
         .collect();
     let skills = r
@@ -163,6 +306,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         output: r.out_tok,
         cost: cost_opt.unwrap_or(0.0),
         priced: cost_opt.is_some(),
+        agent: agent_def(&r.agent).id,
         mcp,
         skills,
     }
@@ -182,6 +326,7 @@ struct Agg {
     model_tok: HashMap<String, f64>,
     model_cost: HashMap<String, f64>,
     model_priced: HashMap<String, bool>,
+    model_agent: HashMap<String, &'static str>,
     mcp_counts: HashMap<String, u64>,
     skill_counts: HashMap<String, u64>,
 }
@@ -195,8 +340,9 @@ impl Agg {
         if !e.session.is_empty() {
             self.sessions.insert(e.session.clone());
         }
-        // Slash-command skill events carry no model (empty) — they're not LLM
-        // requests, so they must not inflate request counts or the model split.
+        // Slash-command skill / MCP-call-only events carry no model (empty) —
+        // they're not LLM requests, so they must not inflate request counts or
+        // the model split.
         if !e.model.is_empty() {
             self.requests += 1;
             // model totals keep all token types so shares sum to Total tokens
@@ -204,6 +350,7 @@ impl Agg {
             *self.model_cost.entry(e.model.clone()).or_default() += e.cost;
             // a model is "priced" if any of its messages had a known price
             *self.model_priced.entry(e.model.clone()).or_default() |= e.priced;
+            self.model_agent.entry(e.model.clone()).or_insert(e.agent);
         }
         for s in &e.mcp {
             self.mcp_calls += 1;
@@ -215,7 +362,7 @@ impl Agg {
         }
     }
 
-    fn models(&self) -> Vec<ModelStat> {
+    fn models(&self, palette: &[&str]) -> Vec<ModelStat> {
         let mut v: Vec<(String, f64, f64)> = self
             .model_tok
             .iter()
@@ -230,8 +377,9 @@ impl Agg {
                     vendor: vendor_of(&name).to_string(),
                     tokens: (tok / 1e6 * 100.0).round() / 100.0,
                     cost: (cost * 100.0).round() / 100.0,
-                    color: if i < PALETTE.len() { PALETTE[i] } else { OVERFLOW_GRAY }.to_string(),
+                    color: if i < palette.len() { palette[i] } else { OVERFLOW_GRAY }.to_string(),
                     priced,
+                    agent: self.model_agent.get(&name).copied().unwrap_or("").to_string(),
                     name,
                 }
             })
@@ -279,7 +427,7 @@ fn pct_delta(cur: f64, prev: f64) -> f64 {
 }
 
 // ── Day report: today, 24 hourly buckets ───────────────────────────
-fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+fn report_day(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
     let today = now.date_naive();
     let yesterday = today - Duration::days(1);
     let mut agg = Agg::default();
@@ -332,16 +480,17 @@ fn report_day(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             pct_delta(agg.cost, prev.cost),
         ),
         series,
-        models: agg.models(),
+        models: agg.models(palette),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        agents: Vec::new(),
     }
 }
 
 // ── Week report: current calendar week (Mon-Sun) vs previous week ────
-fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
     let today = now.date_naive();
     // Monday of the current week (Mon=0 … Sun=6).
     let start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
@@ -399,16 +548,17 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             pct_delta(agg.cost, prev.cost),
         ),
         series,
-        models: agg.models(),
+        models: agg.models(palette),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        agents: Vec::new(),
     }
 }
 
 // ── Month report: current calendar month vs previous calendar month ──
-fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
+fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
     use chrono::NaiveDate;
     let today = now.date_naive();
     let (y, m) = (today.year(), today.month());
@@ -476,11 +626,12 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             pct_delta(agg.cost, prev.cost),
         ),
         series,
-        models: agg.models(),
+        models: agg.models(palette),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
         cost_trend: cost_b,
+        agents: Vec::new(),
     }
 }
 

@@ -181,13 +181,17 @@ fn check_milestones(app: &tauri::AppHandle, dash: &Dashboard) {
     let Some(state) = app.try_state::<Celebration>() else {
         return;
     };
+    // The first scope is always the aggregate view (all agents combined).
+    let Some(primary) = dash.scopes.first() else {
+        return;
+    };
     // total_tokens is already in millions, so a 100M milestone is total / 100.
     let (week_id, month_id) = period_ids();
     let cur = MilestoneState {
         week_id,
-        week_floor: (dash.week.metrics.total_tokens / 100.0).floor() as i64,
+        week_floor: (primary.week.metrics.total_tokens / 100.0).floor() as i64,
         month_id,
-        month_floor: (dash.month.metrics.total_tokens / 100.0).floor() as i64,
+        month_floor: (primary.month.metrics.total_tokens / 100.0).floor() as i64,
     };
 
     let mut g = state.state.lock().unwrap();
@@ -224,6 +228,7 @@ fn celebrate(app: &tauri::AppHandle) {
 /// Show (or reuse) a full-screen, click-through, non-activating overlay on the
 /// primary monitor and run the confetti animation, then hide it after it plays.
 /// Must be called on the main thread.
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 fn show_celebration(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<Celebration>() else {
         return;
@@ -505,6 +510,7 @@ fn position_popover_windows(app: &tauri::AppHandle) {
 
 /// True if our (Accessory) app is currently the frontmost application.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 fn app_is_frontmost() -> bool {
     use tauri_nspanel::cocoa::base::id;
     use tauri_nspanel::objc::{class, msg_send, sel, sel_impl};
@@ -541,6 +547,7 @@ fn hide_panel_on_context_switch(app: &tauri::AppHandle) {
 /// activation (mirrors tauri-nspanel's menu-bar example). The observers live for
 /// the whole app lifetime, so the returned tokens are intentionally dropped.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 fn register_panel_autohide(app: &tauri::AppHandle) {
     use std::ffi::CString;
     use tauri_nspanel::block::ConcreteBlock;
@@ -578,6 +585,7 @@ fn register_panel_autohide(app: &tauri::AppHandle) {
 /// (and thus the webview's `prefers-color-scheme`) can lag the real system value.
 /// The user default reflects the system setting directly, regardless of focus.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 fn system_is_dark() -> bool {
     use std::ffi::CStr;
     use tauri_nspanel::cocoa::base::{id, nil};
@@ -609,6 +617,7 @@ fn system_is_dark() -> bool {
 /// lives for the whole app lifetime, so the returned token is intentionally
 /// dropped (same as register_panel_autohide).
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 fn watch_system_theme(app: &tauri::AppHandle) {
     use std::ffi::CString;
     use tauri_nspanel::block::ConcreteBlock;
@@ -727,6 +736,7 @@ fn fmt_tokens_m(m: f64) -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
 pub fn run() {
     // Tracks when the popover was last hidden, so a click on the tray icon
     // while it's open (which first blurs/hides it) doesn't immediately reopen.
@@ -1007,12 +1017,14 @@ pub fn run() {
             });
 
             // Filesystem watcher: reflect a log write within ~1s instead of
-            // waiting up to the 30s poll (PRD wants <=5s). Writes land in
-            // ~/.claude/projects; our own cache lives elsewhere, so this never
-            // self-triggers. Debounced so a burst of writes coalesces into one
-            // rebuild; the 30s poll above stays as a fallback. (build_dashboard
-            // serializes on BUILD_LOCK, so this and the poll can't race the cache.)
-            if let Some(projects) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) {
+            // waiting up to the 30s poll (PRD wants <=5s). One watcher covers
+            // every source root (~/.claude/projects, ~/.codex/sessions, …); our
+            // own cache lives elsewhere, so this never self-triggers. Debounced
+            // so a burst of writes coalesces into one rebuild; the 30s poll
+            // above stays as a fallback. (build_dashboard serializes on
+            // BUILD_LOCK, so this and the poll can't race the cache.)
+            {
+                let roots = store::source_roots();
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     use notify::{RecursiveMode, Watcher};
@@ -1027,11 +1039,17 @@ pub fn run() {
                         Ok(w) => w,
                         Err(_) => return,
                     };
-                    // Claude Code may not have created the dir yet on a fresh
-                    // machine; create it so watch() registers instead of silently
-                    // falling back to the 30s poll for the whole session.
-                    let _ = std::fs::create_dir_all(&projects);
-                    if watcher.watch(&projects, RecursiveMode::Recursive).is_err() {
+                    let mut watching = false;
+                    for (_agent, dir) in &roots {
+                        // The CLI may not have created its dir yet on a fresh
+                        // machine; create it so watch() registers instead of
+                        // silently falling back to the 30s poll all session.
+                        let _ = std::fs::create_dir_all(dir);
+                        if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
+                            watching = true;
+                        }
+                    }
+                    if !watching {
                         return;
                     }
                     // Block for the first change, then drain the burst until quiet.

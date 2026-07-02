@@ -9,6 +9,12 @@ edition = "2021"
 name = "tokenscope_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[lints.rust]
+# The old `objc` crate (pulled in via tauri-nspanel) emits cfg(feature =
+# "cargo-clippy") from its macros, which trips this lint at every msg_send!
+# call site in our crate. Nothing we can fix locally — silence it.
+unexpected_cfgs = "allow"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -34,23 +34,32 @@ export function Segmented({ value, items = ["Day", "Week", "Month"], theme, onSe
   );
 }
 
-export function BarChart({ data, theme, height = 96, accent, accentSoft, radius = 3 }:
-  { data: SeriesPoint[]; theme: Theme; height?: number; accent?: string; accentSoft?: string; radius?: number }) {
+export function BarChart({ data, theme, height = 96, accent, accentSoft, radius = 3, segs }:
+  { data: SeriesPoint[]; theme: Theme; height?: number; accent?: string; accentSoft?: string; radius?: number;
+    // Optional custom stacking, top→bottom (e.g. per-agent in the All scope).
+    // Each entry paints one segment per bucket; values align with `data`.
+    segs?: { color: string; values: number[] }[] }) {
   const t = theme;
   accent = accent || t.accent; accentSoft = accentSoft || t.accentSoft;
-  const max = Math.max(...data.map((d) => d.input + d.cache + d.output), 1e-9);
+  // Default stacking: output on top, input(+cache) below — the classic view.
+  const stacks = segs ?? [
+    { color: accentSoft, values: data.map((d) => d.output) },
+    { color: accent, values: data.map((d) => d.input + d.cache) },
+  ];
+  const totals = data.map((_, i) => stacks.reduce((s, st) => s + (st.values[i] || 0), 0));
+  const max = Math.max(...totals, 1e-9);
   const n = data.length;
   const gapPct = Math.max(0.8, Math.min(6, 32 / n));
   const effRadius = n > 16 ? 1 : radius;
-  const [hi, setHi] = useState<SeriesPoint | null>(null);
+  const [hi, setHi] = useState(-1);
   const [tip, setTip] = useState({ x: 0, y: 0 });
   // position:fixed so the tooltip renders above the scrolling card (not clipped).
   // Anchor to the *visible bar top* (baseline − bar height), not the full-height
   // column top, so short bars don't push the tooltip up over the legend above.
-  const onBar = (d: SeriesPoint, e: React.MouseEvent) => {
+  const onBar = (i: number, e: React.MouseEvent) => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const barPx = ((d.input + d.cache + d.output) / max) * height;
-    setHi(d); setTip({ x: r.left + r.width / 2, y: r.bottom - barPx });
+    const barPx = (totals[i] / max) * height;
+    setHi(i); setTip({ x: r.left + r.width / 2, y: r.bottom - barPx });
   };
   return (
     <div>
@@ -58,18 +67,20 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
         {[0.25, 0.5, 0.75, 1].map((g, i) => (
           <div key={i} style={{ position: "absolute", left: 0, right: 0, bottom: `${g * 100}%`, borderTop: `1px solid ${t.gridLine}` }} />
         ))}
-        {data.map((d, i) => {
-          // stacked top→bottom: output · input(+cache)
-          const hO = (d.output / max) * height, hI = ((d.input + d.cache) / max) * height;
-          const empty = d.input + d.cache + d.output <= 0;
-          const on = hi === d;
+        {data.map((_, i) => {
+          const empty = totals[i] <= 0;
+          const on = hi === i;
+          // round the top of the first segment that actually shows
+          const firstVisible = stacks.findIndex((st) => (st.values[i] || 0) > 0);
           return (
             <div key={i}
-              onMouseEnter={empty ? undefined : (e) => onBar(d, e)}
-              onMouseLeave={empty ? undefined : () => setHi(null)}
-              style={{ flex: 1, alignSelf: "stretch", display: "flex", flexDirection: "column", justifyContent: "flex-end", position: "relative", zIndex: 1, cursor: "default", opacity: hi && !on && !empty ? 0.55 : 1, transition: "opacity .12s" }}>
-              <div style={{ height: hO, background: accentSoft, borderRadius: `${effRadius}px ${effRadius}px 0 0` }} />
-              <div style={{ height: hI, background: accent }} />
+              onMouseEnter={empty ? undefined : (e) => onBar(i, e)}
+              onMouseLeave={empty ? undefined : () => setHi(-1)}
+              style={{ flex: 1, alignSelf: "stretch", display: "flex", flexDirection: "column", justifyContent: "flex-end", position: "relative", zIndex: 1, cursor: "default", opacity: hi >= 0 && !on && !empty ? 0.55 : 1, transition: "opacity .12s" }}>
+              {stacks.map((st, si) => (
+                <div key={si} style={{ height: ((st.values[i] || 0) / max) * height, background: st.color,
+                  borderRadius: si === firstVisible ? `${effRadius}px ${effRadius}px 0 0` : 0 }} />
+              ))}
             </div>
           );
         })}
@@ -79,7 +90,7 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
           <div key={i} style={{ flex: 1, textAlign: "center", font: `500 9px ${t.mono}`, color: t.dim, letterSpacing: ".03em" }}>{d.label}</div>
         ))}
       </div>
-      {hi && (
+      {hi >= 0 && (
         <div style={{
           position: "fixed",
           left: Math.min(Math.max(tip.x, 96), (typeof window !== "undefined" ? window.innerWidth : 372) - 96),
@@ -88,9 +99,9 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
           font: `500 10px ${t.mono}`, whiteSpace: "nowrap", pointerEvents: "none", zIndex: 9999,
           boxShadow: "0 4px 14px rgba(0,0,0,0.35)" }}>
           <span style={{ color: accent, fontWeight: 600 }}>
-            {(() => { const tot = hi.input + hi.cache + hi.output; return tot === 0 ? "No tokens" : fmtTokens(tot) + " tokens"; })()}
+            {totals[hi] === 0 ? "No tokens" : fmtTokens(totals[hi]) + " tokens"}
           </span>
-          <span style={{ opacity: 0.7 }}> · {hi.full}</span>
+          <span style={{ opacity: 0.7 }}> · {data[hi].full}</span>
         </div>
       )}
     </div>
@@ -126,14 +137,17 @@ export function Sparkline({ values, theme, width = 80, height = 24, accent, stro
 const DONUT_PALETTE = ["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const DONUT_OVERFLOW = "#79817b";
 
-export function CostDonut({ models, theme, size = 104, thickness = 16 }:
-  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number }) {
+export function CostDonut({ models, theme, size = 104, thickness = 16, keepColors = false }:
+  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number;
+    // true → keep each model's own (agent-tinted) color so wedges match the
+    // token-list dots; false → classic cost-rank green recoloring.
+    keepColors?: boolean }) {
   const t = theme;
   const [hi, setHi] = useState(-1);
-  // Rank by cost (desc) and recolor by that rank — usage from most to least.
+  // Rank by cost (desc); recolor by that rank unless colors are meaningful.
   const ranked = [...models]
     .sort((a, b) => b.cost - a.cost)
-    .map((m, i) => ({ ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
+    .map((m, i) => (keepColors ? m : { ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
   models = ranked;
   const total = models.reduce((s, m) => s + m.cost, 0) || 1e-9;
   const cx = size / 2, cy = size / 2;
