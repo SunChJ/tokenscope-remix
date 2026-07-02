@@ -112,6 +112,12 @@ brew update && brew upgrade --cask tokenscope
 3. 安装器按当前用户安装（无需管理员权限），并**自动注册开机自启**
 4. 系统要求：**Windows 10 1803 及以上 / Windows 11**，需要 WebView2 运行时（Win 11 预装；Win 10 用户若没装，安装器会引导补装）
 
+### 更新
+
+自 v1.2.0 起，App 会自行检测新版本并在面板内提示（「v*x.y.z* is available → Update」），
+点击即可下载安装、重启生效，无需手动下载。Homebrew 用户也可以继续
+`brew upgrade --cask tokenscope`，两条路径安装的是同一份构建。
+
 ### 首次启动后
 
 - **macOS**：菜单栏出现图标 + 当日 Token 数（如 `⬡ 12.40M`）

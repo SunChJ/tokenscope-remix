@@ -754,7 +754,12 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
-        ));
+        ))
+        // In-app updates: checks the GitHub release feed (latest.json) and
+        // installs signed update packages; process plugin provides the
+        // relaunch after install. Both driven from the frontend UpdateBanner.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
     // Registers the WebviewPanelManager state used by `to_panel`/`get_webview_panel`.
     #[cfg(target_os = "macos")]
     {

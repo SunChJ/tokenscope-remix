@@ -112,6 +112,13 @@ brew update && brew upgrade --cask tokenscope
 3. The app installs per-user (no admin required) and registers itself for **launch at login** automatically
 4. Requirements: **Windows 10 1803+ / Windows 11** with the WebView2 runtime (preinstalled on Windows 11; Windows 10 users without it will be prompted by the installer)
 
+### Updating
+
+From v1.2.0 the app checks for new releases itself and shows an in-app banner
+("v*x.y.z* is available → Update"); the update downloads, installs, and applies
+on restart — no manual download needed. Homebrew users can keep using
+`brew upgrade --cask tokenscope` as well; both paths install the same build.
+
 ### After first launch
 
 - **macOS**: an icon plus today's token count appears in the menu bar (e.g. `⬡ 12.40M`)
