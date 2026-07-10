@@ -108,13 +108,13 @@ function MiniStat({ label, value, sub, theme, accent, children }:
   );
 }
 
-// Input/Output legend: full words by default, abbreviated to In/Out only
-// when the row would otherwise overflow the available width.
-function SplitLegend({ t, inputM, outputM, cachedPct }:
-  { t: Theme; inputM: number; outputM: number; cachedPct: number }) {
+// Cached/Rest legend: full words by default, abbreviated when the row would
+// otherwise overflow. Mirrors the split bar above (dark = cached, light = rest).
+function SplitLegend({ t, cacheM, restM, cachedPct }:
+  { t: Theme; cacheM: number; restM: number; cachedPct: number }) {
   const ref = useRef<HTMLDivElement>(null);
   const [compact, setCompact] = useState(false);
-  const key = `${inputM}|${outputM}|${cachedPct}`;
+  const key = `${cacheM}|${restM}|${cachedPct}`;
   // reset to full labels whenever the numbers change, then re-measure
   useLayoutEffect(() => { setCompact(false); }, [key]);
   useLayoutEffect(() => {
@@ -126,8 +126,8 @@ function SplitLegend({ t, inputM, outputM, cachedPct }:
       display: "flex", alignItems: "center", gap: 14,
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
-      <span><span style={{ color: t.accent }}>●</span> {compact ? "In" : "Input"} {inputM.toFixed(2)}M</span>
-      <span><span style={{ color: t.accentSoft }}>●</span> {compact ? "Out" : "Output"} {outputM.toFixed(2)}M</span>
+      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {cacheM.toFixed(2)}M</span>
+      <span><span style={{ color: t.accentSoft }}>●</span> New {restM.toFixed(2)}M</span>
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
     </div>
   );
@@ -442,11 +442,16 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const P: PeriodReport = period === "Day" ? scope.day : period === "Month" ? scope.month : scope.week;
   const M = P.metrics;
   // Per-agent slices — non-empty only in the All scope with >=2 sources; they
-  // switch the hero bar + chart from Input/Output to a by-agent breakdown.
+  // switch the hero bar + chart from Cached/New to a by-agent breakdown.
   const slices = P.agents;
   // animated Total tokens: counts up from 0 on each open / period / scope
   // switch; held at 0 while the popover is hidden so it never flashes.
   const animTotal = useCountUp(M.totalTokens, `${period}:${scope.id}:${openGen}`, active);
+  // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
+  const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
+  const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
+  const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
+  const agentTotal = slices.reduce((sum, s) => sum + s.tokens, 0);
   const models = P.models;
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
@@ -581,23 +586,21 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
           </div>
         </div>
-        {/* hero split bar. All scope with several agents: one segment per agent
-            ("who is burning"); otherwise the classic input(+cache)/output split.
-            When there's no usage the bar is just the empty track (no slivers). */}
-        <div style={{ display: "flex", gap: 0, height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
+        {/* All scope: one segment per agent. Single scope: cached vs new. */}
+        <div style={{ display: "flex", height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
           {M.totalTokens > 0 && (slices.length > 0 ? (
             slices.map((s) => (
-              <div key={s.id} style={{ flexGrow: Math.max(s.tokens, 1e-6), flexBasis: 0, minWidth: 4, background: s.color }} />
+              <div key={s.id} style={{ width: `${agentTotal > 0 ? (s.tokens / agentTotal) * 100 : 0}%`, background: s.color }} />
             ))
           ) : <>
-            <div style={{ flexGrow: Math.max(M.inputTokens + M.cacheTokens, 1e-6), flexBasis: 0, minWidth: 4, background: t.accent }} />
-            <div style={{ flexGrow: Math.max(M.outputTokens, 1e-6), flexBasis: 0, minWidth: 4, background: t.accentSoft }} />
+            <div style={{ width: `${cachePct}%`, background: t.accent }} />
+            <div style={{ width: `${restPct}%`, background: t.accentSoft }} />
           </>)}
         </div>
         {slices.length > 0
           ? <AgentLegend t={t} slices={slices} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
-          : <SplitLegend t={t} inputM={M.inputTokens + M.cacheTokens} outputM={M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />}
-        {/* bar chart — stacked by agent in the All scope, In/Out elsewhere */}
+          : <SplitLegend t={t} cacheM={M.cacheTokens} restM={M.inputTokens + M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />}
+        {/* bar chart — stacked by agent in the All scope */}
         <BarChart data={P.series} theme={t} height={84}
           segs={slices.length > 0 ? [...slices].reverse().map((s) => ({ color: s.color, values: s.values })) : undefined} />
         <SectionRule t={t} m="14px 0 10px" />

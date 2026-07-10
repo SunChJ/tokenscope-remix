@@ -223,6 +223,16 @@ fix. Newest first. Useful as a reference for similar issues.
   Day/Week/Month still animates). Skipped on the very first render.
   (`src/main.tsx`, `src/App.tsx`)
 
+### 16. Total-tokens split bar didn't fill — gray track showed through
+
+- **Symptom**: The split bar under Total tokens was only partly filled, leaving
+  gray track visible on the right. It was most obvious with a lopsided split.
+- **Cause**: WebKit incorrectly sized segments using `flexGrow` with
+  `flexBasis: 0` instead of treating the values as a ratio.
+- **Fix** (`src/App.tsx`): use explicit percentage widths for both the per-agent
+  bar and the single-agent cached/new bar. The latter now matches its legend:
+  dark is cached tokens and light is uncached input plus output.
+
 ---
 
 ## Notes
