@@ -33,7 +33,7 @@ pub struct RawEvent {
     pub cr: f64, // cache read (codex: cached_input_tokens, a subset of its raw input)
     pub out_tok: f64,
     pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
-    pub skills: Vec<String>, // all Skill input.skill ids called (unfiltered)
+    pub skills: Vec<String>, // all detected Skill ids called (unfiltered)
     pub id: String,          // message id (dedup); "" = no cross-line dedup needed
     // Source log file (manifest key). Lets a truncated/rewritten file purge its
     // own stale events before being re-read, so re-ingestion stays idempotent.
@@ -61,6 +61,12 @@ struct FileState {
     model: String,
     #[serde(default)]
     session: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default)]
+    turn_id: String,
+    #[serde(default)]
+    skills_seen: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -88,7 +94,8 @@ pub struct Store {
 //       tool_use line were deduped, dropping the tool call).
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: multi-agent ingest (claude + codex), FileState manifest, quota snapshot.
-const STORE_VERSION: u32 = 5;
+//   v6: extract Codex Skill calls and track project skill directories.
+const STORE_VERSION: u32 = 6;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -202,6 +209,21 @@ impl Store {
             }
             let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
         }
+    }
+
+    /// Working directories seen in Codex sessions. Config uses these to find
+    /// project-scoped `.agents/skills` without crawling the user's home dir.
+    pub fn codex_project_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .manifest
+            .files
+            .values()
+            .filter(|s| !s.cwd.is_empty())
+            .map(|s| PathBuf::from(&s.cwd))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
     }
 
     /// Rebuild the id→index map after the `events` vector is mutated wholesale
@@ -362,16 +384,35 @@ impl Store {
                 {
                     state.session = id.to_string();
                 }
+                if let Some(cwd) = payload.get("cwd").and_then(|x| x.as_str()) {
+                    state.cwd = cwd.to_string();
+                }
                 None
             }
             "turn_context" => {
                 if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
                     state.model = m.to_string();
                 }
+                if let Some(cwd) = payload.get("cwd").and_then(|x| x.as_str()) {
+                    state.cwd = cwd.to_string();
+                }
+                if let Some(turn_id) = payload.get("turn_id").and_then(|x| x.as_str()) {
+                    if state.turn_id != turn_id {
+                        state.turn_id = turn_id.to_string();
+                        state.skills_seen.clear();
+                    }
+                }
                 None
             }
             "event_msg" => {
-                if payload.get("type")?.as_str()? != "token_count" {
+                let event_type = payload.get("type")?.as_str()?;
+                // Older Codex logs may not carry turn_context.turn_id. A task
+                // boundary is still enough to reset per-turn Skill dedup.
+                if event_type == "task_started" {
+                    state.skills_seen.clear();
+                    return None;
+                }
+                if event_type != "token_count" {
                     return None;
                 }
                 let ts_ms = parse_ts(&v)?;
@@ -406,18 +447,35 @@ impl Store {
                 })
             }
             "response_item" => {
+                let item_type = payload.get("type")?.as_str()?;
+                let name = payload.get("name").and_then(|x| x.as_str()).unwrap_or("");
+
+                // Classic Codex CLI shell call. `arguments` is JSON containing
+                // the command that reads a selected Skill's SKILL.md.
+                if item_type == "function_call" && name == "exec_command" {
+                    let args = payload.get("arguments")?.as_str()?;
+                    let cmd = serde_json::from_str::<serde_json::Value>(args)
+                        .ok()
+                        .and_then(|a| a.get("cmd").and_then(|x| x.as_str()).map(str::to_owned))
+                        .unwrap_or_else(|| args.to_string());
+                    return codex_skill_event(&v, state, &cmd);
+                }
+
+                // Codex app wraps tool dispatch in a custom `exec` call. Its
+                // input still contains the concrete SKILL.md path.
+                if item_type == "custom_tool_call" && name == "exec" {
+                    let input = payload.get("input")?.as_str()?;
+                    return codex_skill_event(&v, state, input);
+                }
+
                 // MCP tool calls: function_call items named mcp__<server>[__<tool>].
-                if payload.get("type")?.as_str()? != "function_call" {
-                    return None;
-                }
-                let name = payload.get("name")?.as_str()?;
-                let rest = name.strip_prefix("mcp__")?;
+                let rest = (item_type == "function_call")
+                    .then(|| name.strip_prefix("mcp__"))
+                    .flatten()?;
                 let server = rest.split("__").next().unwrap_or("").to_string();
-                if server.is_empty() {
-                    return None;
-                }
-                Some(RawEvent {
-                    ts_ms: parse_ts(&v)?,
+                let ts_ms = parse_ts(&v)?;
+                (!server.is_empty()).then(|| RawEvent {
+                    ts_ms,
                     session: state.session.clone(),
                     model: String::new(), // not an LLM request → no tokens/cost
                     in_tok: 0.0,
@@ -471,6 +529,77 @@ impl Store {
 fn parse_ts(v: &serde_json::Value) -> Option<i64> {
     let ts = v.get("timestamp")?.as_str()?;
     Some(DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis())
+}
+
+/// Extract each directory name immediately above a referenced SKILL.md. The
+/// config whitelist later rejects built-in/plugin paths and unknown names.
+fn codex_skill_names(text: &str) -> Vec<String> {
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for marker in ["/SKILL.md", "\\SKILL.md"] {
+        let mut offset = 0;
+        while let Some(rel) = text[offset..].find(marker) {
+            let end = offset + rel;
+            let before = &text[..end];
+            let path_start = before
+                .rfind(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let path = &before[path_start..];
+            let built_in = path.contains("/skills/.system/")
+                || path.contains("\\skills\\.system\\")
+                || path.contains("/plugins/cache/")
+                || path.contains("\\plugins\\cache\\");
+            let start = path
+                .rfind(|c| c == '/' || c == '\\')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let name = path[start..]
+                .trim_matches(|c: char| c.is_whitespace() || c == '\'' || c == '"');
+            if !built_in && !name.is_empty() {
+                found.push((end, name.to_string()));
+            }
+            offset = end + marker.len();
+        }
+    }
+    found.sort_by_key(|(pos, _)| *pos);
+    let mut names = Vec::new();
+    for (_, name) in found {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// One call per skill per Codex turn. Reading the same SKILL.md again to finish
+/// a truncated/paged read is still the same invocation and must not inflate it.
+fn codex_skill_event(
+    v: &serde_json::Value,
+    state: &mut FileState,
+    tool_input: &str,
+) -> Option<RawEvent> {
+    let skills: Vec<String> = codex_skill_names(tool_input)
+        .into_iter()
+        .filter(|skill| !state.skills_seen.contains(skill))
+        .collect();
+    if skills.is_empty() {
+        return None;
+    }
+    state.skills_seen.extend(skills.iter().cloned());
+    Some(RawEvent {
+        ts_ms: parse_ts(v)?,
+        session: state.session.clone(),
+        model: String::new(),
+        in_tok: 0.0,
+        cc: 0.0,
+        cr: 0.0,
+        out_tok: 0.0,
+        mcp: Vec::new(),
+        skills,
+        id: String::new(),
+        source: String::new(),
+        agent: String::new(),
+    })
 }
 
 /// "rollout-2026-06-25T16-13-58-<uuid>.jsonl" → "<uuid>" (session id fallback).
@@ -609,4 +738,65 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         source: String::new(),
         agent: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_codex_skill_names_from_unix_and_windows_paths() {
+        let input = r#"sed ~/.codex/skills/find-skills/SKILL.md && type C:\Users\me\.agents\skills\release-notes\SKILL.md && cat ~/.codex/skills/.system/openai-docs/SKILL.md && cat ~/.codex/plugins/cache/bundled/skills/browser/SKILL.md"#;
+        assert_eq!(
+            codex_skill_names(input),
+            vec!["find-skills".to_string(), "release-notes".to_string()]
+        );
+    }
+
+    #[test]
+    fn counts_a_codex_skill_once_per_turn() {
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+            codex_quota: None,
+        };
+        let mut state = FileState::default();
+        let turn = |id: &str| {
+            format!(
+                r#"{{"timestamp":"2026-07-09T12:00:00Z","type":"turn_context","payload":{{"turn_id":"{id}","model":"gpt-5"}}}}"#
+            )
+        };
+        let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"read ~/.codex/skills/find-skills/SKILL.md"}}"#;
+
+        assert!(store.parse_codex_line(&turn("turn-1"), &mut state).is_none());
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().skills,
+            vec!["find-skills"]
+        );
+        assert!(store.parse_codex_line(call, &mut state).is_none());
+
+        assert!(store.parse_codex_line(&turn("turn-2"), &mut state).is_none());
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().skills,
+            vec!["find-skills"]
+        );
+    }
+
+    #[test]
+    fn parses_classic_codex_exec_command_skill_call() {
+        let mut store = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+            codex_quota: None,
+        };
+        let mut state = FileState::default();
+        let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat ~/.agents/skills/review/SKILL.md\"}"}}"#;
+
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().skills,
+            vec!["review"]
+        );
+    }
 }

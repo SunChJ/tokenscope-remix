@@ -27,7 +27,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 | Codex session logs (tokens / model / rate limits) | `~/.codex/sessions/**/*.jsonl` (honors `CODEX_HOME`) |
 | Claude user MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
 | Codex user MCP whitelist | `~/.codex/config.toml` → `[mcp_servers.*]` |
-| User Skill whitelist | `~/.claude/skills/` directory |
+| User Skill whitelist | Claude: `~/.claude/skills/`; Codex: `$CODEX_HOME/skills/`, `~/.agents/skills/`, and project `.agents/skills/` |
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching the CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 
 ### Key processing
@@ -37,7 +37,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins
 - Cost is priced per the four token types; each model carries a `priced` flag — **models not found in either source still count tokens but are labelled "no price" in the UI**
 - Logs contain only the bare model name (no vendor) → third-party models default to the official vendor price (an estimate)
-- Tool classification: `mcp__<server>__*` where the server is in the owning agent's config → MCP; a Skill call (the `Skill` tool's `input.skill`, or a `/skill` slash command) whose name is in your skills directory → Skill (Claude only); everything else is ignored
+- Tool classification: `mcp__<server>__*` where the server is in the owning agent's config → MCP; Claude Skill tool/slash-command calls and Codex `SKILL.md` reads are matched against that agent's user/project skill directories → Skill; everything else is ignored
 
 > Cost is an **estimate** based on public prices; subscription users should read it as "equivalent spend value".
 

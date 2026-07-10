@@ -120,7 +120,7 @@ pub fn build_dashboard() -> Dashboard {
     let codex_quota = store.codex_quota.clone();
 
     // 2. Aggregate: apply current config + prices, slice by current time.
-    let cfg = UserConfig::load();
+    let cfg = UserConfig::load(&store.codex_project_dirs());
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
@@ -246,14 +246,18 @@ fn build_scope(
 
     // "servers"/"skills" = how many the user has *installed* (global, constant
     // across periods), not how many were called in the window. Per agent:
-    // skills are a Claude-only concept, so a pure-Codex scope reports 0 and the
-    // UI hides the section.
     let (installed_servers, installed_skills) = match agent_scope {
-        AGENT_CODEX => (cfg.codex_mcp_servers.len() as u64, 0u64),
-        AGENT_CLAUDE => (cfg.mcp_servers.len() as u64, cfg.skills.len() as u64),
+        AGENT_CODEX => (
+            cfg.codex_mcp_servers.len() as u64,
+            cfg.codex_skills.len() as u64,
+        ),
+        AGENT_CLAUDE => (
+            cfg.mcp_servers.len() as u64,
+            cfg.claude_skills.len() as u64,
+        ),
         _ => (
             (cfg.mcp_servers.len() + cfg.codex_mcp_servers.len()) as u64,
-            cfg.skills.len() as u64,
+            (cfg.claude_skills.len() + cfg.codex_skills.len()) as u64,
         ),
     };
     for r in [&mut day, &mut week, &mut month] {
@@ -294,7 +298,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
     let skills = r
         .skills
         .iter()
-        .filter(|s| cfg.is_user_skill(s))
+        .filter(|s| cfg.is_user_skill(&r.agent, s))
         .map(|s| s.rsplit(':').next().unwrap_or(s).to_string())
         .collect();
     Event {

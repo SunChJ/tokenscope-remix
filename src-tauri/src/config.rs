@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 pub struct UserConfig {
     pub mcp_servers: HashSet<String>,       // claude, from ~/.claude.json
     pub codex_mcp_servers: HashSet<String>, // codex, from ~/.codex/config.toml
-    pub skills: HashSet<String>,
+    pub claude_skills: HashSet<String>,
+    pub codex_skills: HashSet<String>,
 }
 
 fn home() -> Option<PathBuf> {
@@ -43,12 +44,16 @@ fn mcps_from(json: Option<&serde_json::Value>) -> HashSet<String> {
 }
 
 /// Add each subdirectory name of `dir` to the set (skills are folders).
-fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
+fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>, include_hidden: bool) {
     if let Ok(entries) = fs::read_dir(dir) {
         for e in entries.flatten() {
             if e.path().is_dir() {
                 if let Some(name) = e.file_name().to_str() {
-                    set.insert(name.to_string());
+                    if (include_hidden || !name.starts_with('.'))
+                        && e.path().join("SKILL.md").is_file()
+                    {
+                        set.insert(name.to_string());
+                    }
                 }
             }
         }
@@ -62,7 +67,36 @@ fn scan_skill_dir(dir: &Path, set: &mut HashSet<String>) {
 fn load_user_skills() -> HashSet<String> {
     let mut set = HashSet::new();
     if let Some(h) = home() {
-        scan_skill_dir(&h.join(".claude").join("skills"), &mut set);
+        scan_skill_dir(&h.join(".claude").join("skills"), &mut set, true);
+    }
+    set
+}
+
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".codex")))
+}
+
+/// User Codex skills live in $CODEX_HOME/skills and ~/.agents/skills. Also
+/// include project `.agents/skills` directories from session working dirs.
+/// Hidden directories such as $CODEX_HOME/skills/.system are built-ins.
+fn load_codex_skills(project_dirs: &[PathBuf]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let mut dirs = HashSet::new();
+    if let Some(d) = codex_home() {
+        dirs.insert(d.join("skills"));
+    }
+    if let Some(h) = home() {
+        dirs.insert(h.join(".agents").join("skills"));
+    }
+    for project in project_dirs {
+        for dir in project.ancestors() {
+            dirs.insert(dir.join(".agents").join("skills"));
+        }
+    }
+    for dir in dirs {
+        scan_skill_dir(&dir, &mut set, false);
     }
     set
 }
@@ -101,13 +135,14 @@ fn load_codex_mcps() -> HashSet<String> {
 }
 
 impl UserConfig {
-    pub fn load() -> Self {
+    pub fn load(codex_project_dirs: &[PathBuf]) -> Self {
         // Parse ~/.claude.json a single time and derive the MCP whitelist from it.
         let json = read_user_config();
         UserConfig {
             mcp_servers: mcps_from(json.as_ref()),
             codex_mcp_servers: load_codex_mcps(),
-            skills: load_user_skills(),
+            claude_skills: load_user_skills(),
+            codex_skills: load_codex_skills(codex_project_dirs),
         }
     }
 
@@ -122,8 +157,12 @@ impl UserConfig {
     }
 
     /// A skill id (may be "plugin:skill") → strip plugin prefix, check dir.
-    pub fn is_user_skill(&self, skill: &str) -> bool {
+    pub fn is_user_skill(&self, agent: &str, skill: &str) -> bool {
         let key = skill.rsplit(':').next().unwrap_or(skill);
-        self.skills.contains(key)
+        if agent == crate::store::AGENT_CODEX {
+            self.codex_skills.contains(key)
+        } else {
+            self.claude_skills.contains(key)
+        }
     }
 }
