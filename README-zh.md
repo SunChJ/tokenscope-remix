@@ -26,7 +26,7 @@
 | Claude 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
 | Codex 会话日志（Token / 模型 / 配额） | `~/.codex/sessions/**/*.jsonl`（支持 `CODEX_HOME`） |
 | Claude 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
-| Codex 用户 MCP 白名单 | `~/.codex/config.toml` → `[mcp_servers.*]` |
+| Codex 用户 MCP 白名单 | 全局及受信任项目 `config.toml` → `[mcp_servers.*]`（`$CODEX_HOME/config.toml`、项目 `.codex/config.toml`） |
 | 用户 Skill 白名单 | Claude：`~/.claude/skills/`；Codex：`$CODEX_HOME/skills/`、`~/.agents/skills/` 与项目 `.agents/skills/` |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
 
@@ -37,7 +37,7 @@
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
 - 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**
 - 日志只有裸模型名、无厂商信息 → 第三方模型默认取官方厂商价（估算）
-- 工具分类：`mcp__<server>__*` 且 server 在**所属 Agent** 的配置中 → MCP；Claude 的 Skill 工具/斜杠命令及 Codex 对 `SKILL.md` 的读取，会按所属 Agent 的用户/项目 skills 目录匹配 → Skill；其余忽略
+- 工具分类：MCP 调用从直接的 `mcp__<server>__*` 名称、Codex tool-search 映射或 Codex App 自定义调用中归属 server，再按**所属 Agent**配置过滤；Claude 的 Skill 工具/斜杠命令及 Codex 对 `SKILL.md` 的读取，会按所属 Agent 的用户/项目 skills 目录匹配；其余忽略
 
 > 花费为按公开价格的**估算**；订阅用户应理解为「等效消费价值」。
 

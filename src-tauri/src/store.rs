@@ -67,6 +67,11 @@ struct FileState {
     turn_id: String,
     #[serde(default)]
     skills_seen: Vec<String>,
+    // Newer Codex logs emit tool_search_output groups, then call the selected
+    // tool by its short name (for example `js`). Persist the short-name mapping
+    // so incremental reads can still attribute later calls to their MCP server.
+    #[serde(default)]
+    mcp_tools: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -95,7 +100,8 @@ pub struct Store {
 //   v4: track a per-event source file (idempotent re-read of truncated logs).
 //   v5: multi-agent ingest (claude + codex), FileState manifest, quota snapshot.
 //   v6: extract Codex Skill calls and track project skill directories.
-const STORE_VERSION: u32 = 6;
+//   v7: extract Codex MCP calls from tool search and app custom-tool formats.
+const STORE_VERSION: u32 = 7;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -450,6 +456,13 @@ impl Store {
                 let item_type = payload.get("type")?.as_str()?;
                 let name = payload.get("name").and_then(|x| x.as_str()).unwrap_or("");
 
+                // Newer Codex exposes lazily searched MCP tools under short
+                // function names. Remember which server owns each returned tool.
+                if item_type == "tool_search_output" {
+                    remember_codex_mcp_tools(payload, state);
+                    return None;
+                }
+
                 // Classic Codex CLI shell call. `arguments` is JSON containing
                 // the command that reads a selected Skill's SKILL.md.
                 if item_type == "function_call" && name == "exec_command" {
@@ -458,23 +471,29 @@ impl Store {
                         .ok()
                         .and_then(|a| a.get("cmd").and_then(|x| x.as_str()).map(str::to_owned))
                         .unwrap_or_else(|| args.to_string());
-                    return codex_skill_event(&v, state, &cmd);
+                    return codex_exec_event(&v, state, &cmd, false);
                 }
 
-                // Codex app wraps tool dispatch in a custom `exec` call. Its
-                // input still contains the concrete SKILL.md path.
+                // Codex app wraps tool dispatch in a custom `exec` call. Its JS
+                // input contains concrete SKILL.md paths and tools.mcp__ calls.
                 if item_type == "custom_tool_call" && name == "exec" {
                     let input = payload.get("input")?.as_str()?;
-                    return codex_skill_event(&v, state, input);
+                    return codex_exec_event(&v, state, input, true);
                 }
 
-                // MCP tool calls: function_call items named mcp__<server>[__<tool>].
-                let rest = (item_type == "function_call")
-                    .then(|| name.strip_prefix("mcp__"))
-                    .flatten()?;
-                let server = rest.split("__").next().unwrap_or("").to_string();
+                if item_type != "function_call" {
+                    return None;
+                }
+                // Old logs keep the mcp__server__tool name. Newer tool-search
+                // logs only keep the short tool name and need the mapping above.
+                let server = name
+                    .strip_prefix("mcp__")
+                    .and_then(|rest| rest.split("__").next())
+                    .filter(|server| !server.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| state.mcp_tools.get(name).cloned())?;
                 let ts_ms = parse_ts(&v)?;
-                (!server.is_empty()).then(|| RawEvent {
+                Some(RawEvent {
                     ts_ms,
                     session: state.session.clone(),
                     model: String::new(), // not an LLM request → no tokens/cost
@@ -531,6 +550,59 @@ fn parse_ts(v: &serde_json::Value) -> Option<i64> {
     Some(DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis())
 }
 
+/// Record short tool names returned by Codex's lazy tool search. A result group
+/// named `mcp__node_repl__` with a child `js` means later `function_call: js`
+/// events belong to the `node_repl` MCP server.
+fn remember_codex_mcp_tools(payload: &serde_json::Value, state: &mut FileState) {
+    let Some(groups) = payload.get("tools").and_then(|x| x.as_array()) else {
+        return;
+    };
+    for group in groups {
+        let Some(server) = group
+            .get("name")
+            .and_then(|x| x.as_str())
+            .and_then(|name| name.strip_prefix("mcp__"))
+            .and_then(|rest| rest.split("__").next())
+            .filter(|server| !server.is_empty())
+        else {
+            continue;
+        };
+        let Some(tools) = group.get("tools").and_then(|x| x.as_array()) else {
+            continue;
+        };
+        for tool in tools {
+            if let Some(name) = tool.get("name").and_then(|x| x.as_str()) {
+                state.mcp_tools.insert(name.to_string(), server.to_string());
+            }
+        }
+    }
+}
+
+/// Extract every actual `tools.mcp__server__tool(...)` invocation from a Codex
+/// app custom exec call. Repeated servers represent repeated tool calls.
+fn codex_mcp_servers(text: &str) -> Vec<String> {
+    const PREFIX: &str = "tools.mcp__";
+    let mut servers = Vec::new();
+    let mut offset = 0;
+    while let Some(rel) = text[offset..].find(PREFIX) {
+        let server_start = offset + rel + PREFIX.len();
+        let rest = &text[server_start..];
+        let Some(server_end) = rest.find("__") else {
+            break;
+        };
+        let server = &rest[..server_end];
+        let tool = &rest[server_end + 2..];
+        let tool_end = tool
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tool.len());
+        if !server.is_empty() && tool_end > 0 && tool[tool_end..].trim_start().starts_with('(') {
+            servers.push(server.to_string());
+        }
+        offset = server_start + server_end + 2 + tool_end;
+    }
+    servers
+}
+
 /// Extract each directory name immediately above a referenced SKILL.md. The
 /// config whitelist later rejects built-in/plugin paths and unknown names.
 fn codex_skill_names(text: &str) -> Vec<String> {
@@ -573,28 +645,35 @@ fn codex_skill_names(text: &str) -> Vec<String> {
 
 /// One call per skill per Codex turn. Reading the same SKILL.md again to finish
 /// a truncated/paged read is still the same invocation and must not inflate it.
-fn codex_skill_event(
+fn codex_exec_event(
     v: &serde_json::Value,
     state: &mut FileState,
     tool_input: &str,
+    include_mcp: bool,
 ) -> Option<RawEvent> {
+    let ts_ms = parse_ts(v)?;
     let skills: Vec<String> = codex_skill_names(tool_input)
         .into_iter()
         .filter(|skill| !state.skills_seen.contains(skill))
         .collect();
-    if skills.is_empty() {
+    let mcp = if include_mcp {
+        codex_mcp_servers(tool_input)
+    } else {
+        Vec::new()
+    };
+    if skills.is_empty() && mcp.is_empty() {
         return None;
     }
     state.skills_seen.extend(skills.iter().cloned());
     Some(RawEvent {
-        ts_ms: parse_ts(v)?,
+        ts_ms,
         session: state.session.clone(),
         model: String::new(),
         in_tok: 0.0,
         cc: 0.0,
         cr: 0.0,
         out_tok: 0.0,
-        mcp: Vec::new(),
+        mcp,
         skills,
         id: String::new(),
         source: String::new(),
@@ -744,6 +823,15 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
 mod tests {
     use super::*;
 
+    fn empty_store() -> Store {
+        Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+            codex_quota: None,
+        }
+    }
+
     #[test]
     fn extracts_codex_skill_names_from_unix_and_windows_paths() {
         let input = r#"sed ~/.codex/skills/find-skills/SKILL.md && type C:\Users\me\.agents\skills\release-notes\SKILL.md && cat ~/.codex/skills/.system/openai-docs/SKILL.md && cat ~/.codex/plugins/cache/bundled/skills/browser/SKILL.md"#;
@@ -755,12 +843,7 @@ mod tests {
 
     #[test]
     fn counts_a_codex_skill_once_per_turn() {
-        let mut store = Store {
-            events: Vec::new(),
-            index: HashMap::new(),
-            manifest: Manifest::default(),
-            codex_quota: None,
-        };
+        let mut store = empty_store();
         let mut state = FileState::default();
         let turn = |id: &str| {
             format!(
@@ -785,18 +868,51 @@ mod tests {
 
     #[test]
     fn parses_classic_codex_exec_command_skill_call() {
-        let mut store = Store {
-            events: Vec::new(),
-            index: HashMap::new(),
-            manifest: Manifest::default(),
-            codex_quota: None,
-        };
+        let mut store = empty_store();
         let mut state = FileState::default();
         let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cat ~/.agents/skills/review/SKILL.md\"}"}}"#;
 
         assert_eq!(
             store.parse_codex_line(call, &mut state).unwrap().skills,
             vec!["review"]
+        );
+    }
+
+    #[test]
+    fn maps_tool_search_results_to_short_mcp_calls() {
+        let mut store = empty_store();
+        let mut state = FileState::default();
+        let search = r#"{"timestamp":"2026-07-09T12:00:00Z","type":"response_item","payload":{"type":"tool_search_output","tools":[{"name":"mcp__node_repl__","tools":[{"name":"js"},{"name":"js_reset"}]}]}}"#;
+        let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"js","arguments":"{}"}}"#;
+
+        assert!(store.parse_codex_line(search, &mut state).is_none());
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().mcp,
+            vec!["node_repl"]
+        );
+    }
+
+    #[test]
+    fn extracts_mcp_calls_from_codex_app_custom_exec() {
+        let mut store = empty_store();
+        let mut state = FileState::default();
+        let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.mcp__node_repl__js({}); await tools.mcp__node_repl__js({}); const ref = tools.mcp__unused__inspect;"}}"#;
+
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().mcp,
+            vec!["node_repl", "node_repl"]
+        );
+    }
+
+    #[test]
+    fn parses_prefixed_codex_mcp_call() {
+        let mut store = empty_store();
+        let mut state = FileState::default();
+        let call = r#"{"timestamp":"2026-07-09T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"mcp__chrome_devtools__click","arguments":"{}"}}"#;
+
+        assert_eq!(
+            store.parse_codex_line(call, &mut state).unwrap().mcp,
+            vec!["chrome_devtools"]
         );
     }
 }

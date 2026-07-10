@@ -108,18 +108,9 @@ fn norm_mcp(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// MCP servers from ~/.codex/config.toml (honoring CODEX_HOME): every
-/// `[mcp_servers.<name>]` table header. A structural TOML parse isn't needed
-/// for section names, so we scan headers instead of adding a toml dependency.
-fn load_codex_mcps() -> HashSet<String> {
-    let mut set = HashSet::new();
-    let path = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home().map(|h| h.join(".codex")))
-        .map(|d| d.join("config.toml"));
-    let Some(text) = path.and_then(|p| fs::read_to_string(p).ok()) else {
-        return set;
-    };
+/// Collect every `[mcp_servers.<name>]` table header. A structural TOML parse
+/// isn't needed for section names, so keep this dependency-free.
+fn add_codex_mcps(text: &str, set: &mut HashSet<String>) {
     for line in text.lines() {
         let line = line.trim();
         // Match [mcp_servers.<name>] and [mcp_servers."<name>"], but not deeper
@@ -131,6 +122,26 @@ fn load_codex_mcps() -> HashSet<String> {
             set.insert(norm_mcp(name));
         }
     }
+}
+
+/// MCP servers from the global Codex config plus trusted project configs seen
+/// in session working directories.
+fn load_codex_mcps(project_dirs: &[PathBuf]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let mut paths = HashSet::new();
+    if let Some(d) = codex_home() {
+        paths.insert(d.join("config.toml"));
+    }
+    for project in project_dirs {
+        for dir in project.ancestors() {
+            paths.insert(dir.join(".codex").join("config.toml"));
+        }
+    }
+    for path in paths {
+        if let Ok(text) = fs::read_to_string(path) {
+            add_codex_mcps(&text, &mut set);
+        }
+    }
     set
 }
 
@@ -140,7 +151,7 @@ impl UserConfig {
         let json = read_user_config();
         UserConfig {
             mcp_servers: mcps_from(json.as_ref()),
-            codex_mcp_servers: load_codex_mcps(),
+            codex_mcp_servers: load_codex_mcps(codex_project_dirs),
             claude_skills: load_user_skills(),
             codex_skills: load_codex_skills(codex_project_dirs),
         }
@@ -164,5 +175,27 @@ impl UserConfig {
         } else {
             self.claude_skills.contains(key)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_normalizes_codex_mcp_server_names() {
+        let mut servers = HashSet::new();
+        add_codex_mcps(
+            r#"
+                [mcp_servers.chrome-devtools]
+                [mcp_servers."node_repl"]
+                [mcp_servers.chrome-devtools.env]
+            "#,
+            &mut servers,
+        );
+        assert_eq!(
+            servers,
+            HashSet::from(["chrome_devtools".into(), "node_repl".into()])
+        );
     }
 }
