@@ -441,18 +441,33 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
   const P: PeriodReport = period === "Day" ? scope.day : period === "Month" ? scope.month : scope.week;
   const M = P.metrics;
+  const models = P.models;
+  const [totalModel, setTotalModel] = useState("");
+  // The All scope can contain the same model once per agent. The selector is
+  // model-based, so combine those rows before calculating its Total and cost.
+  const modelTotals = Array.from(models.reduce((totals, model) => {
+    const prev = totals.get(model.name) ?? { name: model.name, tokens: 0, cost: 0 };
+    prev.tokens += model.tokens;
+    prev.cost += model.cost;
+    totals.set(model.name, prev);
+    return totals;
+  }, new Map<string, { name: string; tokens: number; cost: number }>()).values())
+    .filter((model) => model.tokens > 0)
+    .sort((a, b) => b.tokens - a.tokens);
+  const selectedModel = modelTotals.find((model) => model.name === totalModel);
+  const totalTokens = selectedModel?.tokens ?? M.totalTokens;
+  const totalCost = selectedModel?.cost ?? M.cost;
   // Per-agent slices — non-empty only in the All scope with >=2 sources; they
   // switch the hero bar + chart from Cached/New to a by-agent breakdown.
   const slices = P.agents;
   // animated Total tokens: counts up from 0 on each open / period / scope
-  // switch; held at 0 while the popover is hidden so it never flashes.
-  const animTotal = useCountUp(M.totalTokens, `${period}:${scope.id}:${openGen}`, active);
+  // / model switch; held at 0 while hidden so it never flashes.
+  const animTotal = useCountUp(totalTokens, `${period}:${scope.id}:${totalModel}:${openGen}`, active);
   // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
   const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
   const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
   const agentTotal = slices.reduce((sum, s) => sum + s.tokens, 0);
-  const models = P.models;
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
   // that it'd render a meaningless "0.0%" (a negligible token share). Such a
@@ -575,15 +590,33 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
           <div>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>Total tokens</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+              <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Total tokens</div>
+              <select
+                data-no-drag=""
+                aria-label="Total tokens model"
+                title={selectedModel?.name ?? "All models"}
+                value={selectedModel?.name ?? ""}
+                onChange={(e) => setTotalModel(e.target.value)}
+                style={{
+                  width: 132, height: 22, minWidth: 0, borderRadius: 6,
+                  border: `1px solid ${t.gridLine}`, background: t.gridLine,
+                  color: t.text, padding: "1px 5px", outline: "none",
+                  font: `500 10px ${t.ui}`, cursor: "pointer",
+                }}
+              >
+                <option value="">All models</option>
+                {modelTotals.map((model) => <option key={model.name} value={model.name}>{model.name}</option>)}
+              </select>
+            </div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
               <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
-              {Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
+              {!selectedModel && Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
-            <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${M.cost.toFixed(2)}</div>
+            <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${totalCost.toFixed(2)}</div>
           </div>
         </div>
         {/* All scope: one segment per agent. Single scope: cached vs new. */}
