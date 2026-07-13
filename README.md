@@ -134,7 +134,7 @@ right-click menu to check immediately.
 - **Windows**: the tray icon appears in the notification area. The Windows tray API doesn't show a label beside the icon — **hover the tray icon** to see today's token count in the tooltip (e.g. `Tokenscope · today 12.40M`)
 - Left-click the icon to toggle the panel; right-click for the menu (Open / Refresh / Check for Updates / display preferences / Quit)
 - **Show Weekly Remaining** optionally appends Codex's remaining weekly quota to the menu-bar label (for example `12.40M-81%`); it is off by default and remembers your choice
-- **Dashboard Shortcut** enables a global hotkey for opening the panel (`⌥⌘T` on macOS, `Ctrl+Alt+T` on Windows/Linux); it is off by default and remembers your choice
+- **Dashboard Shortcut** toggles the panel with a global hotkey (`⌥⌘T` on macOS, `Ctrl+Alt+T` on Windows/Linux by default); use **Change Dashboard Shortcut…** to record your own combination. It is off by default and remembers your choice
 - **Launch-at-login is set up automatically** — no manual configuration needed
 
 ## Develop
@@ -165,9 +165,9 @@ For distribution see `PRD.md` §6.3 (Homebrew Cask recommended on macOS; direct 
 Keep all app version files in sync with the bundled helper:
 
 ```bash
-pnpm version:set 1.3.2
+pnpm version:set 1.3.3
 pnpm version:check
-git commit -am "release: v1.3.2"
+git commit -am "release: v1.3.3"
 git push origin main
 ```
 

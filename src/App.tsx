@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
@@ -271,6 +271,84 @@ function VersionUpdate({ st, theme, onInstall, onDismiss }:
   );
 }
 
+function formatShortcut(shortcut: string) {
+  const macos = typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
+  const parts = shortcut.split("+").map((part) => {
+    const key = part.toUpperCase();
+    if (["COMMANDORCONTROL", "COMMANDORCTRL", "CMDORCTRL", "CMDORCONTROL"].includes(key)) return { order: macos ? 4 : 1, label: macos ? "⌘" : "Ctrl" };
+    if (["COMMAND", "CMD", "SUPER"].includes(key)) return { order: 4, label: macos ? "⌘" : "Win" };
+    if (["CONTROL", "CTRL"].includes(key)) return { order: 1, label: macos ? "⌃" : "Ctrl" };
+    if (["OPTION", "ALT"].includes(key)) return { order: 2, label: macos ? "⌥" : "Alt" };
+    if (key === "SHIFT") return { order: 3, label: macos ? "⇧" : "Shift" };
+    return { order: 5, label: part.replace(/^Key/, "").replace(/^Digit/, "") };
+  });
+  const labels = parts.sort((a, b) => a.order - b.order).map((part) => part.label);
+  return macos ? labels.join("") : labels.join("+");
+}
+
+function shortcutFromKeyEvent(event: ReactKeyboardEvent<HTMLDivElement>) {
+  if (["Meta", "Control", "Alt", "Shift"].includes(event.key)) return null;
+  if (!event.metaKey && !event.ctrlKey && !event.altKey) return "";
+  if (!event.code || event.code === "Unidentified") return "";
+  const modifiers = [
+    event.metaKey ? "Command" : "",
+    event.ctrlKey ? "Control" : "",
+    event.altKey ? "Alt" : "",
+    event.shiftKey ? "Shift" : "",
+  ].filter(Boolean);
+  return [...modifiers, event.code].join("+");
+}
+
+function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
+  { current: string; theme: Theme; dark: boolean; onClose: () => void; onSaved: () => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  useEffect(() => { ref.current?.focus(); }, []);
+
+  const record = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") { onClose(); return; }
+    const shortcut = shortcutFromKeyEvent(event);
+    if (shortcut === null) return;
+    if (!shortcut) {
+      setError("Include Command, Control, or Alt");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    invoke("set_dashboard_shortcut", { shortcut })
+      .then(onSaved)
+      .catch(() => { setSaving(false); setError("That shortcut is unavailable"); });
+  };
+
+  return (
+    <div data-no-drag="" onMouseDown={onClose} style={{
+      position: "absolute", inset: 0, zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center",
+      background: "rgba(0,0,0,0.42)", backdropFilter: "blur(3px)",
+    }}>
+      <div ref={ref} role="dialog" aria-modal="true" aria-label="Change dashboard shortcut" tabIndex={0}
+        onKeyDown={record} onMouseDown={(event) => event.stopPropagation()} style={{
+          width: 250, padding: "18px 20px", borderRadius: 12, outline: "none", textAlign: "center",
+          background: dark ? "#292d31" : "#ffffff", border: `1px solid ${theme.gridLine}`,
+          boxShadow: "0 18px 50px rgba(0,0,0,0.38)", color: theme.text,
+        }}>
+        <div style={{ font: `600 12px ${theme.ui}`, marginBottom: 12 }}>Dashboard Shortcut</div>
+        <div style={{
+          display: "inline-flex", padding: "7px 12px", borderRadius: 7,
+          background: dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)",
+          font: `600 13px ${theme.mono}`, color: theme.accent,
+        }}>{formatShortcut(current)}</div>
+        <div style={{ marginTop: 12, font: `500 10px/1.45 ${theme.ui}`, color: theme.dim }}>
+          {saving ? "Saving…" : "Press a new shortcut · Esc to cancel"}
+        </div>
+        {error && <div style={{ marginTop: 7, font: `500 9.5px ${theme.ui}`, color: "#e0795f" }}>{error}</div>}
+      </div>
+    </div>
+  );
+}
+
 // Agent filter chips (All / Claude / Codex …). Rendered only when several
 // sources have data; a single-source install never sees them.
 function AgentChips({ scopes, value, theme, onSelect }:
@@ -535,6 +613,16 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
   // In-app update lifecycle (checking/current → available → downloading → ready).
   const [updSt, updInstall, updDismiss] = updater;
+  const [shortcutEditor, setShortcutEditor] = useState<string | null>(null);
+  useEffect(() => {
+    const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+    if (!inTauri) return;
+    let dead = false;
+    let unlisten: (() => void) | null = null;
+    listen<string>("configure-dashboard-shortcut", (event) => setShortcutEditor(event.payload))
+      .then((stop) => { if (dead) stop(); else unlisten = stop; });
+    return () => { dead = true; unlisten?.(); };
+  }, []);
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
   // NSPanel and is gated out). A real OS window-drag begins only once the
   // pointer moves past a small threshold, so a plain click still clicks through
@@ -923,6 +1011,11 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         }}>
           {toast.msg}
         </div>
+      )}
+      {shortcutEditor !== null && (
+        <ShortcutEditor current={shortcutEditor} theme={t} dark={dark}
+          onClose={() => setShortcutEditor(null)}
+          onSaved={() => { setShortcutEditor(null); showToast("Shortcut enabled", true); }} />
       )}
     </div>
   );

@@ -17,7 +17,7 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 // Positioner is only used for the non-macOS fallback; macOS positions the
 // NSPanel manually (see position_panel).
 #[cfg(not(target_os = "macos"))]
@@ -37,14 +37,64 @@ fn now_ms() -> i64 {
 
 const DASHBOARD_SHORTCUT: &str = "CommandOrControl+Alt+T";
 
-#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct TrayPreferences {
     show_weekly_remaining: bool,
     dashboard_shortcut: bool,
+    dashboard_shortcut_key: String,
+}
+
+impl Default for TrayPreferences {
+    fn default() -> Self {
+        Self {
+            show_weekly_remaining: false,
+            dashboard_shortcut: false,
+            dashboard_shortcut_key: DASHBOARD_SHORTCUT.to_string(),
+        }
+    }
 }
 
 struct TrayPreferencesState(std::sync::Mutex<TrayPreferences>);
+struct DashboardShortcutMenuState(CheckMenuItem<tauri::Wry>);
+
+fn shortcut_label(shortcut: &str) -> String {
+    let macos = cfg!(target_os = "macos");
+    let mut parts = Vec::new();
+    for part in shortcut.split('+') {
+        let (order, label) = match part.to_ascii_uppercase().as_str() {
+            "COMMANDORCONTROL" | "COMMANDORCTRL" | "CMDORCTRL" | "CMDORCONTROL" => {
+                if macos {
+                    (4, "⌘")
+                } else {
+                    (1, "Ctrl")
+                }
+            }
+            "COMMAND" | "CMD" | "SUPER" => (4, if macos { "⌘" } else { "Win" }),
+            "CONTROL" | "CTRL" => (1, if macos { "⌃" } else { "Ctrl" }),
+            "OPTION" | "ALT" => (2, if macos { "⌥" } else { "Alt" }),
+            "SHIFT" => (3, if macos { "⇧" } else { "Shift" }),
+            _ => (
+                5,
+                part.strip_prefix("Key")
+                    .or_else(|| part.strip_prefix("Digit"))
+                    .unwrap_or(part),
+            ),
+        };
+        parts.push((order, label));
+    }
+    parts.sort_by_key(|part| part.0);
+    let labels = parts.into_iter().map(|part| part.1).collect::<Vec<_>>();
+    if macos {
+        labels.join("")
+    } else {
+        labels.join("+")
+    }
+}
+
+fn dashboard_shortcut_menu_label(shortcut: &str) -> String {
+    format!("Dashboard Shortcut ({})", shortcut_label(shortcut))
+}
 
 fn weekly_remaining_pct(dash: &Dashboard) -> Option<u8> {
     let quota = dash.scopes.iter().find_map(|scope| scope.quota.as_ref())?;
@@ -488,6 +538,47 @@ fn show_popover(app: &tauri::AppHandle) {
     let _ = app.run_on_main_thread(move || show_popover_inner(&handle));
 }
 
+fn toggle_popover(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        #[cfg(target_os = "macos")]
+        {
+            let visible = handle
+                .get_webview_panel("main")
+                .map(|panel| panel.is_visible())
+                .unwrap_or_else(|_| {
+                    handle
+                        .get_webview_window("main")
+                        .and_then(|window| window.is_visible().ok())
+                        .unwrap_or(false)
+                });
+            if visible {
+                if let Ok(panel) = handle.get_webview_panel("main") {
+                    panel.order_out(None);
+                } else if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            } else {
+                show_popover_inner(&handle);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let visible = handle
+                .get_webview_window("main")
+                .and_then(|window| window.is_visible().ok())
+                .unwrap_or(false);
+            if visible {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            } else {
+                show_popover_inner(&handle);
+            }
+        }
+    });
+}
+
 fn show_popover_inner(app: &tauri::AppHandle) {
     // On macOS the window is an NSPanel — position it manually, then show()
     // (makes it key and orders it front, incl. over fullscreen Spaces).
@@ -520,6 +611,58 @@ fn show_popover_inner(app: &tauri::AppHandle) {
             "(function(){var e=document.querySelector('.om-scroll');if(e){e.scrollTop=0;}else{window.scrollTo(0,0);}})()",
         );
     }
+}
+
+#[tauri::command]
+fn set_dashboard_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
+    let shortcut = shortcut.trim().to_string();
+    shortcut
+        .parse::<Shortcut>()
+        .map_err(|_| "invalid shortcut".to_string())?;
+
+    let state = app
+        .try_state::<TrayPreferencesState>()
+        .ok_or_else(|| "shortcut state unavailable".to_string())?;
+    let (was_enabled, previous) = state
+        .0
+        .lock()
+        .map(|preferences| {
+            (
+                preferences.dashboard_shortcut,
+                preferences.dashboard_shortcut_key.clone(),
+            )
+        })
+        .map_err(|_| "shortcut state unavailable".to_string())?;
+
+    if was_enabled && previous != shortcut {
+        app.global_shortcut()
+            .unregister(previous.as_str())
+            .map_err(|error| format!("could not replace shortcut: {error}"))?;
+    }
+    if !was_enabled || previous != shortcut {
+        if let Err(error) = app.global_shortcut().register(shortcut.as_str()) {
+            if was_enabled && previous != shortcut {
+                let _ = app.global_shortcut().register(previous.as_str());
+            }
+            return Err(format!("shortcut unavailable: {error}"));
+        }
+    }
+
+    let preferences = state
+        .0
+        .lock()
+        .map(|mut preferences| {
+            preferences.dashboard_shortcut = true;
+            preferences.dashboard_shortcut_key = shortcut.clone();
+            preferences.clone()
+        })
+        .map_err(|_| "shortcut state unavailable".to_string())?;
+    save_tray_preferences(&preferences);
+    if let Some(menu) = app.try_state::<DashboardShortcutMenuState>() {
+        let _ = menu.0.set_checked(true);
+        let _ = menu.0.set_text(dashboard_shortcut_menu_label(&shortcut));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -620,7 +763,7 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        show_popover(app);
+                        toggle_popover(app);
                     }
                 })
                 .build(),
@@ -645,7 +788,8 @@ pub fn run() {
             get_dashboard,
             get_range_dashboard,
             save_screenshot,
-            begin_drag
+            begin_drag,
+            set_dashboard_shortcut
         ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.
@@ -670,7 +814,7 @@ pub fn run() {
             if tray_preferences.dashboard_shortcut
                 && app
                     .global_shortcut()
-                    .register(DASHBOARD_SHORTCUT)
+                    .register(tray_preferences.dashboard_shortcut_key.as_str())
                     .is_err()
             {
                 tray_preferences.dashboard_shortcut = false;
@@ -678,6 +822,7 @@ pub fn run() {
             }
             let weekly_remaining_on = tray_preferences.show_weekly_remaining;
             let dashboard_shortcut_on = tray_preferences.dashboard_shortcut;
+            let dashboard_shortcut_key = tray_preferences.dashboard_shortcut_key.clone();
             app.manage(TrayPreferencesState(std::sync::Mutex::new(
                 tray_preferences,
             )));
@@ -801,17 +946,20 @@ pub fn run() {
                 weekly_remaining_on,
                 None::<&str>,
             )?;
-            let shortcut_label = if cfg!(target_os = "macos") {
-                "Dashboard Shortcut (⌥⌘T)"
-            } else {
-                "Dashboard Shortcut (Ctrl+Alt+T)"
-            };
             let dashboard_shortcut_i = CheckMenuItem::with_id(
                 app,
                 "dashboard-shortcut",
-                shortcut_label,
+                dashboard_shortcut_menu_label(&dashboard_shortcut_key),
                 true,
                 dashboard_shortcut_on,
+                None::<&str>,
+            )?;
+            app.manage(DashboardShortcutMenuState(dashboard_shortcut_i.clone()));
+            let change_dashboard_shortcut_i = MenuItem::with_id(
+                app,
+                "change-dashboard-shortcut",
+                "Change Dashboard Shortcut…",
+                true,
                 None::<&str>,
             )?;
             // Launch-at-login toggle (a checkbox item). Seeded from the reconciled
@@ -834,6 +982,7 @@ pub fn run() {
                     &PredefinedMenuItem::separator(app)?,
                     &weekly_remaining_i,
                     &dashboard_shortcut_i,
+                    &change_dashboard_shortcut_i,
                     &autostart_i,
                     &PredefinedMenuItem::separator(app)?,
                     &quit_i,
@@ -922,15 +1071,20 @@ pub fn run() {
                     }
                     "dashboard-shortcut" => {
                         if let Some(state) = app.try_state::<TrayPreferencesState>() {
-                            let enabled = state
+                            let (enabled, shortcut) = state
                                 .0
                                 .lock()
-                                .map(|prefs| prefs.dashboard_shortcut)
-                                .unwrap_or(false);
+                                .map(|prefs| {
+                                    (
+                                        prefs.dashboard_shortcut,
+                                        prefs.dashboard_shortcut_key.clone(),
+                                    )
+                                })
+                                .unwrap_or((false, DASHBOARD_SHORTCUT.to_string()));
                             let changed = if enabled {
-                                app.global_shortcut().unregister(DASHBOARD_SHORTCUT).is_ok()
+                                app.global_shortcut().unregister(shortcut.as_str()).is_ok()
                             } else {
-                                app.global_shortcut().register(DASHBOARD_SHORTCUT).is_ok()
+                                app.global_shortcut().register(shortcut.as_str()).is_ok()
                             };
                             if changed {
                                 if let Ok(mut prefs) = state.0.lock() {
@@ -940,6 +1094,20 @@ pub fn run() {
                                 }
                             }
                         }
+                    }
+                    "change-dashboard-shortcut" => {
+                        let shortcut = app
+                            .try_state::<TrayPreferencesState>()
+                            .and_then(|state| {
+                                state
+                                    .0
+                                    .lock()
+                                    .ok()
+                                    .map(|prefs| prefs.dashboard_shortcut_key.clone())
+                            })
+                            .unwrap_or_else(|| DASHBOARD_SHORTCUT.to_string());
+                        show_popover(app);
+                        let _ = app.emit("configure-dashboard-shortcut", shortcut);
                     }
                     "autostart" => {
                         // Flip the OS registration, re-read the real state, mirror
@@ -1047,5 +1215,24 @@ mod tests {
         };
 
         assert_eq!(weekly_remaining_from_quota(&quota), Some(81));
+    }
+
+    #[test]
+    fn old_tray_preferences_get_the_default_shortcut() {
+        let preferences: TrayPreferences =
+            serde_json::from_str(r#"{"show_weekly_remaining":true,"dashboard_shortcut":true}"#)
+                .unwrap();
+
+        assert_eq!(preferences.dashboard_shortcut_key, DASHBOARD_SHORTCUT);
+        assert!(DASHBOARD_SHORTCUT.parse::<Shortcut>().is_ok());
+        assert!("Command+Alt+KeyT".parse::<Shortcut>().is_ok());
+        assert_eq!(
+            shortcut_label(DASHBOARD_SHORTCUT),
+            if cfg!(target_os = "macos") {
+                "⌥⌘T"
+            } else {
+                "Ctrl+Alt+T"
+            }
+        );
     }
 }

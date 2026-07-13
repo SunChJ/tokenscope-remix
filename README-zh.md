@@ -132,7 +132,7 @@ App 会在启动时及此后每小时检测新版本。当前版本和更新操�
 - **Windows**：系统托盘出现图标。Windows 任务栏托盘 API 不支持在图标旁显示文字，**鼠标悬停托盘图标**即可看到当日 Token 数（提示气泡形如 `Tokenscope · today 12.40M`）
 - 左键点击图标开/关面板，右键出菜单（Open / Refresh / Check for Updates / 显示偏好 / Quit）
 - **Show Weekly Remaining** 可在菜单栏 Token 数后追加 Codex 每周剩余配额（如 `12.40M-81%`）；默认关闭，选择会被记住
-- **Dashboard Shortcut** 可开启全局快捷键来唤起面板（macOS 为 `⌥⌘T`，Windows/Linux 为 `Ctrl+Alt+T`）；默认关闭，选择会被记住
+- **Dashboard Shortcut** 可用全局快捷键切换面板的显示/隐藏（默认 macOS 为 `⌥⌘T`，Windows/Linux 为 `Ctrl+Alt+T`）；通过 **Change Dashboard Shortcut…** 可直接录入自定义组合键。默认关闭，选择会被记住
 - 已自动设置**登录自启**，无需手动配置
 
 ## 开发
@@ -163,9 +163,9 @@ pnpm tauri build       # macOS 产出 .app / .dmg，Windows 产出 .exe (NSIS)�
 使用仓库内置脚本同步所有版本文件：
 
 ```bash
-pnpm version:set 1.3.2
+pnpm version:set 1.3.3
 pnpm version:check
-git commit -am "release: v1.3.2"
+git commit -am "release: v1.3.3"
 git push origin main
 ```
 
