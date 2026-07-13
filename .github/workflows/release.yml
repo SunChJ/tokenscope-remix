@@ -106,6 +106,8 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v6
 
@@ -132,6 +134,14 @@ jobs:
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
+
+      - name: Validate updater signing
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is required for updater artifacts"
+            exit 1
+          fi
 
       - name: Prepare release notes
         id: release_notes
@@ -170,14 +180,14 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Add TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) plus platform signing
-          # secrets here when signed updater artifacts are enabled.
         with:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: "Tokenscope ${{ env.RELEASE_TAG }}"
           releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
 
       - name: Update Homebrew Cask

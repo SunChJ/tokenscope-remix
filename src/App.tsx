@@ -135,7 +135,7 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
 
 // ── In-app updates ──────────────────────────────────────────────
 // Poll the GitHub release feed (plugin-updater endpoint) on launch and every
-// 6h; surface a slim banner when a newer signed build exists. Download +
+// hour; surface a slim banner when a newer signed build exists. Download +
 // install happen in-app, then a relaunch finishes the update. A dismissed
 // version stays hidden until the *next* version appears (localStorage).
 type UpdateState =
@@ -152,7 +152,10 @@ function useUpdater(): [UpdateState, () => void, () => void] {
     const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     if (!inTauri) return;
     let dead = false;
+    let checking = false;
     const probe = async () => {
+      if (checking) return;
+      checking = true;
       try {
         const u = await checkUpdate();
         if (dead || !u) return;
@@ -160,11 +163,14 @@ function useUpdater(): [UpdateState, () => void, () => void] {
         updRef.current = u;
         setSt({ phase: "available", update: u });
       } catch {
-        // offline / rate-limited / no latest.json yet — stay quiet, retry later
+        // Offline / rate-limited / no latest.json: fail quietly. There is no
+        // immediate retry; the next regular hourly check remains scheduled.
+      } finally {
+        checking = false;
       }
     };
-    probe();
-    const t = window.setInterval(probe, 6 * 60 * 60 * 1000);
+    void probe();
+    const t = window.setInterval(() => { void probe(); }, 60 * 60 * 1000);
     return () => { dead = true; window.clearInterval(t); };
   }, []);
   const install = async () => {
@@ -192,6 +198,8 @@ function useUpdater(): [UpdateState, () => void, () => void] {
   };
   return [st, install, dismiss];
 }
+
+type UpdaterController = ReturnType<typeof useUpdater>;
 
 function releaseNotesSummary(body?: string) {
   if (!body) return null;
@@ -529,7 +537,9 @@ function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onTog
   );
 }
 
-function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean }) {
+function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater }:
+  { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void;
+    openGen: number; active: boolean; updater: UpdaterController }) {
   // Agent scope filter. scopes[0] is always the aggregate; a stale selection
   // (e.g. a source disappeared after a rescan) falls back to it.
   const scopes = dash.scopes;
@@ -538,7 +548,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   // Filtering to one agent re-tints the whole panel with its accent.
   const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
   // In-app update lifecycle (idle → available → downloading → ready).
-  const [updSt, updInstall, updDismiss] = useUpdater();
+  const [updSt, updInstall, updDismiss] = updater;
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
   // NSPanel and is gated out). A real OS window-drag begins only once the
   // pointer moves past a small threshold, so a plain click still clicks through
@@ -928,6 +938,7 @@ export default function App() {
   const [err, setErr] = useState<string | null>(null);
   const [openGen, setOpenGen] = useState(0);
   const [focused, setFocused] = useState(true); // browser preview: always "focused"
+  const updater = useUpdater();
   // Theme preference: explicit Dark / Light, or System (follows the OS
   // appearance live on both macOS and Windows via prefers-color-scheme). First
   // run defaults to System.
@@ -1051,5 +1062,6 @@ export default function App() {
   if (!dash.scopes.length) {
     return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>Failed to load: dashboard returned no scopes</div>;
   }
-  return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme} openGen={openGen} active={focused} />;
+  return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme}
+    openGen={openGen} active={focused} updater={updater} />;
 }

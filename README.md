@@ -8,6 +8,14 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
 ![Tokenscope panel (dark / light)](docs/screenshot.png)
 
+## Quick install on macOS
+
+Homebrew is the recommended installation and upgrade path:
+
+```bash
+brew install --cask sunchj/tokenscope/tokenscope
+```
+
 ## What it does
 
 - Shows today's token count (all agents combined) next to the menu-bar icon (e.g. `⬡ 14.00M`)
@@ -72,7 +80,11 @@ So a cache hit is **not** billed as normal input — it uses the dedicated (chea
 
 ## Install
 
-### Option 1: Homebrew (recommended)
+### macOS: Homebrew (recommended)
+
+Homebrew is the primary installation method for macOS. It provides one-command
+installation, handles Gatekeeper quarantine automatically, and keeps upgrades
+predictable.
 
 ```bash
 brew install --cask sunchj/tokenscope/tokenscope
@@ -88,7 +100,7 @@ Upgrade:
 brew update && brew upgrade --cask tokenscope
 ```
 
-### Option 2: Download the .dmg
+### macOS: Download the .dmg (fallback)
 
 1. Download the latest `Tokenscope_*_universal.dmg` from [Releases](https://github.com/SunChJ/tokenscope-remix/releases) (works on both Apple Silicon and Intel)
 2. Drag it into Applications
@@ -101,7 +113,7 @@ brew update && brew upgrade --cask tokenscope
 
 > Unsigned is a current known limitation. A true "double-click to open" experience requires Apple Developer ID signing + notarization — see `PRD.md` §6.4.
 
-### Option 3: Install on Windows
+### Windows
 
 1. Download the latest `Tokenscope_*_x64-setup.exe` from [Releases](https://github.com/SunChJ/tokenscope-remix/releases)
 2. Double-click to install. Because the build is **unsigned**, Windows SmartScreen will warn on first run — click **More info → Run anyway**
@@ -110,10 +122,9 @@ brew update && brew upgrade --cask tokenscope
 
 ### Updating
 
-From v1.2.0 the app checks for new releases itself and shows an in-app banner
-("v*x.y.z* is available → Update"); the update downloads, installs, and applies
-on restart — no manual download needed. Homebrew users can keep using
-`brew upgrade --cask tokenscope` as well; both paths install the same build.
+The app checks for new releases on launch and every hour, then shows an in-app
+banner ("v*x.y.z* is available → Update"). Homebrew users should keep using
+`brew upgrade --cask tokenscope`; direct-download users can update in the app.
 
 ### After first launch
 
@@ -157,8 +168,10 @@ git push origin main
 ```
 
 A version change pushed to `main` is validated by GitHub Actions, tagged as
-`vX.Y.Z`, then built and published for macOS and Windows. A matching existing
-tag can also be run manually from the Release workflow for recovery.
+`vX.Y.Z`, then built and published for macOS and Windows together with signed
+updater artifacts and `latest.json`. A matching existing tag can also be run
+manually from the Release workflow for recovery. The release workflow requires
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets.
 
 ## Structure
 

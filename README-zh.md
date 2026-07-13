@@ -8,6 +8,14 @@
 
 ![Tokenscope 面板（深色 / 浅色）](docs/screenshot.png)
 
+## macOS 快速安装
+
+Homebrew 是推荐的安装和升级方式：
+
+```bash
+brew install --cask sunchj/tokenscope/tokenscope
+```
+
 ## 它做什么
 
 - 菜单栏图标旁显示当日 Token 数（所有 Agent 合计，如 `⬡ 14.00M`）
@@ -72,7 +80,10 @@ cost = input            × price.input
 
 ## 安装
 
-### 方式一：Homebrew（推荐）
+### macOS：Homebrew（推荐）
+
+Homebrew 是 macOS 的主要安装方式：一条命令完成安装，自动处理
+Gatekeeper 隔离属性，后续升级也更简单可控。
 
 ```bash
 brew install --cask sunchj/tokenscope/tokenscope
@@ -88,7 +99,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 brew update && brew upgrade --cask tokenscope
 ```
 
-### 方式二：下载 .dmg
+### macOS：下载 .dmg（备用）
 
 1. 从 [Releases](https://github.com/SunChJ/tokenscope-remix/releases) 下载最新的 `Tokenscope_*_universal.dmg`（同时支持 Apple Silicon 与 Intel）
 2. 拖入「应用程序」
@@ -101,7 +112,7 @@ brew update && brew upgrade --cask tokenscope
 
 > 未签名是当前的已知限制。要彻底「双击直开」需 Apple Developer ID 签名 + 公证，见 `PRD.md` §6.4。
 
-### 方式三：Windows 安装
+### Windows
 
 1. 从 [Releases](https://github.com/SunChJ/tokenscope-remix/releases) 下载最新的 `Tokenscope_*_x64-setup.exe`
 2. 双击安装。因为是**未签名**构建，首次运行会被 SmartScreen 拦截 —— 点 **"更多信息" → "仍要运行"** 即可
@@ -110,9 +121,9 @@ brew update && brew upgrade --cask tokenscope
 
 ### 更新
 
-自 v1.2.0 起，App 会自行检测新版本并在面板内提示（「v*x.y.z* is available → Update」），
-点击即可下载安装、重启生效，无需手动下载。Homebrew 用户也可以继续
-`brew upgrade --cask tokenscope`，两条路径安装的是同一份构建。
+App 会在启动时及此后每小时检测新版本，并在面板内提示
+（「v*x.y.z* is available → Update」）。Homebrew 用户建议继续使用
+`brew upgrade --cask tokenscope`；直接下载安装的用户可使用 App 内更新。
 
 ### 首次启动后
 
@@ -156,8 +167,10 @@ git push origin main
 ```
 
 版本号变更推送到 `main` 后，GitHub Actions 会校验版本、创建 `vX.Y.Z`
-标签，并自动构建和发布 macOS / Windows 安装包。发布失败时，也可以在
-Release workflow 中选择已有的同版本标签手工重跑。
+标签，并自动构建和发布 macOS / Windows 安装包、签名更新包和 `latest.json`。
+发布失败时，也可以在 Release workflow 中选择已有的同版本标签手工重跑。
+发布流程需要配置 `TAURI_SIGNING_PRIVATE_KEY` 和
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets。
 
 ## 结构
 
