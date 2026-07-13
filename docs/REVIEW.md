@@ -14,7 +14,7 @@
 2. 一切都经 `build_dashboard` 每 30s + 每次开 popover 触发,造成 O(全部历史) 的重复全量读写/解析(含主线程阻塞 IO 与锁内网络抓取);
 3. 发布流水线脆弱。
 
-**跨平台/Windows 风险尤其突出**:当前 `feat/windows-support` 分支的 Critical 构建中断同时阻断 macOS `.dmg` 与 Windows NSIS 安装器;autostart 在 Windows 上写 `HKCU\...\Run` 且无法关闭;非原子写入与 AV/文件锁在 Windows 上更易触发缓存损坏;彩带依赖 WebView2 冷启动时序。
+**跨平台/Windows 风险尤其突出**:当前 `feat/windows-support` 分支的 Critical 构建中断同时阻断 macOS `.dmg` 与 Windows NSIS 安装器;autostart 在 Windows 上写 `HKCU\...\Run` 且无法关闭;非原子写入与 AV/文件锁在 Windows 上更易触发缓存损坏。
 
 ---
 
@@ -107,9 +107,7 @@
 9. **`fetch_cached` 持久化任何以 `{` 开头的 200 响应,可毒化缓存 24h**(`pricing.rs:70-79`)——结构校验通过后再覆盖缓存。
 10. **Shell 插件与 `shell:allow-open` 能力被启用但从未使用**(`capabilities/default.json:16`、`lib.rs:550`、`Cargo.toml:19`)——纯负债,扩大攻击面,删除。
 11. **`workflow_dispatch` 从非 tag ref 触发会产生畸形 release 并使 Homebrew 步骤失败**(`release.yml`)——加 `if: startsWith(github.ref, 'refs/tags/v')` 守卫。
-12. **Milestone 快照在状态锁外持久化,可能写入回退的旧 floor**(`lib.rs:134-155`)——`save_milestones` 移入持锁区并令 floor 单调。
-13. **请求趋势 sparkline 计入了请求指标排除的 slash-command 事件**(`parser.rs:288/350/420`)——给趋势自增加 `if !e.model.is_empty()` 守卫。
-14. **彩带尾部被截断:动画寿命长于固定 4200ms 隐藏定时器**(`confetti.html:135-141`、`lib.rs:255-256`)——经 IPC 发 `confetti-done` 再隐藏,或延迟提到 ~5500ms。
+12. **请求趋势 sparkline 计入了请求指标排除的 slash-command 事件**(`parser.rs:288/350/420`)——给趋势自增加 `if !e.model.is_empty()` 守卫。
 
 ---
 

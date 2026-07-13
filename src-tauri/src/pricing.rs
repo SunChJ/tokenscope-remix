@@ -109,7 +109,9 @@ fn fetch_cached(name: &str, url: &str, valid: impl Fn(&str) -> bool) -> Option<S
             .unwrap_or(false);
         if fresh {
             if let Ok(t) = fs::read_to_string(&path) {
-                return Some(t);
+                if valid(&t) {
+                    return Some(t);
+                }
             }
         }
     }
@@ -122,8 +124,9 @@ fn fetch_cached(name: &str, url: &str, valid: impl Fn(&str) -> bool) -> Option<S
             }
         }
     }
-    // stale cache as last resort
-    fs::read_to_string(&path).ok()
+    // Last successful raw response is the offline price source. Never return a
+    // corrupt/partial cache: let the bundled snapshot take over in that case.
+    fs::read_to_string(&path).ok().filter(|t| valid(t))
 }
 
 impl Pricing {
@@ -270,7 +273,14 @@ impl Pricing {
         if let Some(p) = self.exact.get(model) {
             return Some(p);
         }
-        self.norm.get(&normalize_key(model))
+        let key = normalize_key(model);
+        self.norm.get(&key).or_else(|| match key.as_str() {
+            // LiteLLM currently lists Spark without cost fields. Estimate it
+            // from GPT-5.3-Codex in the same downloaded raw table; a future
+            // dedicated Spark price still wins through the lookups above.
+            "gpt-5p3-codex-spark" => self.norm.get("gpt-5p3-codex"),
+            _ => None,
+        })
     }
 
     /// Exact-or-normalized cost in USD. None = no pricing data for this model.
@@ -294,5 +304,51 @@ impl Pricing {
     #[allow(dead_code)]
     pub fn known(&self, model: &str) -> bool {
         self.lookup(model).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pricing;
+
+    fn assert_cost(pricing: &Pricing, model: &str, expected: f64) {
+        let actual = pricing
+            .cost(model, 1_000_000.0, 1_000_000.0, 0.0, 1_000_000.0)
+            .unwrap();
+        assert!((actual - expected).abs() < 1e-9, "{model}: {actual}");
+    }
+
+    #[test]
+    fn prices_recent_codex_models_from_litellm_raw() {
+        let mut pricing = Pricing {
+            exact: Default::default(),
+            norm: Default::default(),
+        };
+        pricing.ingest_litellm(
+            r#"{
+                "gpt-5.6-sol": {
+                    "input_cost_per_token": 0.000005,
+                    "cache_read_input_token_cost": 0.0000005,
+                    "output_cost_per_token": 0.00003
+                },
+                "gpt-5.6-terra": {
+                    "input_cost_per_token": 0.0000025,
+                    "cache_read_input_token_cost": 0.00000025,
+                    "output_cost_per_token": 0.000015
+                },
+                "gpt-5.3-codex": {
+                    "input_cost_per_token": 0.00000175,
+                    "cache_read_input_token_cost": 0.000000175,
+                    "output_cost_per_token": 0.000014
+                },
+                "chatgpt/gpt-5.3-codex-spark": {
+                    "litellm_provider": "chatgpt"
+                }
+            }"#,
+        );
+
+        assert_cost(&pricing, "gpt-5.6-sol", 35.5);
+        assert_cost(&pricing, "gpt-5.6-terra", 17.75);
+        assert_cost(&pricing, "gpt-5.3-codex-spark", 15.925);
     }
 }

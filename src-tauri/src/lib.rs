@@ -5,17 +5,17 @@ mod pricing;
 mod store;
 
 use model::Dashboard;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(not(target_os = "macos"))]
+use tauri::WindowEvent;
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
-#[cfg(not(target_os = "macos"))]
-use tauri::WindowEvent;
-use std::time::Duration;
 use tauri_plugin_autostart::ManagerExt;
 // Positioner is only used for the non-macOS fallback; macOS positions the
 // NSPanel manually (see position_panel).
@@ -53,55 +53,11 @@ fn update_tray_label(app: &tauri::AppHandle, label: String) {
 fn refresh(app: &tauri::AppHandle) {
     let dash = parser::build_dashboard();
     update_tray_label(app, fmt_tokens_m(dash.today_tokens));
-    check_milestones(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
 }
 
-/// Persisted 100M-token milestone snapshot. Stored in the app *data* dir so it
-/// survives app restarts, reboots, and updates (which only replace the .app
-/// bundle, never the data dir). The per-period ids let us tell a real crossing
-/// from a period reset.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct MilestoneState {
-    week_id: String,
-    week_floor: i64,
-    month_id: String,
-    month_floor: i64,
-}
-
-/// 100M-token celebration tracking. `state` is the last persisted snapshot
-/// (`None` only before the very first observation ever, so the first run
-/// baselines without celebrating pre-existing usage). `active` guards against
-/// overlapping celebrations.
-struct Celebration {
-    state: std::sync::Mutex<Option<MilestoneState>>,
-    active: AtomicBool,
-}
-
-/// `~/Library/Application Support/tokenscope/milestones.json` (platform
-/// equivalent elsewhere). Deliberately the data dir, not the Caches dir the
-/// event store uses — Caches can be purged by the OS, milestones must not be.
-fn milestones_path() -> Option<std::path::PathBuf> {
-    let dir = dirs::data_dir()?.join("tokenscope");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("milestones.json"))
-}
-
-fn load_milestones() -> Option<MilestoneState> {
-    let t = std::fs::read_to_string(milestones_path()?).ok()?;
-    serde_json::from_str(&t).ok()
-}
-
-fn save_milestones(m: &MilestoneState) {
-    if let Some(p) = milestones_path() {
-        if let Ok(t) = serde_json::to_string(m) {
-            let _ = std::fs::write(p, t);
-        }
-    }
-}
-
 // ── Launch-at-login preference ──────────────────────────────────────
-// Persisted in the data dir (survives restarts/updates, like milestones). The
+// Persisted in the data dir so it survives restarts and updates. The
 // on/off toggle lives in the tray's right-click menu; on startup we reconcile
 // the OS registration to this preference rather than force-enabling every
 // launch (which silently undid a user who had turned autostart off).
@@ -144,202 +100,6 @@ fn reconcile_autostart(app: &tauri::AppHandle) -> bool {
         let _ = mgr.disable();
     }
     pref
-}
-
-/// Current calendar-week and calendar-month identifiers, matching parser.rs's
-/// period definitions (Monday-based week, calendar month), so a stored floor is
-/// only ever compared within the same period.
-fn period_ids() -> (String, String) {
-    use chrono::Datelike;
-    let d = chrono::Local::now().date_naive();
-    let iso = d.iso_week();
-    (
-        format!("{}-W{:02}", iso.year(), iso.week()),
-        format!("{}-{:02}", d.year(), d.month()),
-    )
-}
-
-/// Decide whether to celebrate: fire if either period advanced to a higher
-/// 100M floor *within the same period*. `None` (first ever observation) never
-/// fires. A period-id mismatch means that period reset, so it re-baselines
-/// silently rather than comparing floors. Returns a single bool, so a jump
-/// across several boundaries — or week and month advancing together — is one
-/// celebration.
-fn milestone_fire(prev: Option<&MilestoneState>, cur: &MilestoneState) -> bool {
-    match prev {
-        None => false,
-        Some(p) => {
-            (p.week_id == cur.week_id && cur.week_floor > p.week_floor)
-                || (p.month_id == cur.month_id && cur.month_floor > p.month_floor)
-        }
-    }
-}
-
-/// Observe the latest totals, persist the snapshot, and celebrate on a new
-/// 100M-token milestone. We watch week ∪ month, not day: today is always within
-/// both the current week and month, so a day crossing is already implied by the
-/// month — but a calendar week can straddle a month boundary, so early in a
-/// month the week total can lead the (freshly reset) month, hence both. Because
-/// the snapshot is persisted, a crossing that happened while the app wasn't
-/// running (it reads the logs Claude writes regardless) still catches up on the
-/// next observation.
-fn check_milestones(app: &tauri::AppHandle, dash: &Dashboard) {
-    let Some(state) = app.try_state::<Celebration>() else {
-        return;
-    };
-    // The first scope is always the aggregate view (all agents combined).
-    let Some(primary) = dash.scopes.first() else {
-        return;
-    };
-    // total_tokens is already in millions, so a 100M milestone is total / 100.
-    let (week_id, month_id) = period_ids();
-    let cur = MilestoneState {
-        week_id,
-        week_floor: (primary.week.metrics.total_tokens / 100.0).floor() as i64,
-        month_id,
-        month_floor: (primary.month.metrics.total_tokens / 100.0).floor() as i64,
-    };
-
-    let mut g = state.state.lock().unwrap();
-    let fire = milestone_fire(g.as_ref(), &cur);
-    // Keep the persisted floors monotonic within a period: a later observation
-    // with a lower total (a transient/partial read, or two observers racing)
-    // must not regress the stored floor and re-fire the celebration on restart.
-    let mut next = cur.clone();
-    if let Some(prev) = g.as_ref() {
-        if prev.week_id == next.week_id && prev.week_floor > next.week_floor {
-            next.week_floor = prev.week_floor;
-        }
-        if prev.month_id == next.month_id && prev.month_floor > next.month_floor {
-            next.month_floor = prev.month_floor;
-        }
-    }
-    *g = Some(next.clone());
-    // Persist while still holding the lock so two observers can't interleave and
-    // write a stale snapshot over a newer one.
-    save_milestones(&next);
-    drop(g);
-    if fire {
-        celebrate(app);
-    }
-}
-
-/// Trigger the celebration overlay. Window/panel work must run on the main
-/// thread (refresh() runs on a background thread), so hop there.
-fn celebrate(app: &tauri::AppHandle) {
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || show_celebration(&handle));
-}
-
-/// Show (or reuse) a full-screen, click-through, non-activating overlay on the
-/// primary monitor and run the confetti animation, then hide it after it plays.
-/// Must be called on the main thread.
-#[allow(deprecated)] // tauri_nspanel::cocoa (objc2 migration is upstream's)
-fn show_celebration(app: &tauri::AppHandle) {
-    let Some(state) = app.try_state::<Celebration>() else {
-        return;
-    };
-    // Skip if a celebration is already playing.
-    if state.active.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let (pos, size) = match app.primary_monitor() {
-        Ok(Some(m)) => (*m.position(), *m.size()),
-        _ => {
-            state.active.store(false, Ordering::SeqCst);
-            return;
-        }
-    };
-
-    // Whether the confetti window was reused or freshly built — only used on
-    // macOS to decide whether to (re-)apply the NSPanel attributes.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    let existed = app.get_webview_window("confetti").is_some();
-    let win = match app.get_webview_window("confetti") {
-        Some(w) => w,
-        None => {
-            match tauri::WebviewWindowBuilder::new(
-                app,
-                "confetti",
-                tauri::WebviewUrl::App("confetti.html".into()),
-            )
-            .title("Tokenscope Celebration")
-            .inner_size(size.width as f64, size.height as f64)
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .resizable(false)
-            .visible(false)
-            .build()
-            {
-                Ok(w) => w,
-                Err(_) => {
-                    state.active.store(false, Ordering::SeqCst);
-                    return;
-                }
-            }
-        }
-    };
-
-    // Cover the whole primary monitor and let clicks pass through to the apps
-    // beneath — the celebration must never interrupt what the user is doing.
-    let _ = win.set_position(pos);
-    let _ = win.set_size(size);
-    let _ = win.set_ignore_cursor_events(true);
-
-    #[cfg(target_os = "macos")]
-    {
-        use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
-        #[allow(non_upper_case_globals)]
-        const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
-
-        // Convert to a non-activating panel once, so it can float over apps in
-        // native fullscreen without stealing focus (same approach as the main
-        // popover). On reuse the window is already a panel.
-        if !existed {
-            if let Ok(panel) = win.to_panel() {
-                panel.set_level(25); // NSMainMenuWindowLevel (24) + 1
-                panel.set_style_mask(NS_NONACTIVATING_PANEL);
-                panel.set_collection_behaviour(
-                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorMoveToActiveSpace
-                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
-                );
-            }
-        }
-        let _ = win.eval("window.__burst&&window.__burst()");
-        if let Ok(panel) = app.get_webview_panel("confetti") {
-            panel.show();
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = win.eval("window.__burst&&window.__burst()");
-        let _ = win.show();
-    }
-
-    // Hide once the animation has played out (emission ~2.3s + fall/fade).
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(4200));
-        let app3 = app2.clone();
-        let _ = app2.run_on_main_thread(move || {
-            #[cfg(target_os = "macos")]
-            if let Ok(panel) = app3.get_webview_panel("confetti") {
-                panel.order_out(None);
-            }
-            #[cfg(not(target_os = "macos"))]
-            if let Some(w) = app3.get_webview_window("confetti") {
-                let _ = w.hide();
-            }
-            if let Some(st) = app3.try_state::<Celebration>() {
-                st.active.store(false, Ordering::SeqCst);
-            }
-        });
-    });
 }
 
 /// Last tray-icon rectangle (physical px: x, y, width, height), captured on tray
@@ -702,7 +462,6 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // instant it opens, while the tray otherwise only refreshes every 30s — so
     // without this the two could disagree for up to 30s during heavy usage.
     update_tray_label(&app, fmt_tokens_m(dash.today_tokens));
-    check_milestones(&app, &dash);
     dash
 }
 
@@ -795,14 +554,6 @@ pub fn run() {
             // Drag-start timestamp so a drag doesn't hide the popover (non-macOS).
             #[cfg(not(target_os = "macos"))]
             app.manage(DragGuard(AtomicI64::new(0)));
-
-            // 100M-token celebration tracking. Load the persisted snapshot so
-            // milestones survive restarts/reboots/updates; the first run ever
-            // (no file) baselines on first observation without celebrating.
-            app.manage(Celebration {
-                state: std::sync::Mutex::new(load_milestones()),
-                active: AtomicBool::new(false),
-            });
 
             // Reconcile launch-at-login with the user's saved preference. The
             // on/off toggle lives in the tray's right-click menu (built below);
@@ -1019,12 +770,15 @@ pub fn run() {
             // cold/stale cache) and refresh once a day. build_dashboard reads the
             // memoized copy, so neither JSON parsing nor the network ever runs
             // while BUILD_LOCK is held.
-            std::thread::spawn(|| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
                 pricing::Pricing::reload_shared();
-                loop {
-                    std::thread::sleep(Duration::from_secs(24 * 60 * 60));
-                    pricing::Pricing::reload_shared();
-                }
+                // Rebuild immediately with the newly loaded prices. Otherwise
+                // an open panel can keep showing the startup built-in snapshot
+                // (and false "without pricing data" warnings) until the next
+                // unrelated 30-second refresh.
+                refresh(&handle);
+                std::thread::sleep(Duration::from_secs(24 * 60 * 60));
             });
 
             // Background refresh: keep the tray's token count current and push
@@ -1083,65 +837,4 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ms(wk: &str, wf: i64, mo: &str, mf: i64) -> MilestoneState {
-        MilestoneState {
-            week_id: wk.into(),
-            week_floor: wf,
-            month_id: mo.into(),
-            month_floor: mf,
-        }
-    }
-
-    #[test]
-    fn first_ever_observation_baselines_without_firing() {
-        // No prior snapshot → never celebrate pre-existing usage on first run.
-        assert!(!milestone_fire(None, &ms("2026-W24", 3, "2026-06", 3)));
-    }
-
-    #[test]
-    fn no_change_does_not_fire() {
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 3)));
-    }
-
-    #[test]
-    fn month_crossing_fires() {
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 4)));
-    }
-
-    #[test]
-    fn week_crossing_fires_even_when_month_flat() {
-        // Early in a month the week (straddling from the previous month) can lead.
-        let prev = ms("2026-W24", 0, "2026-06", 0);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 0)));
-    }
-
-    #[test]
-    fn multi_boundary_jump_is_a_single_fire() {
-        // 3 → 7 is still one celebration (fire is a bool, not a count).
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 7)));
-    }
-
-    #[test]
-    fn new_month_rebaselines_silently() {
-        // Period id changed → that period reset; re-baseline, don't compare floors
-        // (so a new month opening below last month's floor never fires).
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W27", 0, "2026-07", 0)));
-    }
-
-    #[test]
-    fn new_week_does_not_fire_on_reset() {
-        let prev = ms("2026-W24", 2, "2026-06", 3);
-        // New week (id changed), month unchanged and flat → no fire.
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W25", 0, "2026-06", 3)));
-    }
 }
