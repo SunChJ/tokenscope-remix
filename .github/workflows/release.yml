@@ -122,7 +122,7 @@ jobs:
           # `brew install` to work.
           releaseDraft: false
           prerelease: false
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
 
       - name: Update Homebrew Cask
         if: matrix.os == 'macos-latest'
