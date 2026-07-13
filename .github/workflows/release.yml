@@ -57,6 +57,7 @@ jobs:
 
       - name: Prepare release notes
         id: release_notes
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
