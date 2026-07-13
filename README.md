@@ -165,9 +165,9 @@ For distribution see `PRD.md` §6.3 (Homebrew Cask recommended on macOS; direct 
 Keep all app version files in sync with the bundled helper:
 
 ```bash
-pnpm version:set 1.3.3
+pnpm version:set 1.3.4
 pnpm version:check
-git commit -am "release: v1.3.3"
+git commit -am "release: v1.3.4"
 git push origin main
 ```
 

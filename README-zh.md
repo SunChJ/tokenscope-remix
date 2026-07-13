@@ -163,9 +163,9 @@ pnpm tauri build       # macOS 产出 .app / .dmg，Windows 产出 .exe (NSIS)�
 使用仓库内置脚本同步所有版本文件：
 
 ```bash
-pnpm version:set 1.3.3
+pnpm version:set 1.3.4
 pnpm version:check
-git commit -am "release: v1.3.3"
+git commit -am "release: v1.3.4"
 git push origin main
 ```
 
