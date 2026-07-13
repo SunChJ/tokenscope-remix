@@ -6,8 +6,8 @@ import { domToPng } from "modern-screenshot";
 import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
-  Dashboard, PeriodReport, ModelStat, Scope, Quota, Theme, TH,
-  fetchDashboard, fmtInt, fmtTokens, pct, themeForScope,
+  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, Scope, Quota, Theme, TH,
+  fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
@@ -52,7 +52,7 @@ function Delta({ v, theme }: { v: number; theme: Theme }) {
   // Usage/cost going up is "bad" → red; going down is "good" → green.
   const col = up ? "#e0795f" : theme.accent;
   return (
-    <span style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
+    <span title="Compared with the previous period" style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
       padding: "1.5px 5px", borderRadius: 5, background: up ? "rgba(224,121,95,0.16)" : "rgba(39,176,110,0.14)" }}>
       {up ? "▲" : "▼"}{Math.abs(Math.round(v))}%
     </span>
@@ -126,8 +126,8 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
       display: "flex", alignItems: "center", gap: 14,
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
-      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {cacheM.toFixed(2)}M</span>
-      <span><span style={{ color: t.accentSoft }}>●</span> New {restM.toFixed(2)}M</span>
+      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {fmtTokens(cacheM)}</span>
+      <span><span style={{ color: t.accentSoft }}>●</span> New {fmtTokens(restM)}</span>
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
     </div>
   );
@@ -422,6 +422,113 @@ function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolea
   );
 }
 
+function localIso(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatRange(range: DateRange, year = true) {
+  const options: Intl.DateTimeFormatOptions = {
+    month: "short",
+    day: "numeric",
+    ...(year ? { year: "numeric" } : {}),
+  };
+  const format = (iso: string) => new Date(`${iso}T00:00:00`).toLocaleDateString("en-US", options);
+  return range.startDate === range.endDate
+    ? format(range.startDate)
+    : `${format(range.startDate)} – ${format(range.endDate)}`;
+}
+
+function tokenAmount(valueM: number, targetM: number) {
+  if (targetM >= 1) return { value: valueM.toFixed(2), unit: "M" };
+  if (targetM >= 0.001) {
+    const valueK = valueM * 1000;
+    return { value: valueK.toFixed(targetM < 0.01 ? 1 : 0), unit: "K" };
+  }
+  return { value: Math.round(valueM * 1_000_000).toLocaleString("en-US"), unit: "tokens" };
+}
+
+function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onToggle, onDraft, onApply, onClear }:
+  { theme: Theme; dark: boolean; open: boolean; active: boolean; draft: DateRange; max: string; busy: boolean;
+    error: string; onToggle: () => void; onDraft: (range: DateRange) => void; onApply: () => void; onClear: () => void }) {
+  const t = theme;
+  const root = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => {
+      if (!root.current?.contains(event.target as Node)) onToggle();
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onToggle();
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open, onToggle]);
+
+  const inputStyle: React.CSSProperties = {
+    width: 142, height: 30, borderRadius: 7, outline: "none",
+    border: `1px solid ${t.segBorder}`, background: t.segBg, color: t.text,
+    padding: "3px 7px", font: `500 10.5px ${t.mono}`, colorScheme: dark ? "dark" : "light",
+  };
+  return (
+    <div ref={root} data-no-drag="" style={{ position: "relative" }}>
+      <button type="button" onClick={onToggle} title={active ? "Change date range" : "Filter by date range"}
+        aria-label="filter by date range" aria-expanded={open} style={{
+          display: "inline-flex", alignItems: "center", justifyContent: "center",
+          width: 26, height: 26, borderRadius: 7, cursor: "pointer", padding: 0,
+          background: active || open ? t.segOnBg : t.segBg,
+          border: `1px solid ${t.segBorder}`,
+          color: active || open ? t.segOnText : t.dim,
+          boxShadow: active || open ? t.segOnShadow : "none",
+        }}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="5" width="18" height="16" rx="2" />
+          <path d="M16 3v4M8 3v4M3 10h18" />
+          {busy && <circle cx="17.5" cy="16.5" r="2.2" fill={t.accent} stroke="none" />}
+        </svg>
+      </button>
+      {open && (
+        <form onSubmit={(event) => { event.preventDefault(); onApply(); }} style={{
+          position: "absolute", top: 34, right: -68, zIndex: 40, width: 342,
+          padding: 11, borderRadius: 10, background: t.card,
+          border: `1px solid ${t.segBorder}`, boxShadow: "0 12px 32px rgba(0,0,0,0.28)",
+        }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input aria-label="Start date" type="date" required max={draft.endDate || max}
+              value={draft.startDate} onChange={(event) => onDraft({ ...draft, startDate: event.target.value })}
+              style={inputStyle} />
+            <span style={{ color: t.faint, font: `500 11px ${t.mono}` }}>to</span>
+            <input aria-label="End date" type="date" required min={draft.startDate} max={max}
+              value={draft.endDate} onChange={(event) => onDraft({ ...draft, endDate: event.target.value })}
+              style={inputStyle} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9 }}>
+            <span style={{ flex: 1, minWidth: 0, color: error ? "#e0795f" : t.faint,
+              font: `500 9px ${t.mono}`, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {error || "Dates are inclusive"}
+            </span>
+            {active && <button type="button" onClick={onClear} style={{
+              border: "none", background: "transparent", color: t.dim, cursor: "pointer",
+              padding: "4px 6px", font: `600 10px ${t.ui}`,
+            }}>Clear</button>}
+            <button type="submit" disabled={busy} style={{
+              border: "none", borderRadius: 6, background: t.accent, color: "#fff",
+              cursor: busy ? "default" : "pointer", padding: "4px 10px",
+              opacity: busy ? 0.65 : 1, font: `600 10px ${t.ui}`,
+            }}>{busy ? "Loading…" : "Apply"}</button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
 function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean }) {
   // Agent scope filter. scopes[0] is always the aggregate; a stale selection
   // (e.g. a source disappeared after a rescan) falls back to it.
@@ -439,7 +546,75 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
-  const P: PeriodReport = period === "Day" ? scope.day : period === "Month" ? scope.month : scope.week;
+  const today = localIso(new Date());
+  const [rangeOpen, setRangeOpen] = useState(false);
+  const [draftRange, setDraftRange] = useState<DateRange>(() => {
+    const now = new Date();
+    return { startDate: localIso(new Date(now.getFullYear(), now.getMonth(), 1)), endDate: localIso(now) };
+  });
+  const [activeRange, setActiveRange] = useState<DateRange | null>(null);
+  const [rangeDash, setRangeDash] = useState<RangeDashboard | null>(null);
+  const [rangeBusy, setRangeBusy] = useState(false);
+  const [rangeError, setRangeError] = useState("");
+  const rangeRequest = useRef(0);
+  const rangeBaseGeneration = useRef("");
+
+  const clearDateRange = () => {
+    rangeRequest.current += 1;
+    setActiveRange(null);
+    setRangeDash(null);
+    setRangeBusy(false);
+    setRangeError("");
+    setRangeOpen(false);
+  };
+  const selectPeriod = (value: string) => {
+    clearDateRange();
+    setPeriod(value as "Day" | "Week" | "Month");
+  };
+  const applyDateRange = async () => {
+    if (!draftRange.startDate || !draftRange.endDate || draftRange.startDate > draftRange.endDate) {
+      setRangeError("Choose a valid date range");
+      return;
+    }
+    const request = ++rangeRequest.current;
+    setRangeBusy(true);
+    setRangeError("");
+    try {
+      const result = await fetchRangeDashboard(draftRange);
+      if (request !== rangeRequest.current) return;
+      setRangeDash(result);
+      setActiveRange({ ...draftRange });
+      rangeBaseGeneration.current = dash.generatedAt;
+      setRangeOpen(false);
+    } catch (error) {
+      if (request === rangeRequest.current) {
+        setRangeError(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (request === rangeRequest.current) setRangeBusy(false);
+    }
+  };
+
+  // A live dashboard push means today's selected range may have changed. Keep
+  // an active custom range fresh without replacing the last good report if a
+  // transient refresh fails.
+  useEffect(() => {
+    if (!active || !activeRange || rangeBusy || rangeBaseGeneration.current === dash.generatedAt) return;
+    rangeBaseGeneration.current = dash.generatedAt;
+    const request = ++rangeRequest.current;
+    fetchRangeDashboard(activeRange)
+      .then((result) => {
+        if (request === rangeRequest.current) setRangeDash(result);
+      })
+      .catch(() => {});
+  }, [active, activeRange?.startDate, activeRange?.endDate, dash.generatedAt, rangeBusy]);
+
+  const presetReport: PeriodReport = period === "Day" ? scope.day : period === "Month" ? scope.month : scope.week;
+  const rangeReport = activeRange
+    ? rangeDash?.scopes.find((item) => item.id === scope.id)?.report
+    : undefined;
+  const P: PeriodReport = rangeReport ?? presetReport;
+  const viewKey = activeRange ? `${activeRange.startDate}:${activeRange.endDate}` : period;
   const M = P.metrics;
   const models = P.models;
   const [totalModel, setTotalModel] = useState("");
@@ -462,7 +637,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const slices = P.agents;
   // animated Total tokens: counts up from 0 on each open / period / scope
   // / model switch; held at 0 while hidden so it never flashes.
-  const animTotal = useCountUp(totalTokens, `${period}:${scope.id}:${totalModel}:${openGen}`, active);
+  const animTotal = useCountUp(totalTokens, `${viewKey}:${scope.id}:${totalModel}:${openGen}`, active);
+  const heroTotal = tokenAmount(animTotal, totalTokens);
   // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
   const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
@@ -481,7 +657,9 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
   // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
   const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
-  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+  const trendSub = activeRange
+    ? formatRange(activeRange, false)
+    : { Day: "today 24h", Week: "this week", Month: "this month" }[period];
 
   // screenshot capture: rasterize the full panel card to a PNG and hand it to
   // the Rust `save_screenshot` command (browser preview falls back to a download).
@@ -574,7 +752,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
-            <Segmented value={period} theme={t} onSelect={(v) => setPeriod(v as any)} />
+            <Segmented value={activeRange ? "" : period} theme={t} onSelect={selectPeriod} />
+            <RangeFilter theme={t} dark={dark} open={rangeOpen} active={!!activeRange}
+              draft={draftRange} max={today} busy={rangeBusy} error={rangeError}
+              onToggle={() => { setRangeOpen((value) => !value); setRangeError(""); }}
+              onDraft={(range) => { setDraftRange(range); setRangeError(""); }}
+              onApply={applyDateRange} onClear={clearDateRange} />
             <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
             <ScreenshotButton theme={t} busy={shotBusy} onClick={captureScreenshot} />
           </div>
@@ -583,6 +766,23 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         <div style={{ padding: "14px 15px 15px" }}>
         {/* in-app update prompt */}
         <UpdateBanner st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
+        {activeRange && (
+          <div data-no-drag="" style={{
+            display: "flex", alignItems: "center", gap: 7, marginBottom: 12,
+            padding: "6px 9px", borderRadius: 8,
+            background: `color-mix(in srgb, ${t.accent} 9%, transparent)`,
+            border: `1px solid color-mix(in srgb, ${t.accent} 22%, transparent)`,
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={t.accent} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 10h18" />
+            </svg>
+            <span style={{ flex: 1, font: `600 10px ${t.mono}`, color: t.text }}>{formatRange(activeRange)}</span>
+            <button type="button" onClick={clearDateRange} aria-label="clear date range" style={{
+              border: "none", background: "transparent", color: t.faint, cursor: "pointer",
+              padding: "0 2px", font: `600 12px ${t.ui}`,
+            }}>✕</button>
+          </div>
+        )}
         {/* agent filter — only when several sources have data */}
         {scopes.length > 1 && (
           <AgentChips scopes={scopes} value={scope.id} theme={t} onSelect={setScopeId} />
@@ -610,13 +810,13 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
               </select>
             </div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
-              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
+              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{heroTotal.value}<span style={{ font: `500 ${heroTotal.unit === "tokens" ? 11 : 15}px ${t.mono}`, color: t.dim, marginLeft: 3 }}>{heroTotal.unit}</span></span>
               {!selectedModel && Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
-            <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>${totalCost.toFixed(2)}</div>
+            <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>{fmtMoney(totalCost)}</div>
           </div>
         </div>
         {/* All scope: one segment per agent. Single scope: cached vs new. */}
@@ -659,7 +859,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
           <MiniStat label="Requests" value={fmtInt(M.requests)} sub={`${M.sessions} sessions`} theme={t}>
             <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
-          <MiniStat label="Cost trend" value={`$${M.cost.toFixed(2)}`} sub={trendSub} theme={t} accent={t.accent}>
+          <MiniStat label="Cost trend" value={fmtMoney(M.cost)} sub={trendSub} theme={t} accent={t.accent}>
             <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
         </div>
@@ -680,7 +880,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
               <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} servers</span>
             </div>
             {P.mcp.length > 0
-              ? <BarList key={`${period}:${scope.id}`} items={P.mcp} theme={t} accent={t.accent} />
+              ? <BarList key={`${viewKey}:${scope.id}`} items={P.mcp} theme={t} accent={t.accent} />
               : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No MCP calls in this period</div>}
           </>
         )}
@@ -693,7 +893,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
               <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} skills</span>
             </div>
             {P.skills.length > 0
-              ? <BarList key={`${period}:${scope.id}`} items={P.skills} theme={t} accent={t.accent} />
+              ? <BarList key={`${viewKey}:${scope.id}`} items={P.skills} theme={t} accent={t.accent} />
               : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No skill calls in this period</div>}
           </>
         )}

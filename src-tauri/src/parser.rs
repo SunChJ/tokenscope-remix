@@ -7,7 +7,7 @@ use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
 use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX};
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
@@ -104,17 +104,10 @@ pub fn build_dashboard() -> Dashboard {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // 1. Ingest incrementally (full scan only on first run; afterwards just the
-    //    appended lines), prune events older than the heatmap window, and persist
-    //    only when something actually changed — so an idle tick doesn't rewrite
-    //    the entire events.json every 30s.
+    //    appended lines) and persist only when something actually changed. Keep
+    //    complete history so user-selected billing ranges stay reproducible.
     let mut store = Store::load();
-    let mut dirty = store.ingest();
-    // Reports/heatmap span ~26 weeks (+ prev month); 210 days leaves margin.
-    let cutoff = (Local::now() - Duration::days(210)).timestamp_millis();
-    if store.prune_before(cutoff) {
-        dirty = true;
-    }
-    if dirty {
+    if store.ingest() {
         store.save();
     }
     let codex_quota = store.codex_quota.clone();
@@ -124,17 +117,26 @@ pub fn build_dashboard() -> Dashboard {
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
+    let now = Local::now();
+    // Preset reports and the heatmap need only recent events. Full history stays
+    // in Store and is priced/aggregated only when a custom range requests it.
+    let report_cutoff = (now - Duration::days(210)).timestamp_millis();
     let events: Vec<Event> = store
         .events
         .iter()
+        .filter(|raw| raw.ts_ms >= report_cutoff)
         .map(|r| compute_event(r, &cfg, &pricing))
         .collect();
 
-    let now = Local::now();
     let today = now.date_naive();
 
-    // Agents that actually have data, in registry order.
-    let present_ids: HashSet<&str> = events.iter().map(|e| e.agent).collect();
+    // Keep historical agents selectable even when their latest event is outside
+    // the preset window; custom ranges can still contain their usage.
+    let present_ids: HashSet<&str> = store
+        .events
+        .iter()
+        .map(|raw| agent_def(&raw.agent).id)
+        .collect();
     let present: Vec<&AgentDef> = AGENTS.iter().filter(|a| present_ids.contains(a.id)).collect();
 
     let scopes = if present.len() <= 1 {
@@ -206,6 +208,114 @@ pub fn build_dashboard() -> Dashboard {
     }
 }
 
+/// Aggregate an inclusive custom date range for every dashboard scope. The
+/// immediately preceding range of equal length is used for delta comparison.
+pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDashboard, String> {
+    if start > end {
+        return Err("start date must not be after end date".to_string());
+    }
+
+    let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = Store::load();
+    if store.ingest() {
+        store.save();
+    }
+
+    let cfg = UserConfig::load(&store.codex_project_dirs());
+    let pricing = Pricing::shared();
+    let days = (end - start).num_days() + 1;
+    let previous_start = start
+        .checked_sub_signed(Duration::days(days))
+        .unwrap_or(start);
+    let present_ids: HashSet<&str> = store
+        .events
+        .iter()
+        .map(|raw| agent_def(&raw.agent).id)
+        .collect();
+    let events: Vec<Event> = store
+        .events
+        .iter()
+        .filter(|raw| {
+            let Some(timestamp) = DateTime::from_timestamp_millis(raw.ts_ms) else {
+                return false;
+            };
+            let date = timestamp.with_timezone(&Local).date_naive();
+            date >= previous_start && date <= end
+        })
+        .map(|raw| compute_event(raw, &cfg, &pricing))
+        .collect();
+    let present: Vec<&AgentDef> = AGENTS
+        .iter()
+        .filter(|agent| present_ids.contains(agent.id))
+        .collect();
+
+    let scopes = if present.len() <= 1 {
+        let agent = present.first().map(|a| a.id).unwrap_or(AGENT_CLAUDE);
+        let mut report = report_range(&events, start, end, PALETTE);
+        set_installed_counts(&mut report, agent, &cfg);
+        vec![RangeScope {
+            id: "all".to_string(),
+            report,
+        }]
+    } else {
+        let mut per_agent = Vec::new();
+        for agent in &present {
+            let filtered: Vec<Event> = events
+                .iter()
+                .filter(|event| event.agent == agent.id)
+                .map(clone_event)
+                .collect();
+            let mut report = report_range(&filtered, start, end, &agent.palette);
+            set_installed_counts(&mut report, agent.id, &cfg);
+            per_agent.push(RangeScope {
+                id: agent.id.to_string(),
+                report,
+            });
+        }
+
+        let mut all = report_range(&events, start, end, PALETTE);
+        set_installed_counts(&mut all, "", &cfg);
+        all.models = per_agent
+            .iter()
+            .flat_map(|scope| scope.report.models.iter().cloned())
+            .collect();
+        all.models.sort_by(|a, b| {
+            b.tokens
+                .partial_cmp(&a.tokens)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all.agents = present
+            .iter()
+            .zip(per_agent.iter())
+            .map(|(agent, scope)| AgentSlice {
+                id: agent.id.to_string(),
+                label: agent.label.to_string(),
+                color: agent.color.to_string(),
+                tokens: scope.report.metrics.total_tokens,
+                values: scope
+                    .report
+                    .series
+                    .iter()
+                    .map(|point| point.input + point.cache + point.output)
+                    .collect(),
+            })
+            .collect();
+
+        let mut scopes = vec![RangeScope {
+            id: "all".to_string(),
+            report: all,
+        }];
+        scopes.extend(per_agent);
+        scopes
+    };
+
+    Ok(RangeDashboard {
+        scopes,
+        start_date: start.format("%Y-%m-%d").to_string(),
+        end_date: end.format("%Y-%m-%d").to_string(),
+    })
+}
+
 /// Cheap manual clone (Event holds Vec<String>s; used only for per-agent
 /// filtering during multi-agent builds).
 fn clone_event(e: &Event) -> Event {
@@ -244,25 +354,8 @@ fn build_scope(
     let mut month = report_month(events, now, palette);
     let heatmap = build_heatmap(events, today);
 
-    // "servers"/"skills" = how many the user has *installed* (global, constant
-    // across periods), not how many were called in the window. Per agent:
-    let (installed_servers, installed_skills) = match agent_scope {
-        AGENT_CODEX => (
-            cfg.codex_mcp_servers.len() as u64,
-            cfg.codex_skills.len() as u64,
-        ),
-        AGENT_CLAUDE => (
-            cfg.mcp_servers.len() as u64,
-            cfg.claude_skills.len() as u64,
-        ),
-        _ => (
-            (cfg.mcp_servers.len() + cfg.codex_mcp_servers.len()) as u64,
-            (cfg.claude_skills.len() + cfg.codex_skills.len()) as u64,
-        ),
-    };
     for r in [&mut day, &mut week, &mut month] {
-        r.metrics.servers = installed_servers;
-        r.metrics.skills = installed_skills;
+        set_installed_counts(r, agent_scope, cfg);
     }
 
     Scope {
@@ -275,6 +368,21 @@ fn build_scope(
         heatmap,
         quota: None,
     }
+}
+
+/// "servers"/"skills" are installed totals, not only the names called in the
+/// selected period. This keeps preset and custom reports on the same footing.
+fn set_installed_counts(report: &mut PeriodReport, agent_scope: &str, cfg: &UserConfig) {
+    let (servers, skills) = match agent_scope {
+        AGENT_CODEX => (cfg.codex_mcp_servers.len(), cfg.codex_skills.len()),
+        AGENT_CLAUDE => (cfg.mcp_servers.len(), cfg.claude_skills.len()),
+        _ => (
+            cfg.mcp_servers.len() + cfg.codex_mcp_servers.len(),
+            cfg.claude_skills.len() + cfg.codex_skills.len(),
+        ),
+    };
+    report.metrics.servers = servers as u64;
+    report.metrics.skills = skills as u64;
 }
 
 /// Derive a computed Event from a stored RawEvent, applying the *current* user
@@ -379,8 +487,8 @@ impl Agg {
                 let priced = *self.model_priced.get(&name).unwrap_or(&false);
                 ModelStat {
                     vendor: vendor_of(&name).to_string(),
-                    tokens: (tok / 1e6 * 100.0).round() / 100.0,
-                    cost: (cost * 100.0).round() / 100.0,
+                    tokens: tok / 1e6,
+                    cost: (cost * 1_000_000.0).round() / 1_000_000.0,
                     color: if i < palette.len() { palette[i] } else { OVERFLOW_GRAY }.to_string(),
                     priced,
                     agent: self.model_agent.get(&name).copied().unwrap_or("").to_string(),
@@ -404,11 +512,11 @@ impl Agg {
 
     fn metrics(&self, delta_tokens: f64, delta_cost: f64) -> Metrics {
         Metrics {
-            total_tokens: ((self.input + self.cache + self.output) / 1e6 * 100.0).round() / 100.0,
-            input_tokens: (self.input / 1e6 * 100.0).round() / 100.0,
-            cache_tokens: (self.cache / 1e6 * 100.0).round() / 100.0,
-            output_tokens: (self.output / 1e6 * 100.0).round() / 100.0,
-            cost: (self.cost * 100.0).round() / 100.0,
+            total_tokens: (self.input + self.cache + self.output) / 1e6,
+            input_tokens: self.input / 1e6,
+            cache_tokens: self.cache / 1e6,
+            output_tokens: self.output / 1e6,
+            cost: (self.cost * 1_000_000.0).round() / 1_000_000.0,
             mcp_calls: self.mcp_calls,
             skill_calls: self.skill_calls,
             requests: self.requests,
@@ -563,7 +671,6 @@ fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Peri
 
 // ── Month report: current calendar month vs previous calendar month ──
 fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
-    use chrono::NaiveDate;
     let today = now.date_naive();
     let (y, m) = (today.year(), today.month());
     let cur_first = NaiveDate::from_ymd_opt(y, m, 1).unwrap();
@@ -639,6 +746,131 @@ fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Per
     }
 }
 
+// ── Custom report: inclusive dates vs the preceding equal-length range ────
+fn report_range(
+    events: &[Event],
+    start: NaiveDate,
+    end: NaiveDate,
+    palette: &[&str],
+) -> PeriodReport {
+    let days = (end - start).num_days() + 1;
+    let hourly = days == 1;
+    // Preserve daily detail for ordinary billing windows. Longer ranges are
+    // grouped into at most 48 contiguous buckets so charts stay cheap/readable;
+    // totals and model/call breakdowns still use every event exactly.
+    let bucket_days = if hourly { 1 } else { (days + 47) / 48 };
+    let bucket_count = if hourly {
+        24
+    } else {
+        ((days + bucket_days - 1) / bucket_days) as usize
+    };
+    let previous_start = start
+        .checked_sub_signed(Duration::days(days))
+        .unwrap_or(start);
+
+    let mut agg = Agg::default();
+    let mut previous = Agg::default();
+    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); bucket_count];
+    let mut request_buckets = vec![0.0f64; bucket_count];
+    let mut cost_buckets = vec![0.0f64; bucket_count];
+
+    for event in events {
+        let date = event.ts.date_naive();
+        if date >= start && date <= end {
+            agg.add(event);
+            let index = if hourly {
+                event.ts.hour() as usize
+            } else {
+                ((date - start).num_days() / bucket_days) as usize
+            };
+            if index < bucket_count {
+                buckets[index].0 += event.input / 1e6;
+                buckets[index].1 += event.cache / 1e6;
+                buckets[index].2 += event.output / 1e6;
+                if !event.model.is_empty() {
+                    request_buckets[index] += 1.0;
+                }
+                cost_buckets[index] += event.cost;
+            }
+        } else if date >= previous_start && date < start {
+            previous.add(event);
+        }
+    }
+
+    let label_every = bucket_count.div_ceil(7).max(1);
+    let series = (0..bucket_count)
+        .map(|index| {
+            let (label, full) = if hourly {
+                (
+                    if index % 4 == 0 && index != 0 {
+                        format!("{:02}", index)
+                    } else {
+                        String::new()
+                    },
+                    format!("{} {:02}:00", full_date(start), index),
+                )
+            } else {
+                let bucket_start = start + Duration::days(index as i64 * bucket_days);
+                let bucket_end = std::cmp::min(
+                    end,
+                    bucket_start + Duration::days(bucket_days - 1),
+                );
+                let label = if index == 0
+                    || index + 1 == bucket_count
+                    || index % label_every == 0
+                {
+                    format!(
+                        "{} {}",
+                        MONTHS[(bucket_start.month() - 1) as usize],
+                        bucket_start.day()
+                    )
+                } else {
+                    String::new()
+                };
+                let full = if bucket_start == bucket_end {
+                    full_date(bucket_start)
+                } else {
+                    format!("{} – {}", full_date(bucket_start), full_date(bucket_end))
+                };
+                (label, full)
+            };
+            SeriesPoint {
+                label,
+                full,
+                input: buckets[index].0,
+                cache: buckets[index].1,
+                output: buckets[index].2,
+            }
+        })
+        .collect();
+
+    PeriodReport {
+        metrics: agg.metrics(
+            pct_delta(
+                agg.input + agg.cache + agg.output,
+                previous.input + previous.cache + previous.output,
+            ),
+            pct_delta(agg.cost, previous.cost),
+        ),
+        series,
+        models: agg.models(palette),
+        mcp: Agg::named(&agg.mcp_counts),
+        skills: Agg::named(&agg.skill_counts),
+        req_trend: request_buckets,
+        cost_trend: cost_buckets,
+        agents: Vec::new(),
+    }
+}
+
+fn full_date(date: NaiveDate) -> String {
+    format!(
+        "{} {}, {}",
+        MONTHS[(date.month() - 1) as usize],
+        date.day(),
+        date.year()
+    )
+}
+
 // ── Heatmap: last ~26 weeks daily totals ────────────────────────────
 fn build_heatmap(events: &[Event], today: chrono::NaiveDate) -> Vec<HeatDay> {
     let start = today - Duration::days(25 * 7 + today.weekday().num_days_from_sunday() as i64);
@@ -679,4 +911,69 @@ fn build_heatmap(events: &[Event], today: chrono::NaiveDate) -> Vec<HeatDay> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn event(year: i32, month: u32, day: u32, hour: u32, tokens: f64) -> Event {
+        Event {
+            ts: Local
+                .with_ymd_and_hms(year, month, day, hour, 0, 0)
+                .single()
+                .unwrap(),
+            session: format!("{year}-{month}-{day}"),
+            model: "test-model".to_string(),
+            input: tokens,
+            cache: 0.0,
+            output: 0.0,
+            cost: tokens / 1e6,
+            priced: true,
+            agent: AGENT_CLAUDE,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn custom_range_is_inclusive_and_compares_equal_previous_range() {
+        let events = vec![
+            event(2026, 7, 1, 12, 1_000_000.0),
+            event(2026, 7, 2, 12, 1_000_000.0),
+            event(2026, 7, 3, 12, 2_000_000.0),
+            event(2026, 7, 4, 12, 8_000_000.0),
+        ];
+        let report = report_range(
+            &events,
+            NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
+            PALETTE,
+        );
+
+        assert_eq!(report.metrics.total_tokens, 3.0);
+        assert_eq!(report.metrics.requests, 2);
+        assert_eq!(report.metrics.delta_tokens, 200.0);
+        assert_eq!(report.series.len(), 2);
+        assert_eq!(report.series[0].input, 1.0);
+        assert_eq!(report.series[1].input, 2.0);
+    }
+
+    #[test]
+    fn custom_single_day_uses_hours_and_long_ranges_cap_chart_buckets() {
+        let day = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let hourly = report_range(&[event(2026, 7, 13, 23, 500.0)], day, day, PALETTE);
+        assert_eq!(hourly.series.len(), 24);
+        assert_eq!(hourly.metrics.total_tokens, 0.0005);
+        assert_eq!(hourly.series[23].input, 0.0005);
+
+        let long = report_range(
+            &[],
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
+            PALETTE,
+        );
+        assert!(long.series.len() <= 48);
+    }
 }

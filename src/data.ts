@@ -35,6 +35,9 @@ export interface Scope {
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string;
 }
+export interface DateRange { startDate: string; endDate: string }
+export interface RangeScope { id: string; report: PeriodReport }
+export interface RangeDashboard extends DateRange { scopes: RangeScope[] }
 
 // Per-agent accent pairs [accent, accentSoft], tuned per theme so light mode
 // keeps enough contrast. Scope.color (backend) is the chart base; these drive
@@ -62,20 +65,30 @@ export async function fetchDashboard(): Promise<Dashboard> {
   return res.json();
 }
 
+export async function fetchRangeDashboard(range: DateRange): Promise<RangeDashboard> {
+  const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  if (!inTauri) throw new Error("custom date ranges require the desktop app");
+  return invoke<RangeDashboard>("get_range_dashboard", {
+    startDate: range.startDate,
+    endDate: range.endDate,
+  });
+}
+
 // ── formatting helpers ──────────────────────────────────────────
 export const fmtTokens = (m: number) => {
   if (m >= 1) return m.toFixed(2) + "M";
-  const k = m * 1000;
-  // one decimal for sub-1K totals (e.g. "0.4K"), but only when it rounds to a
-  // non-zero label — avoid a misleadingly precise "0.0K" for tiny values.
-  if (k >= 0.05 && k < 1) return k.toFixed(1) + "K";
-  return Math.round(k) + "K";
+  const tokens = m * 1_000_000;
+  if (tokens < 1000) return Math.round(tokens).toLocaleString("en-US");
+  const k = tokens / 1000;
+  const digits = k < 100 ? 1 : 0;
+  return k.toFixed(digits).replace(/\.0$/, "") + "K";
 };
 export const fmtInt = (n: number) => n.toLocaleString("en-US");
 export const pct = (part: number, whole: number) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
 export function fmtMoney(v: number) {
   if (v >= 100000) return "$" + Math.round(v / 1000) + "K";
   if (v >= 10000) return "$" + (v / 1000).toFixed(1) + "K";
+  if (v > 0 && v < 0.01) return "$" + v.toFixed(4);
   return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 

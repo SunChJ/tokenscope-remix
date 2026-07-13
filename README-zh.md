@@ -11,7 +11,7 @@
 ## 它做什么
 
 - 菜单栏图标旁显示当日 Token 数（所有 Agent 合计，如 `⬡ 14.00M`）
-- 点击打开面板：Day / Week / Month 切换
+- 点击打开面板：Day / Week / Month 切换，以及按起止日期（含首尾日）的自定义区间筛选
 - **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿）；只装一个 Agent 则界面与经典版完全一致
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
@@ -144,6 +144,21 @@ pnpm tauri build       # macOS 产出 .app / .dmg，Windows 产出 .exe (NSIS)�
 
 分发见 `PRD.md` §6.3（macOS 推荐 Homebrew Cask；`.dmg` / `.exe` 直接下载建议代码签名 + 公证）。
 
+## 发布
+
+使用仓库内置脚本同步所有版本文件：
+
+```bash
+pnpm version:set 1.3.1
+pnpm version:check
+git commit -am "release: v1.3.1"
+git push origin main
+```
+
+版本号变更推送到 `main` 后，GitHub Actions 会校验版本、创建 `vX.Y.Z`
+标签，并自动构建和发布 macOS / Windows 安装包。发布失败时，也可以在
+Release workflow 中选择已有的同版本标签手工重跑。
+
 ## 结构
 
 ```
@@ -153,7 +168,7 @@ src/                  React 前端
   App.tsx             主面板
 src-tauri/src/
   store.rs            多源 JSONL 增量摄取（Claude + Codex 适配器）
-  parser.rs           按 Scope 聚合（All / 单 Agent；Day/Week/Month + 热力图）
+  parser.rs           按 Scope 聚合（All / 单 Agent；预设周期 + 自定义区间 + 热力图）
   pricing.rs          models.dev / LiteLLM 价格加载与计价
   config.rs           用户 MCP / Skill 白名单（Claude + Codex）
   model.rs            返回给前端的数据结构

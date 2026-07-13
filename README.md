@@ -11,7 +11,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 ## What it does
 
 - Shows today's token count (all agents combined) next to the menu-bar icon (e.g. `⬡ 14.00M`)
-- Click to open the panel: Day / Week / Month toggle
+- Click to open the panel: Day / Week / Month toggle plus an inclusive custom date-range filter
 - **Multi-agent**: with more than one agent detected, filter chips (All / Claude / Codex) appear — the All view stacks usage **by agent**, and filtering to one agent re-tints the whole panel with its accent (Claude coral / Codex teal). With a single agent the classic UI is unchanged
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
@@ -145,6 +145,21 @@ pnpm tauri build       # outputs .app / .dmg on macOS, .exe (NSIS) on Windows to
 
 For distribution see `PRD.md` §6.3 (Homebrew Cask recommended on macOS; direct `.dmg` / `.exe` downloads benefit from code signing + notarization).
 
+## Release
+
+Keep all app version files in sync with the bundled helper:
+
+```bash
+pnpm version:set 1.3.1
+pnpm version:check
+git commit -am "release: v1.3.1"
+git push origin main
+```
+
+A version change pushed to `main` is validated by GitHub Actions, tagged as
+`vX.Y.Z`, then built and published for macOS and Windows. A matching existing
+tag can also be run manually from the Release workflow for recovery.
+
 ## Structure
 
 ```
@@ -154,7 +169,7 @@ src/                  React frontend
   App.tsx             main panel
 src-tauri/src/
   store.rs            incremental multi-source JSONL ingest (Claude + Codex adapters)
-  parser.rs           aggregation into scopes (All / per-agent; Day/Week/Month + heatmap)
+  parser.rs           aggregation into scopes (All / per-agent; presets + custom ranges + heatmap)
   pricing.rs          models.dev / LiteLLM price loading and costing
   config.rs           user MCP / Skill whitelists (Claude + Codex)
   model.rs            data structures returned to the frontend

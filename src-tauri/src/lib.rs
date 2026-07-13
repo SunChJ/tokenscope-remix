@@ -4,7 +4,7 @@ mod parser;
 mod pricing;
 mod store;
 
-use model::Dashboard;
+use model::{Dashboard, RangeDashboard};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -465,6 +465,25 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     dash
 }
 
+#[tauri::command]
+async fn get_range_dashboard(
+    start_date: String,
+    end_date: String,
+) -> Result<RangeDashboard, String> {
+    let start = chrono::NaiveDate::parse_from_str(&start_date, "%Y-%m-%d")
+        .map_err(|_| "invalid start date".to_string())?;
+    let end = chrono::NaiveDate::parse_from_str(&end_date, "%Y-%m-%d")
+        .map_err(|_| "invalid end date".to_string())?;
+    match tauri::async_runtime::spawn_blocking(move || {
+        parser::build_range_dashboard(start, end)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("failed to build date range: {error}")),
+    }
+}
+
 /// Save a full-panel screenshot (a `data:image/png;base64,...` URL captured in
 /// the webview) to the user's Desktop as `Tokenscope <date> at <time>.png`.
 /// DOM rasterization sidesteps macOS Screen Recording permission entirely.
@@ -540,7 +559,12 @@ pub fn run() {
     }
 
     builder
-        .invoke_handler(tauri::generate_handler![get_dashboard, save_screenshot, begin_drag])
+        .invoke_handler(tauri::generate_handler![
+            get_dashboard,
+            get_range_dashboard,
+            save_screenshot,
+            begin_drag
+        ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.
             #[cfg(target_os = "macos")]

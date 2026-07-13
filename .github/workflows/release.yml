@@ -1,23 +1,98 @@
 name: Release
 
-# Push a version tag (e.g. v0.1.0) to build the app and publish a GitHub Release.
+# A version bump on main creates its tag and publishes automatically. Pushing a
+# matching v* tag remains supported for manual recovery/re-runs.
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+    paths:
+      - package.json
+      - src-tauri/Cargo.toml
+      - src-tauri/tauri.conf.json
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish, for example v1.3.0
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Validate version and prepare tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node scripts/version.mjs)
+          TAG="v${VERSION}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            if [ "${GITHUB_REF_NAME}" != "$TAG" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match app version ${VERSION}"
+              exit 1
+            fi
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.tag }}" != "$TAG" ]; then
+              echo "::error::Requested tag ${{ inputs.tag }} does not match app version ${VERSION}"
+              exit 1
+            fi
+            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "::error::Tag $TAG does not exist"
+              exit 1
+            fi
+          else
+            BEFORE="${{ github.event.before }}"
+            PREVIOUS_PACKAGE=$(git show "${BEFORE}:package.json" 2>/dev/null || true)
+            PREVIOUS_VERSION=""
+            if [ -n "$PREVIOUS_PACKAGE" ]; then
+              PREVIOUS_VERSION=$(printf '%s' "$PREVIOUS_PACKAGE" | node -e \
+                'let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).version))')
+            fi
+            if [ "$VERSION" = "$PREVIOUS_VERSION" ]; then
+              echo "Version unchanged at $VERSION; nothing to publish."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              echo "::error::Tag $TAG already exists; choose a new version"
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Tokenscope $TAG"
+            git push origin "$TAG"
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   release:
-    # Only build/publish for version tags. workflow_dispatch from a branch would
-    # otherwise set the version/tag to the branch name and publish a malformed
-    # release (and fail the Homebrew step on the resulting 404).
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
     permissions:
       contents: write
     strategy:
-      # One platform's failure must not cancel the other — a broken Windows
-      # bundler shouldn't block the macOS .dmg from publishing (and vice versa).
+      # One platform's failure must not cancel the other.
       fail-fast: false
       matrix:
         include:
@@ -28,6 +103,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             rust-targets: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v6
 
@@ -53,7 +131,7 @@ jobs:
           workspaces: "./src-tauri -> target"
 
       - name: Install frontend deps
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Prepare release notes
         id: release_notes
@@ -63,7 +141,7 @@ jobs:
         run: |
           gen=$(gh api --method POST \
             "repos/${{ github.repository }}/releases/generate-notes" \
-            -f tag_name="${{ github.ref_name }}" --jq '.body' || true)
+            -f tag_name="$RELEASE_TAG" --jq '.body' || true)
 
           {
             cat <<'BODY'
@@ -88,38 +166,16 @@ jobs:
             echo "RELEASE_BODY"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build & publish release
+      - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # In-app updater signing is intentionally omitted until real
-          # TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) secrets are configured.
-          # Passing missing secrets as empty env vars makes tauri fail while
-          # decoding the key instead of producing an unsigned release.
-          # --- Code signing + notarization (optional, macOS only) ---
-          # UNSIGNED BUILD BY DEFAULT. Do NOT uncomment these until the matching
-          # secrets actually exist: tauri's bundler treats an empty
-          # APPLE_CERTIFICATE env var as "a certificate is present" and then
-          # fails on `security import` ("SecKeychainItemImport ... not valid").
-          #
-          # Once you have an Apple Developer ID, add these in repo
-          # Settings → Secrets and uncomment to get signed + notarized builds:
-          #
-          #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}                    # base64 of Developer ID .p12
-          #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}  # .p12 export password
-          #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}          # "Developer ID Application: Name (TEAMID)"
-          #   APPLE_ID: ${{ secrets.APPLE_ID }}                                      # Apple ID email
-          #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}                          # app-specific password
-          #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}                            # 10-char Team ID
-          # Windows builds are also unsigned — users get a SmartScreen warning
-          # on first launch, see README "Install on Windows".
+          # Add TAURI_SIGNING_PRIVATE_KEY(_PASSWORD) plus platform signing
+          # secrets here when signed updater artifacts are enabled.
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Tokenscope ${{ github.ref_name }}"
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "Tokenscope ${{ env.RELEASE_TAG }}"
           releaseBody: ${{ steps.release_notes.outputs.body }}
-          # Publish immediately (not a draft): the asset's public download URL
-          # must be live for the Homebrew Cask step below to fetch it and for
-          # `brew install` to work.
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
@@ -129,19 +185,13 @@ jobs:
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          # No tap token configured → skip quietly (the release itself is done;
-          # the cask can be bumped by hand — see the tap repo's README).
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
             echo "HOMEBREW_TAP_TOKEN not set; skipping tap update."
             exit 0
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
-          DMG_NAME="Tokenscope_${VERSION}_universal.dmg"
-          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${DMG_NAME}"
+          DMG_NAME="Tokenscope_${RELEASE_VERSION}_universal.dmg"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${DMG_NAME}"
 
-          # Wait for the release asset to be available, then compute sha256.
-          # -f makes curl fail (non-zero) on a 404 so we keep retrying instead
-          # of hashing GitHub's error page and writing a bogus checksum.
           SHA256=""
           for i in $(seq 1 10); do
             if curl -fsSL "$DOWNLOAD_URL" -o /tmp/tokenscope.dmg; then
@@ -152,14 +202,14 @@ jobs:
             sleep 10
           done
           if [ -z "$SHA256" ]; then
-            echo "::error::Release asset $DMG_NAME never became available"; exit 1
+            echo "::error::Release asset $DMG_NAME never became available"
+            exit 1
           fi
 
-          # Clone the tap repo and update the cask
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/SunChJ/homebrew-tokenscope.git /tmp/homebrew-tap
           cat > /tmp/homebrew-tap/Casks/tokenscope.rb <<CASK
           cask "tokenscope" do
-            version "${VERSION}"
+            version "${RELEASE_VERSION}"
             sha256 "${SHA256}"
 
             url "${DOWNLOAD_URL}"
@@ -168,11 +218,8 @@ jobs:
             homepage "https://github.com/${{ github.repository }}"
 
             depends_on macos: ">= :catalina"
-
             app "Tokenscope.app"
 
-            # Unsigned/unnotarized build: strip the quarantine flag Homebrew
-            # adds so the app opens without the "Apple cannot verify" prompt.
             postflight do
               system_command "/usr/bin/xattr",
                              args: ["-cr", "#{appdir}/Tokenscope.app"],
@@ -185,5 +232,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/tokenscope.rb
-          git diff --cached --quiet || git commit -m "Update cask to v${VERSION}"
+          git diff --cached --quiet || git commit -m "Update cask to ${RELEASE_TAG}"
           git push

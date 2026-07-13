@@ -132,3 +132,19 @@ pub struct Dashboard {
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
 }
+
+/// One scope's aggregation for an inclusive, user-selected date range.
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeScope {
+    pub id: String,
+    pub report: PeriodReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RangeDashboard {
+    pub scopes: Vec<RangeScope>,
+    #[serde(rename = "startDate")]
+    pub start_date: String,
+    #[serde(rename = "endDate")]
+    pub end_date: String,
+}

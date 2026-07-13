@@ -5,8 +5,8 @@
 // (just the facts), reads only newly-appended bytes of changed files (tracked
 // by a per-file manifest), dedupes by message id, and persists everything to
 // the cache dir. Aggregation (parser.rs) then works purely on these in-memory
-// events — cheap, and recomputed per request because the Day/Week/Month
-// windows are relative to "now".
+// events — cheap, and recomputed per request because preset windows are
+// relative to "now" and custom date ranges are selected at runtime.
 //
 // Two sources are ingested, normalized to the same RawEvent shape:
 //   claude — ~/.claude/projects/**/*.jsonl   (assistant messages)
@@ -101,7 +101,8 @@ pub struct Store {
 //   v5: multi-agent ingest (claude + codex), FileState manifest, quota snapshot.
 //   v6: extract Codex Skill calls and track project skill directories.
 //   v7: extract Codex MCP calls from tool search and app custom-tool formats.
-const STORE_VERSION: u32 = 7;
+//   v8: retain complete history for custom-range tracking and settlement.
+const STORE_VERSION: u32 = 8;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -251,20 +252,6 @@ impl Store {
     fn purge_source(&mut self, key: &str) {
         self.events.retain(|e| e.source != key);
         self.rebuild_index();
-    }
-
-    /// Drop events older than `cutoff_ms`. The reports/heatmap only span the last
-    /// ~26 weeks, so anything older is dead weight that grows events.json without
-    /// bound. Returns whether anything was removed. Old logs already at EOF are
-    /// never re-read, so their pruned events don't reappear.
-    pub fn prune_before(&mut self, cutoff_ms: i64) -> bool {
-        let before = self.events.len();
-        self.events.retain(|e| e.ts_ms >= cutoff_ms);
-        let removed = self.events.len() != before;
-        if removed {
-            self.rebuild_index();
-        }
-        removed
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files across
