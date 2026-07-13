@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import appPackage from "../package.json";
 import {
   Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
@@ -126,8 +127,10 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
       display: "flex", alignItems: "center", gap: 14,
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
-      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {fmtTokens(cacheM)}</span>
-      <span><span style={{ color: t.accentSoft }}>●</span> New {fmtTokens(restM)}</span>
+      <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: t.accent,
+        marginRight: 5, verticalAlign: "-0.5px" }} />{compact ? "Cache" : "Cached"} {fmtTokens(cacheM)}</span>
+      <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: t.accentSoft,
+        marginRight: 5, verticalAlign: "-0.5px" }} />New {fmtTokens(restM)}</span>
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
     </div>
   );
@@ -135,43 +138,72 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
 
 // ── In-app updates ──────────────────────────────────────────────
 // Poll the GitHub release feed (plugin-updater endpoint) on launch and every
-// hour; surface a slim banner when a newer signed build exists. Download +
-// install happen in-app, then a relaunch finishes the update. A dismissed
-// version stays hidden until the *next* version appears (localStorage).
+// hour; keep version and update actions below the Tokenscope brand. Download
+// and install happen in-app, then a relaunch finishes the update. A dismissed
+// version stays hidden until the next version appears (localStorage).
 type UpdateState =
-  | { phase: "idle" }
+  | { phase: "checking" }
+  | { phase: "current" }
+  | { phase: "check-failed" }
+  | { phase: "skipped"; version: string }
   | { phase: "available"; update: Update }
   | { phase: "downloading"; version: string; pct: number }
   | { phase: "ready"; version: string }
-  | { phase: "error"; version: string };
+  | { phase: "install-failed"; version: string };
 
 function useUpdater(): [UpdateState, () => void, () => void] {
-  const [st, setSt] = useState<UpdateState>({ phase: "idle" });
+  const [st, setSt] = useState<UpdateState>(() =>
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
+      ? { phase: "checking" }
+      : { phase: "current" }
+  );
   const updRef = useRef<Update | null>(null);
   useEffect(() => {
     const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     if (!inTauri) return;
     let dead = false;
     let checking = false;
-    const probe = async () => {
+    let unlisten: (() => void) | null = null;
+    const probe = async (manual = false) => {
       if (checking) return;
       checking = true;
+      if (manual) setSt({ phase: "checking" });
       try {
         const u = await checkUpdate();
-        if (dead || !u) return;
-        if (localStorage.getItem("tokenscope-skip-update") === u.version) return;
+        if (dead) return;
+        if (!u) {
+          updRef.current = null;
+          setSt({ phase: "current" });
+          return;
+        }
+        const skipped = localStorage.getItem("tokenscope-skip-update") === u.version;
+        if (skipped && !manual) {
+          updRef.current = null;
+          setSt({ phase: "skipped", version: u.version });
+          return;
+        }
+        if (skipped) localStorage.removeItem("tokenscope-skip-update");
         updRef.current = u;
         setSt({ phase: "available", update: u });
       } catch {
-        // Offline / rate-limited / no latest.json: fail quietly. There is no
-        // immediate retry; the next regular hourly check remains scheduled.
+        // Offline / rate-limited / no latest.json: no automatic immediate
+        // retry; wait for the next hourly check or an explicit tray-menu check.
+        if (!dead) setSt({ phase: "check-failed" });
       } finally {
         checking = false;
       }
     };
     void probe();
     const t = window.setInterval(() => { void probe(); }, 60 * 60 * 1000);
-    return () => { dead = true; window.clearInterval(t); };
+    listen("check-for-updates", () => { void probe(true); }).then((stop) => {
+      if (dead) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      dead = true;
+      window.clearInterval(t);
+      unlisten?.();
+    };
   }, []);
   const install = async () => {
     const u = updRef.current;
@@ -188,101 +220,53 @@ function useUpdater(): [UpdateState, () => void, () => void] {
       });
       setSt({ phase: "ready", version: u.version });
     } catch {
-      setSt({ phase: "error", version: u.version });
+      setSt({ phase: "install-failed", version: u.version });
     }
   };
   const dismiss = () => {
     const u = updRef.current;
     if (u) try { localStorage.setItem("tokenscope-skip-update", u.version); } catch {}
-    setSt({ phase: "idle" });
+    setSt(u ? { phase: "skipped", version: u.version } : { phase: "current" });
   };
   return [st, install, dismiss];
 }
 
 type UpdaterController = ReturnType<typeof useUpdater>;
 
-function releaseNotesSummary(body?: string) {
-  if (!body) return null;
-  const lines = body
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) =>
-      line
-        .replace(/^[-*]\s+/, "")
-        .replace(/\*\*/g, "")
-        .replace(/`/g, "")
-        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-        .replace(/\s+by @\S+.*$/, "")
-        .trim()
-    )
-    .filter((line) =>
-      line &&
-      !line.startsWith("#") &&
-      !/^install$/i.test(line) &&
-      !/^what'?s changed$/i.test(line) &&
-      !/^full changelog/i.test(line) &&
-      !line.startsWith("Menu-bar / system-tray")
-    );
-  if (!lines.length) return null;
-  const text = lines.slice(0, 2).join("; ");
-  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
-}
-
-function UpdateBanner({ st, theme, onInstall, onDismiss }:
+function VersionUpdate({ st, theme, onInstall, onDismiss }:
   { st: UpdateState; theme: Theme; onInstall: () => void; onDismiss: () => void }) {
   const t = theme;
-  if (st.phase === "idle") return null;
-  const notes = st.phase === "available" ? releaseNotesSummary(st.update.body) : null;
-  const Btn = ({ label, onClick }: { label: string; onClick: () => void }) => (
-    <button onClick={onClick} style={{
-      font: `600 10px ${t.ui}`, color: "#fff", background: t.accent, border: "none",
-      borderRadius: 6, padding: "3px 10px", cursor: "pointer", whiteSpace: "nowrap",
+  const Action = ({ label, title, onClick }: { label: string; title?: string; onClick: () => void }) => (
+    <button type="button" title={title} onClick={onClick} style={{
+      font: "inherit", fontWeight: 600, color: t.accent, background: "none", border: 0,
+      padding: 0, cursor: "pointer", whiteSpace: "nowrap",
     }}>{label}</button>
   );
+  let status: React.ReactNode;
+  let title: string | undefined;
+  if (st.phase === "checking") status = "Checking…";
+  else if (st.phase === "current") status = "Latest";
+  else if (st.phase === "check-failed") status = "Check failed";
+  else if (st.phase === "skipped") {
+    status = "Skipped";
+    title = `Update v${st.version} was skipped`;
+  } else if (st.phase === "available") {
+    status = <><Action label="Update" title={`Update to v${st.update.version}`} onClick={onInstall} />
+      <Action label="×" title="Skip this version" onClick={onDismiss} /></>;
+    title = [`v${st.update.version} available`, st.update.body].filter(Boolean).join("\n\n");
+  } else if (st.phase === "downloading") status = `${st.pct}%`;
+  else if (st.phase === "ready") {
+    status = <Action label="Restart" title={`Restart into v${st.version}`} onClick={() => relaunch().catch(() => {})} />;
+  } else {
+    status = <><span style={{ color: "#e0795f" }}>Failed</span>
+      <Action label="×" title="Dismiss" onClick={onDismiss} /></>;
+  }
   return (
-    <div data-no-drag="" style={{
-      display: "flex", flexDirection: "column", gap: 5, marginBottom: 12,
-      padding: "7px 10px", borderRadius: 8,
-      background: `color-mix(in srgb, ${t.accent} 10%, transparent)`,
-      border: `1px solid color-mix(in srgb, ${t.accent} 25%, transparent)`,
-      font: `500 10.5px ${t.mono}`, color: t.text,
+    <div data-no-drag="" title={title} style={{
+      display: "flex", alignItems: "center", gap: 4, maxWidth: 94, overflow: "hidden",
+      font: `500 8.5px/1.2 ${t.mono}`, color: t.faint, whiteSpace: "nowrap",
     }}>
-      {st.phase === "available" && <>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            <span style={{ color: t.accent, fontWeight: 600 }}>v{st.update.version}</span> is available
-          </span>
-          <Btn label="Update" onClick={onInstall} />
-          <span onClick={onDismiss} title="Skip this version" style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
-        </div>
-        {notes && (
-          <div title={st.update.body} style={{
-            color: t.dim, font: `500 9.5px/1.35 ${t.ui}`,
-            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-          }}>
-            What's changed: {notes}
-          </div>
-        )}
-      </>}
-      {st.phase === "downloading" && <>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ flex: 1 }}>Downloading v{st.version}…</span>
-          <span style={{ color: t.accent, fontWeight: 600 }}>{st.pct}%</span>
-        </div>
-      </>}
-      {st.phase === "ready" && <>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ flex: 1 }}>v{st.version} installed</span>
-          <Btn label="Restart" onClick={() => relaunch().catch(() => {})} />
-        </div>
-      </>}
-      {st.phase === "error" && <>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ flex: 1, color: "#e0795f" }}>Update failed — try again later</span>
-          <span onClick={onDismiss} style={{ cursor: "pointer", color: t.faint, padding: "0 2px" }}>✕</span>
-        </div>
-      </>}
+      <span>v{appPackage.version}</span><span>·</span>{status}
     </div>
   );
 }
@@ -306,7 +290,8 @@ function AgentChips({ scopes, value, theme, onSelect }:
             border: `1px solid ${on ? t.segBorder : "transparent"}`,
             boxShadow: on ? t.segOnShadow : "none", transition: "color .15s, background .15s",
           }}>
-            {s.color && <span style={{ width: 7, height: 7, borderRadius: "50%", background: s.color, opacity: on ? 1 : 0.75 }} />}
+            {s.color && <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
+              background: s.color, opacity: on ? 1 : 0.75, flex: "0 0 7px" }} />}
             {s.label}
           </div>
         );
@@ -324,7 +309,8 @@ function AgentLegend({ t, slices, cachedPct }:
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
       {slices.map((s) => (
-        <span key={s.label}><span style={{ color: s.color }}>●</span> {s.label} {fmtTokens(s.tokens)}</span>
+        <span key={s.label}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
+          background: s.color, marginRight: 5, verticalAlign: "-0.5px" }} />{s.label} {fmtTokens(s.tokens)}</span>
       ))}
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
     </div>
@@ -547,7 +533,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   const scope = scopes.find((s) => s.id === scopeId) ?? scopes[0];
   // Filtering to one agent re-tints the whole panel with its accent.
   const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
-  // In-app update lifecycle (idle → available → downloading → ready).
+  // In-app update lifecycle (checking/current → available → downloading → ready).
   const [updSt, updInstall, updDismiss] = updater;
   // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
   // NSPanel and is gated out). A real OS window-drag begins only once the
@@ -687,15 +673,22 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
     if (!el) { showToast("Nothing to capture", false); return; }
     setShotBusy(true);
     try {
+      await document.fonts.ready;
+      el.classList.add("ts-no-transition");
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       // explicit width/height = full scrollable content, not just the viewport;
-      // filter drops the capture button itself (and its in-flight spinner) so
-      // the saved image is a clean dashboard, not a shot of the button.
+      // Keep the capture button's layout slot but hide its cloned pixels. Removing
+      // the node would reflow the header and make the PNG differ from the panel.
       const dataUrl = await domToPng(el, {
         scale: 2,
         backgroundColor: dark ? "#1f2226" : "#ffffff",
         width: el.scrollWidth,
         height: el.scrollHeight,
-        filter: (n) => !(n instanceof HTMLElement && n.getAttribute("aria-label") === "save screenshot"),
+        onCloneEachNode: (node) => {
+          if (node instanceof HTMLElement && node.getAttribute("aria-label") === "save screenshot") {
+            node.style.visibility = "hidden";
+          }
+        },
       });
       const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
       if (inTauri) {
@@ -713,6 +706,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
     } catch {
       showToast("Screenshot failed", false);
     } finally {
+      el.classList.remove("ts-no-transition");
       setShotBusy(false);
     }
   };
@@ -752,14 +746,17 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         {/* sticky header — stays put while the body scrolls */}
         <div style={{
           position: "sticky", top: 0, zIndex: 10,
-          display: "flex", alignItems: "center", justifyContent: "space-between",
+          display: "flex", alignItems: "flex-start", justifyContent: "space-between",
           padding: "15px 15px 12px",
           background: dark ? "#1f2226" : "#ffffff",
           borderBottom: `1px solid ${t.gridLine}`,
         }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <TokenGlyph color={t.accent} size={16} />
-            <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: "0 0 auto" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <TokenGlyph color={t.accent} size={16} />
+              <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
+            </div>
+            <VersionUpdate st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
             <Segmented value={activeRange ? "" : period} theme={t} onSelect={selectPeriod} />
@@ -774,8 +771,6 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         </div>
         {/* scrolling body */}
         <div style={{ padding: "14px 15px 15px" }}>
-        {/* in-app update prompt */}
-        <UpdateBanner st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
         {activeRange && (
           <div data-no-drag="" style={{
             display: "flex", alignItems: "center", gap: 7, marginBottom: 12,

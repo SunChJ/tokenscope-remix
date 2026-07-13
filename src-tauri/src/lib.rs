@@ -17,6 +17,7 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 // Positioner is only used for the non-macOS fallback; macOS positions the
 // NSPanel manually (see position_panel).
 #[cfg(not(target_os = "macos"))]
@@ -34,7 +35,55 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn update_tray_label(app: &tauri::AppHandle, label: String) {
+const DASHBOARD_SHORTCUT: &str = "CommandOrControl+Alt+T";
+
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+struct TrayPreferences {
+    show_weekly_remaining: bool,
+    dashboard_shortcut: bool,
+}
+
+struct TrayPreferencesState(std::sync::Mutex<TrayPreferences>);
+
+fn weekly_remaining_pct(dash: &Dashboard) -> Option<u8> {
+    let quota = dash.scopes.iter().find_map(|scope| scope.quota.as_ref())?;
+    weekly_remaining_from_quota(quota)
+}
+
+fn weekly_remaining_from_quota(quota: &model::Quota) -> Option<u8> {
+    let used = if quota.primary_minutes == 7 * 24 * 60 {
+        quota.primary_pct
+    } else if quota.secondary_minutes == 7 * 24 * 60 {
+        quota.secondary_pct
+    } else {
+        return None;
+    };
+    Some((100.0 - used).clamp(0.0, 100.0).round() as u8)
+}
+
+fn tray_label(dash: &Dashboard, show_weekly_remaining: bool) -> String {
+    let mut label = fmt_tokens_m(dash.today_tokens);
+    if show_weekly_remaining {
+        if let Some(remaining) = weekly_remaining_pct(dash) {
+            label.push_str(&format!("-{remaining}%"));
+        }
+    }
+    label
+}
+
+fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
+    let show_weekly_remaining = app
+        .try_state::<TrayPreferencesState>()
+        .map(|state| {
+            state
+                .0
+                .lock()
+                .map(|prefs| prefs.show_weekly_remaining)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let label = tray_label(dash, show_weekly_remaining);
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.tray_by_id("main") {
@@ -52,7 +101,7 @@ fn update_tray_label(app: &tauri::AppHandle, label: String) {
 /// the fresh data to the UI so an open popover updates live.
 fn refresh(app: &tauri::AppHandle) {
     let dash = parser::build_dashboard();
-    update_tray_label(app, fmt_tokens_m(dash.today_tokens));
+    update_tray_label(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
 }
 
@@ -76,6 +125,30 @@ fn save_autostart_pref(on: bool) {
     if let Some(p) = autostart_pref_path() {
         if let Ok(t) = serde_json::to_string(&on) {
             let _ = std::fs::write(p, t);
+        }
+    }
+}
+
+fn tray_preferences_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_dir()?.join("tokenscope");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("tray.json"))
+}
+
+fn load_tray_preferences() -> TrayPreferences {
+    let Some(path) = tray_preferences_path() else {
+        return TrayPreferences::default();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_tray_preferences(preferences: &TrayPreferences) {
+    if let Some(path) = tray_preferences_path() {
+        if let Ok(text) = serde_json::to_string(preferences) {
+            let _ = std::fs::write(path, text);
         }
     }
 }
@@ -461,7 +534,7 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // Sync the tray count to this freshly-fetched value. The panel refetches the
     // instant it opens, while the tray otherwise only refreshes every 30s — so
     // without this the two could disagree for up to 30s during heavy usage.
-    update_tray_label(&app, fmt_tokens_m(dash.today_tokens));
+    update_tray_label(&app, &dash);
     dash
 }
 
@@ -543,6 +616,15 @@ pub fn run() {
             show_popover(app);
         }))
         .plugin(tauri_plugin_positioner::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        show_popover(app);
+                    }
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -584,6 +666,21 @@ pub fn run() {
             // we do NOT force-enable on every start, which would undo a manual
             // opt-out. `autostart_on` seeds the menu checkbox.
             let autostart_on = reconcile_autostart(app.handle());
+            let mut tray_preferences = load_tray_preferences();
+            if tray_preferences.dashboard_shortcut
+                && app
+                    .global_shortcut()
+                    .register(DASHBOARD_SHORTCUT)
+                    .is_err()
+            {
+                tray_preferences.dashboard_shortcut = false;
+                save_tray_preferences(&tray_preferences);
+            }
+            let weekly_remaining_on = tray_preferences.show_weekly_remaining;
+            let dashboard_shortcut_on = tray_preferences.dashboard_shortcut;
+            app.manage(TrayPreferencesState(std::sync::Mutex::new(
+                tray_preferences,
+            )));
 
             // Popover behaviour. On macOS, convert the window to a non-activating
             // NSPanel so it can float over apps in native fullscreen, and hide it
@@ -685,10 +782,38 @@ pub fn run() {
 
             // Build the menu-bar tray: app glyph (template icon) + today's tokens.
             let dash = parser::build_dashboard();
-            let label = fmt_tokens_m(dash.today_tokens);
+            let label = tray_label(&dash, weekly_remaining_on);
 
             let open_i = MenuItem::with_id(app, "open", "Open Tokenscope", true, None::<&str>)?;
             let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+            let check_updates_i = MenuItem::with_id(
+                app,
+                "check-updates",
+                "Check for Updates…",
+                true,
+                None::<&str>,
+            )?;
+            let weekly_remaining_i = CheckMenuItem::with_id(
+                app,
+                "weekly-remaining",
+                "Show Weekly Remaining",
+                true,
+                weekly_remaining_on,
+                None::<&str>,
+            )?;
+            let shortcut_label = if cfg!(target_os = "macos") {
+                "Dashboard Shortcut (⌥⌘T)"
+            } else {
+                "Dashboard Shortcut (Ctrl+Alt+T)"
+            };
+            let dashboard_shortcut_i = CheckMenuItem::with_id(
+                app,
+                "dashboard-shortcut",
+                shortcut_label,
+                true,
+                dashboard_shortcut_on,
+                None::<&str>,
+            )?;
             // Launch-at-login toggle (a checkbox item). Seeded from the reconciled
             // preference; clicking it flips the OS registration and persists.
             let autostart_i = CheckMenuItem::with_id(
@@ -705,7 +830,10 @@ pub fn run() {
                 &[
                     &open_i,
                     &refresh_i,
+                    &check_updates_i,
                     &PredefinedMenuItem::separator(app)?,
+                    &weekly_remaining_i,
+                    &dashboard_shortcut_i,
                     &autostart_i,
                     &PredefinedMenuItem::separator(app)?,
                     &quit_i,
@@ -775,6 +903,44 @@ pub fn run() {
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "open" => show_popover(app),
                     "refresh" => refresh(app),
+                    "check-updates" => {
+                        show_popover(app);
+                        let _ = app.emit("check-for-updates", ());
+                    }
+                    "weekly-remaining" => {
+                        if let Some(state) = app.try_state::<TrayPreferencesState>() {
+                            let Some((enabled, preferences)) = state.0.lock().ok().map(|mut prefs| {
+                                prefs.show_weekly_remaining = !prefs.show_weekly_remaining;
+                                (prefs.show_weekly_remaining, prefs.clone())
+                            }) else {
+                                return;
+                            };
+                            let _ = weekly_remaining_i.set_checked(enabled);
+                            save_tray_preferences(&preferences);
+                            refresh(app);
+                        }
+                    }
+                    "dashboard-shortcut" => {
+                        if let Some(state) = app.try_state::<TrayPreferencesState>() {
+                            let enabled = state
+                                .0
+                                .lock()
+                                .map(|prefs| prefs.dashboard_shortcut)
+                                .unwrap_or(false);
+                            let changed = if enabled {
+                                app.global_shortcut().unregister(DASHBOARD_SHORTCUT).is_ok()
+                            } else {
+                                app.global_shortcut().register(DASHBOARD_SHORTCUT).is_ok()
+                            };
+                            if changed {
+                                if let Ok(mut prefs) = state.0.lock() {
+                                    prefs.dashboard_shortcut = !enabled;
+                                    let _ = dashboard_shortcut_i.set_checked(!enabled);
+                                    save_tray_preferences(&prefs);
+                                }
+                            }
+                        }
+                    }
                     "autostart" => {
                         // Flip the OS registration, re-read the real state, mirror
                         // it into the checkbox, and persist the user's choice.
@@ -861,4 +1027,25 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weekly_remaining_uses_seven_day_quota() {
+        let quota = model::Quota {
+            plan: "pro".into(),
+            primary_pct: 20.0,
+            primary_minutes: 300,
+            primary_resets_at: 0,
+            secondary_pct: 19.4,
+            secondary_minutes: 7 * 24 * 60,
+            secondary_resets_at: 0,
+            as_of_ms: 0,
+        };
+
+        assert_eq!(weekly_remaining_from_quota(&quota), Some(81));
+    }
 }

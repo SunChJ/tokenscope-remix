@@ -122,15 +122,19 @@ brew update && brew upgrade --cask tokenscope
 
 ### Updating
 
-The app checks for new releases on launch and every hour, then shows an in-app
-banner ("v*x.y.z* is available → Update"). Homebrew users should keep using
-`brew upgrade --cask tokenscope`; direct-download users can update in the app.
+The app checks for new releases on launch and every hour. Its version and update
+actions appear directly below **Tokenscope** in the top-left corner. Homebrew
+users should keep using `brew upgrade --cask tokenscope`; direct-download users
+can update and restart from the app. Use **Check for Updates…** in the tray's
+right-click menu to check immediately.
 
 ### After first launch
 
 - **macOS**: an icon plus today's token count appears in the menu bar (e.g. `⬡ 12.40M`)
 - **Windows**: the tray icon appears in the notification area. The Windows tray API doesn't show a label beside the icon — **hover the tray icon** to see today's token count in the tooltip (e.g. `Tokenscope · today 12.40M`)
-- Left-click the icon to toggle the panel; right-click for the menu (Open / Refresh / Quit)
+- Left-click the icon to toggle the panel; right-click for the menu (Open / Refresh / Check for Updates / display preferences / Quit)
+- **Show Weekly Remaining** optionally appends Codex's remaining weekly quota to the menu-bar label (for example `12.40M-81%`); it is off by default and remembers your choice
+- **Dashboard Shortcut** enables a global hotkey for opening the panel (`⌥⌘T` on macOS, `Ctrl+Alt+T` on Windows/Linux); it is off by default and remembers your choice
 - **Launch-at-login is set up automatically** — no manual configuration needed
 
 ## Develop
@@ -161,9 +165,9 @@ For distribution see `PRD.md` §6.3 (Homebrew Cask recommended on macOS; direct 
 Keep all app version files in sync with the bundled helper:
 
 ```bash
-pnpm version:set 1.3.1
+pnpm version:set 1.3.2
 pnpm version:check
-git commit -am "release: v1.3.1"
+git commit -am "release: v1.3.2"
 git push origin main
 ```
 

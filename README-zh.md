@@ -121,15 +121,18 @@ brew update && brew upgrade --cask tokenscope
 
 ### 更新
 
-App 会在启动时及此后每小时检测新版本，并在面板内提示
-（「v*x.y.z* is available → Update」）。Homebrew 用户建议继续使用
-`brew upgrade --cask tokenscope`；直接下载安装的用户可使用 App 内更新。
+App 会在启动时及此后每小时检测新版本。当前版本和更新操作常驻于左上角
+**Tokenscope** 下方。Homebrew 用户建议继续使用 `brew upgrade --cask tokenscope`；
+直接下载安装的用户可在 App 内完成更新和重启。右键托盘菜单中的
+**Check for Updates…** 可立即手动检查。
 
 ### 首次启动后
 
 - **macOS**：菜单栏出现图标 + 当日 Token 数（如 `⬡ 12.40M`）
 - **Windows**：系统托盘出现图标。Windows 任务栏托盘 API 不支持在图标旁显示文字，**鼠标悬停托盘图标**即可看到当日 Token 数（提示气泡形如 `Tokenscope · today 12.40M`）
-- 左键点击图标开/关面板，右键出菜单（Open / Refresh / Quit）
+- 左键点击图标开/关面板，右键出菜单（Open / Refresh / Check for Updates / 显示偏好 / Quit）
+- **Show Weekly Remaining** 可在菜单栏 Token 数后追加 Codex 每周剩余配额（如 `12.40M-81%`）；默认关闭，选择会被记住
+- **Dashboard Shortcut** 可开启全局快捷键来唤起面板（macOS 为 `⌥⌘T`，Windows/Linux 为 `Ctrl+Alt+T`）；默认关闭，选择会被记住
 - 已自动设置**登录自启**，无需手动配置
 
 ## 开发
@@ -160,9 +163,9 @@ pnpm tauri build       # macOS 产出 .app / .dmg，Windows 产出 .exe (NSIS)�
 使用仓库内置脚本同步所有版本文件：
 
 ```bash
-pnpm version:set 1.3.1
+pnpm version:set 1.3.2
 pnpm version:check
-git commit -am "release: v1.3.1"
+git commit -am "release: v1.3.2"
 git push origin main
 ```
 
