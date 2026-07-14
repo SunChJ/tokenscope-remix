@@ -8,6 +8,10 @@ export interface ReliabilityStats {
   completedTurns: number; abortedTurns: number; toolErrors: number; denials: number;
   wastedTokens: number; wastedCost: number;
 }
+export interface PerformanceStats {
+  trackedTurns: number; medianDurationMs: number; p95DurationMs: number;
+  medianTtftMs: number; p95TtftMs: number;
+}
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
@@ -18,7 +22,7 @@ export interface Metrics {
 export interface AgentSlice { id: string; label: string; color: string; tokens: number; values: number[] }
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[]; projects: ProjectStat[];
-  reliability: ReliabilityStats;
+  reliability: ReliabilityStats; performance: PerformanceStats;
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
   agents: AgentSlice[];
 }

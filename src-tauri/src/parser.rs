@@ -45,6 +45,8 @@ struct TurnEvent {
     cost: f64,
     tool_errors: u64,
     denials: u64,
+    duration_ms: u64,
+    ttft_ms: u64,
 }
 
 /// Static per-agent identity: label + accent + a 5-step chart palette (rank
@@ -537,6 +539,8 @@ fn compute_turn(turn: &crate::store::TurnTelemetry, pricing: &Pricing) -> TurnEv
         cost,
         tool_errors: turn.tool_errors,
         denials: turn.denials,
+        duration_ms: turn.duration_ms,
+        ttft_ms: turn.ttft_ms,
     }
 }
 
@@ -563,6 +567,46 @@ fn reliability(turns: &[TurnEvent], start: NaiveDate, end: NaiveDate) -> Reliabi
     stats.wasted_tokens = (stats.wasted_tokens / 1e6 * 1_000_000.0).round() / 1_000_000.0;
     stats.wasted_cost = (stats.wasted_cost * 1_000_000.0).round() / 1_000_000.0;
     stats
+}
+
+fn percentile(values: &mut [u64], percent: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let rank = (values.len() * percent).div_ceil(100).max(1);
+    values[rank - 1]
+}
+
+fn performance(turns: &[TurnEvent], start: NaiveDate, end: NaiveDate) -> PerformanceStats {
+    let mut durations: Vec<u64> = turns
+        .iter()
+        .filter(|turn| {
+            let date = turn.ts.date_naive();
+            date >= start && date <= end && turn.duration_ms > 0
+        })
+        .map(|turn| turn.duration_ms)
+        .collect();
+    let mut ttfts: Vec<u64> = turns
+        .iter()
+        .filter(|turn| {
+            let date = turn.ts.date_naive();
+            date >= start && date <= end && turn.ttft_ms > 0
+        })
+        .map(|turn| turn.ttft_ms)
+        .collect();
+    let tracked_turns = durations.len() as u64;
+    let median_duration_ms = percentile(&mut durations, 50);
+    let p95_duration_ms = percentile(&mut durations, 95);
+    let median_ttft_ms = percentile(&mut ttfts, 50);
+    let p95_ttft_ms = percentile(&mut ttfts, 95);
+    PerformanceStats {
+        tracked_turns,
+        median_duration_ms,
+        p95_duration_ms,
+        median_ttft_ms,
+        p95_ttft_ms,
+    }
 }
 
 // ── aggregation helpers ────────────────────────────────────────────
@@ -789,6 +833,7 @@ fn report_day(
         models: agg.models(palette),
         projects: agg.projects(),
         reliability: reliability(turns, today, today),
+        performance: performance(turns, today, today),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -864,6 +909,7 @@ fn report_week(
         models: agg.models(palette),
         projects: agg.projects(),
         reliability: reliability(turns, start, next_start - Duration::days(1)),
+        performance: performance(turns, start, next_start - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -948,6 +994,7 @@ fn report_month(
         models: agg.models(palette),
         projects: agg.projects(),
         reliability: reliability(turns, cur_first, next_first - Duration::days(1)),
+        performance: performance(turns, cur_first, next_first - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -1067,6 +1114,7 @@ fn report_range(
         models: agg.models(palette),
         projects: agg.projects(),
         reliability: reliability(turns, start, end),
+        performance: performance(turns, start, end),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: request_buckets,
@@ -1216,6 +1264,8 @@ mod tests {
                 cost: 1.25,
                 tool_errors: 2,
                 denials: 1,
+                duration_ms: 1_000,
+                ttft_ms: 100,
             },
             TurnEvent {
                 ts,
@@ -1228,6 +1278,8 @@ mod tests {
                 cost: 0.0,
                 tool_errors: 0,
                 denials: 0,
+                duration_ms: 3_000,
+                ttft_ms: 300,
             },
         ];
         let stats = reliability(&turns, ts.date_naive(), ts.date_naive());
@@ -1238,5 +1290,12 @@ mod tests {
         assert_eq!(stats.denials, 1);
         assert_eq!(stats.wasted_tokens, 1.0);
         assert_eq!(stats.wasted_cost, 1.25);
+
+        let perf = performance(&turns, ts.date_naive(), ts.date_naive());
+        assert_eq!(perf.tracked_turns, 2);
+        assert_eq!(perf.median_duration_ms, 1_000);
+        assert_eq!(perf.p95_duration_ms, 3_000);
+        assert_eq!(perf.median_ttft_ms, 100);
+        assert_eq!(perf.p95_ttft_ms, 300);
     }
 }

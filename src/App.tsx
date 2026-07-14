@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
+  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, PerformanceStats, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -463,6 +463,39 @@ function ReliabilitySection({ stats, sinceMs, theme }:
   );
 }
 
+function formatDuration(ms: number) {
+  if (ms <= 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return minutes < 60 ? `${minutes}m ${seconds}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: Theme }) {
+  const t = theme;
+  const item = (label: string, value: string, sub: string) => (
+    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
+      <div style={{ font: `500 8.5px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".04em" }}>{label}</div>
+      <div style={{ marginTop: 3, font: `600 14px ${t.mono}`, color: t.text }}>{value}</div>
+      <div style={{ marginTop: 2, font: `500 8.5px ${t.mono}`, color: t.faint }}>{sub}</div>
+    </div>
+  );
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+        <Label t={t}>Response performance</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} timed turns</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+        {item("Median", formatDuration(stats.medianDurationMs), "turn duration")}
+        {item("P95", formatDuration(stats.p95DurationMs), "slow tail")}
+        {item("First token", formatDuration(stats.medianTtftMs), stats.p95TtftMs > 0 ? `P95 ${formatDuration(stats.p95TtftMs)}` : "Codex only")}
+      </div>
+    </div>
+  );
+}
+
 // Codex rate-limit card: the two rolling windows (5h + weekly) straight from
 // the session logs — data Claude doesn't expose. Bars turn amber near the cap.
 function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
@@ -774,6 +807,9 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
     completedTurns: 0, abortedTurns: 0, toolErrors: 0, denials: 0,
     wastedTokens: 0, wastedCost: 0,
   };
+  const performance = P.performance ?? {
+    trackedTurns: 0, medianDurationMs: 0, p95DurationMs: 0, medianTtftMs: 0, p95TtftMs: 0,
+  };
   const [totalModel, setTotalModel] = useState("");
   // The All scope can contain the same model once per agent. The selector is
   // model-based, so combine those rows before calculating its Total and cost.
@@ -1057,6 +1093,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         )}
         <SectionRule t={t} m="12px 0 10px" />
         <ReliabilitySection stats={reliability} sinceMs={dash.telemetrySinceMs ?? 0} theme={t} />
+        <SectionRule t={t} m="12px 0 10px" />
+        <PerformanceSection stats={performance} theme={t} />
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>

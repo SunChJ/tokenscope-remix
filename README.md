@@ -24,6 +24,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Project settlement: groups usage by local Git repository / working directory and exports the selected period as CSV without exposing raw paths or conversation content
 - Reliability telemetry: completed/aborted turns, tool errors/denials, and estimated tokens/cost spent on aborted work; collected incrementally from this version forward
+- Response performance: median and P95 turn duration plus Codex time-to-first-token, using the same incremental telemetry stream
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
 - **Codex quota card**: the 5-hour and weekly rate-limit windows (used %, plan, reset countdown) read straight from Codex's own logs
 - Cost donut (hover for a single model), year-long activity heatmap

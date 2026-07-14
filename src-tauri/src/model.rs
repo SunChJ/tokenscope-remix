@@ -58,6 +58,20 @@ pub struct ReliabilityStats {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct PerformanceStats {
+    #[serde(rename = "trackedTurns")]
+    pub tracked_turns: u64,
+    #[serde(rename = "medianDurationMs")]
+    pub median_duration_ms: u64,
+    #[serde(rename = "p95DurationMs")]
+    pub p95_duration_ms: u64,
+    #[serde(rename = "medianTtftMs")]
+    pub median_ttft_ms: u64,
+    #[serde(rename = "p95TtftMs")]
+    pub p95_ttft_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
     pub total_tokens: f64,
@@ -100,6 +114,7 @@ pub struct PeriodReport {
     pub models: Vec<ModelStat>,
     pub projects: Vec<ProjectStat>,
     pub reliability: ReliabilityStats,
+    pub performance: PerformanceStats,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]
