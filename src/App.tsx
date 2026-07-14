@@ -12,7 +12,9 @@ import {
 } from "./data";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
+  ListToggle,
 } from "./charts";
+import { I18nProvider, localeTag, TEXT, useI18n, type Locale } from "./i18n";
 
 // Count up to `target`. Restarts from 0 whenever `resetKey` changes (popover
 // open / period switch); on a live value change it eases from the current
@@ -49,11 +51,12 @@ function useCountUp(target: number, resetKey: string, active: boolean, duration 
 }
 
 function Delta({ v, theme }: { v: number; theme: Theme }) {
+  const { text } = useI18n();
   const up = v >= 0;
   // Usage/cost going up is "bad" → red; going down is "good" → green.
   const col = up ? "#e0795f" : theme.accent;
   return (
-    <span title="Compared with the previous period" style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
+    <span title={text.comparedPrevious} style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
       padding: "1.5px 5px", borderRadius: 5, background: up ? "rgba(224,121,95,0.16)" : "rgba(39,176,110,0.14)" }}>
       {up ? "▲" : "▼"}{Math.abs(Math.round(v))}%
     </span>
@@ -113,6 +116,7 @@ function MiniStat({ label, value, sub, theme, accent, children }:
 // otherwise overflow. Mirrors the split bar above (dark = cached, light = rest).
 function SplitLegend({ t, cacheM, restM, cachedPct }:
   { t: Theme; cacheM: number; restM: number; cachedPct: number }) {
+  const { text } = useI18n();
   const ref = useRef<HTMLDivElement>(null);
   const [compact, setCompact] = useState(false);
   const key = `${cacheM}|${restM}|${cachedPct}`;
@@ -128,10 +132,10 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
       <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: t.accent,
-        marginRight: 5, verticalAlign: "-0.5px" }} />{compact ? "Cache" : "Cached"} {fmtTokens(cacheM)}</span>
+        marginRight: 5, verticalAlign: "-0.5px" }} />{compact ? text.cache : text.cached} {fmtTokens(cacheM)}</span>
       <span><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: t.accentSoft,
-        marginRight: 5, verticalAlign: "-0.5px" }} />New {fmtTokens(restM)}</span>
-      <span style={{ color: t.faint }}>{cachedPct}% cached</span>
+        marginRight: 5, verticalAlign: "-0.5px" }} />{text.new} {fmtTokens(restM)}</span>
+      <span style={{ color: t.faint }}>{cachedPct}% {text.cachedLower}</span>
     </div>
   );
 }
@@ -236,6 +240,7 @@ type UpdaterController = ReturnType<typeof useUpdater>;
 function VersionUpdate({ st, theme, onInstall, onDismiss }:
   { st: UpdateState; theme: Theme; onInstall: () => void; onDismiss: () => void }) {
   const t = theme;
+  const { text } = useI18n();
   const Action = ({ label, title, onClick }: { label: string; title?: string; onClick: () => void }) => (
     <button type="button" title={title} onClick={onClick} style={{
       font: "inherit", fontWeight: 600, color: t.accent, background: "none", border: 0,
@@ -244,22 +249,22 @@ function VersionUpdate({ st, theme, onInstall, onDismiss }:
   );
   let status: React.ReactNode;
   let title: string | undefined;
-  if (st.phase === "checking") status = "Checking…";
-  else if (st.phase === "current") status = "Latest";
-  else if (st.phase === "check-failed") status = "Check failed";
+  if (st.phase === "checking") status = text.checking;
+  else if (st.phase === "current") status = text.latest;
+  else if (st.phase === "check-failed") status = text.checkFailed;
   else if (st.phase === "skipped") {
-    status = "Skipped";
-    title = `Update v${st.version} was skipped`;
+    status = text.skipped;
+    title = `${text.update} v${st.version} ${text.updateSkipped}`;
   } else if (st.phase === "available") {
-    status = <><Action label="Update" title={`Update to v${st.update.version}`} onClick={onInstall} />
-      <Action label="×" title="Skip this version" onClick={onDismiss} /></>;
-    title = [`v${st.update.version} available`, st.update.body].filter(Boolean).join("\n\n");
+    status = <><Action label={text.update} title={`${text.updateTo} v${st.update.version}`} onClick={onInstall} />
+      <Action label="×" title={text.skipVersion} onClick={onDismiss} /></>;
+    title = [`v${st.update.version} ${text.available}`, st.update.body].filter(Boolean).join("\n\n");
   } else if (st.phase === "downloading") status = `${st.pct}%`;
   else if (st.phase === "ready") {
-    status = <Action label="Restart" title={`Restart into v${st.version}`} onClick={() => relaunch().catch(() => {})} />;
+    status = <Action label={text.restart} title={`${text.restartInto} v${st.version}`} onClick={() => relaunch().catch(() => {})} />;
   } else {
-    status = <><span style={{ color: "#e0795f" }}>Failed</span>
-      <Action label="×" title="Dismiss" onClick={onDismiss} /></>;
+    status = <><span style={{ color: "#e0795f" }}>{text.failed}</span>
+      <Action label="×" title={text.dismiss} onClick={onDismiss} /></>;
   }
   return (
     <div data-no-drag="" title={title} style={{
@@ -301,6 +306,7 @@ function shortcutFromKeyEvent(event: ReactKeyboardEvent<HTMLDivElement>) {
 
 function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
   { current: string; theme: Theme; dark: boolean; onClose: () => void; onSaved: () => void }) {
+  const { text } = useI18n();
   const ref = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -313,14 +319,14 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
     const shortcut = shortcutFromKeyEvent(event);
     if (shortcut === null) return;
     if (!shortcut) {
-      setError("Include Command, Control, or Alt");
+      setError(text.shortcutModifier);
       return;
     }
     setSaving(true);
     setError("");
     invoke("set_dashboard_shortcut", { shortcut })
       .then(onSaved)
-      .catch(() => { setSaving(false); setError("That shortcut is unavailable"); });
+      .catch(() => { setSaving(false); setError(text.shortcutUnavailable); });
   };
 
   return (
@@ -328,20 +334,20 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
       position: "absolute", inset: 0, zIndex: 40, display: "flex", alignItems: "center", justifyContent: "center",
       background: "rgba(0,0,0,0.42)", backdropFilter: "blur(3px)",
     }}>
-      <div ref={ref} role="dialog" aria-modal="true" aria-label="Change dashboard shortcut" tabIndex={0}
+      <div ref={ref} role="dialog" aria-modal="true" aria-label={text.shortcutDialog} tabIndex={0}
         onKeyDown={record} onMouseDown={(event) => event.stopPropagation()} style={{
           width: 250, padding: "18px 20px", borderRadius: 12, outline: "none", textAlign: "center",
           background: dark ? "#292d31" : "#ffffff", border: `1px solid ${theme.gridLine}`,
           boxShadow: "0 18px 50px rgba(0,0,0,0.38)", color: theme.text,
         }}>
-        <div style={{ font: `600 12px ${theme.ui}`, marginBottom: 12 }}>Dashboard Shortcut</div>
+        <div style={{ font: `600 12px ${theme.ui}`, marginBottom: 12 }}>{text.dashboardShortcut}</div>
         <div style={{
           display: "inline-flex", padding: "7px 12px", borderRadius: 7,
           background: dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)",
           font: `600 13px ${theme.mono}`, color: theme.accent,
         }}>{formatShortcut(current)}</div>
         <div style={{ marginTop: 12, font: `500 10px/1.45 ${theme.ui}`, color: theme.dim }}>
-          {saving ? "Saving…" : "Press a new shortcut · Esc to cancel"}
+          {saving ? text.saving : text.shortcutHint}
         </div>
         {error && <div style={{ marginTop: 7, font: `500 9.5px ${theme.ui}`, color: "#e0795f" }}>{error}</div>}
       </div>
@@ -354,6 +360,7 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
 function AgentChips({ scopes, value, theme, onSelect }:
   { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void }) {
   const t = theme;
+  const { text } = useI18n();
   return (
     <div data-no-drag="" style={{ display: "flex", gap: 6, marginBottom: 12 }}>
       {scopes.map((s) => {
@@ -370,7 +377,7 @@ function AgentChips({ scopes, value, theme, onSelect }:
           }}>
             {s.color && <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
               background: s.color, opacity: on ? 1 : 0.75, flex: "0 0 7px" }} />}
-            {s.label}
+            {s.id === "all" ? text.all : s.label}
           </div>
         );
       })}
@@ -381,6 +388,7 @@ function AgentChips({ scopes, value, theme, onSelect }:
 // Hero legend for the All scope: one entry per agent instead of Input/Output.
 function AgentLegend({ t, slices, cachedPct }:
   { t: Theme; slices: { label: string; color: string; tokens: number }[]; cachedPct: number }) {
+  const { text } = useI18n();
   return (
     <div style={{
       display: "flex", alignItems: "center", gap: 14,
@@ -390,7 +398,7 @@ function AgentLegend({ t, slices, cachedPct }:
         <span key={s.label}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
           background: s.color, marginRight: 5, verticalAlign: "-0.5px" }} />{s.label} {fmtTokens(s.tokens)}</span>
       ))}
-      <span style={{ color: t.faint }}>{cachedPct}% cached</span>
+      <span style={{ color: t.faint }}>{cachedPct}% {text.cachedLower}</span>
     </div>
   );
 }
@@ -398,37 +406,55 @@ function AgentLegend({ t, slices, cachedPct }:
 function ProjectSettlement({ projects, theme, onExport }:
   { projects: ProjectStat[]; theme: Theme; onExport: (projects: ProjectStat[]) => void }) {
   const t = theme;
+  const { text } = useI18n();
   const [selected, setSelected] = useState("");
+  const [open, setOpen] = useState(false);
   useEffect(() => {
     if (selected && !projects.some((project) => project.id === selected)) setSelected("");
   }, [projects, selected]);
   const rows = selected ? projects.filter((project) => project.id === selected) : projects;
+  const shownRows = rows.slice(0, open ? rows.length : 3);
   return (
     <div>
       <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
-        <Label t={t}>Project settlement</Label>
-        <select aria-label="Project settlement filter" value={selected} onChange={(event) => setSelected(event.target.value)} style={{
+        <Label t={t}>{text.projectSettlement}</Label>
+        <select aria-label={text.projectFilter} value={selected} onChange={(event) => { setSelected(event.target.value); setOpen(false); }} style={{
           flex: 1, minWidth: 0, height: 23, borderRadius: 6, outline: "none",
           border: `1px solid ${t.gridLine}`, background: t.gridLine, color: t.text,
           padding: "1px 5px", font: `500 9.5px ${t.ui}`, cursor: "pointer",
         }}>
-          <option value="">All projects</option>
+          <option value="">{text.allProjects}</option>
           {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
         </select>
-        <button type="button" onClick={() => onExport(rows)} title="Export project settlement as CSV" style={{
+        <button type="button" onClick={() => onExport(rows)} title={text.exportProjectCsv} style={{
           height: 23, borderRadius: 6, padding: "0 7px", cursor: "pointer",
           border: `1px solid ${t.segBorder}`, background: t.segBg, color: t.dim,
           font: `600 9px ${t.ui}`,
         }}>CSV</button>
       </div>
-      {rows.map((project) => (
+      {shownRows.map((project) => (
         <div key={project.id} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "2px 10px", padding: "4px 0" }}>
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 10.5px ${t.ui}`, color: t.text }}>{project.name}</span>
           <span style={{ font: `600 10.5px ${t.mono}`, color: t.accent }}>{fmtMoney(project.cost)}</span>
-          <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{fmtInt(project.requests)} requests · {fmtInt(project.sessions)} sessions</span>
+          <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{fmtInt(project.requests)} {text.requests} · {fmtInt(project.sessions)} {text.sessions}</span>
           <span style={{ font: `500 9px ${t.mono}`, color: t.dim }}>{fmtTokens(project.tokens)}</span>
         </div>
       ))}
+      <ListToggle expanded={open} total={rows.length} theme={t} onToggle={() => setOpen((value) => !value)} />
+    </div>
+  );
+}
+
+function ModelList({ models, shares, max, theme }:
+  { models: ModelStat[]; shares: number[]; max: number; theme: Theme }) {
+  const [open, setOpen] = useState(false);
+  const shown = models.slice(0, open ? models.length : 3);
+  return (
+    <div>
+      {shown.map((model, index) => (
+        <ModelRow key={`${model.agent}:${model.name}`} m={model} max={max} theme={theme} share={shares[index]} />
+      ))}
+      <ListToggle expanded={open} total={models.length} theme={theme} onToggle={() => setOpen((value) => !value)} />
     </div>
   );
 }
@@ -436,11 +462,12 @@ function ProjectSettlement({ projects, theme, onExport }:
 function ReliabilitySection({ stats, sinceMs, theme }:
   { stats: ReliabilityStats; sinceMs: number; theme: Theme }) {
   const t = theme;
+  const { locale, text } = useI18n();
   const turns = stats.completedTurns + stats.abortedTurns;
   const success = turns > 0 ? Math.round((stats.completedTurns / turns) * 100) : 0;
   const since = sinceMs > 0
-    ? new Date(sinceMs).toLocaleDateString("en-US", { month: "short", day: "numeric" })
-    : "this version";
+    ? new Date(sinceMs).toLocaleDateString(localeTag(locale), { month: "short", day: "numeric" })
+    : text.thisVersion;
   const item = (label: string, value: string, sub: string) => (
     <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
       <div style={{ font: `500 8.5px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".04em" }}>{label}</div>
@@ -451,13 +478,13 @@ function ReliabilitySection({ stats, sinceMs, theme }:
   return (
     <div>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-        <Label t={t}>Reliability</Label>
-        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>tracked since {since}</span>
+        <Label t={t}>{text.reliability}</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{text.trackedSince} {since}</span>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
-        {item("Success", turns > 0 ? `${success}%` : "—", `${fmtInt(turns)} turns`)}
-        {item("Aborted", fmtInt(stats.abortedTurns), stats.wastedCost > 0 ? `${fmtMoney(stats.wastedCost)} wasted` : `${fmtTokens(stats.wastedTokens)} wasted`)}
-        {item("Tool issues", fmtInt(stats.toolErrors + stats.denials), `${fmtInt(stats.toolErrors)} errors · ${fmtInt(stats.denials)} denied`)}
+        {item(text.success, turns > 0 ? `${success}%` : "—", `${fmtInt(turns)} ${text.turns}`)}
+        {item(text.aborted, fmtInt(stats.abortedTurns), stats.wastedCost > 0 ? `${fmtMoney(stats.wastedCost)} ${text.wasted}` : `${fmtTokens(stats.wastedTokens)} ${text.wasted}`)}
+        {item(text.toolIssues, fmtInt(stats.toolErrors + stats.denials), `${fmtInt(stats.toolErrors)} ${text.errors} · ${fmtInt(stats.denials)} ${text.denied}`)}
       </div>
     </div>
   );
@@ -474,6 +501,7 @@ function formatDuration(ms: number) {
 
 function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: Theme }) {
   const t = theme;
+  const { text } = useI18n();
   const item = (label: string, value: string, sub: string) => (
     <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
       <div style={{ font: `500 8.5px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".04em" }}>{label}</div>
@@ -484,13 +512,13 @@ function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: 
   return (
     <div>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-        <Label t={t}>Response performance</Label>
-        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} timed turns</span>
+        <Label t={t}>{text.responsePerformance}</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} {text.timedTurns}</span>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
-        {item("Median", formatDuration(stats.medianDurationMs), "turn duration")}
-        {item("P95", formatDuration(stats.p95DurationMs), "slow tail")}
-        {item("First token", formatDuration(stats.medianTtftMs), stats.p95TtftMs > 0 ? `P95 ${formatDuration(stats.p95TtftMs)}` : "Codex only")}
+        {item(text.median, formatDuration(stats.medianDurationMs), text.turnDuration)}
+        {item(text.p95, formatDuration(stats.p95DurationMs), text.slowTail)}
+        {item(text.firstToken, formatDuration(stats.medianTtftMs), stats.p95TtftMs > 0 ? `P95 ${formatDuration(stats.p95TtftMs)}` : text.codexOnly)}
       </div>
     </div>
   );
@@ -498,25 +526,31 @@ function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: 
 
 function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme }) {
   const t = theme;
-  const item = (label: string, value: string, sub: string, warn = false) => (
-    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
+  const { text } = useI18n();
+  const [open, setOpen] = useState(false);
+  const item = (key: string, label: string, value: string, sub: string, warn = false) => (
+    <div key={key} style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
       <div style={{ font: `500 8px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".03em" }}>{label}</div>
       <div style={{ marginTop: 3, font: `600 13px ${t.mono}`, color: warn ? "#e0795f" : t.text }}>{value}</div>
       <div style={{ marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 8px ${t.mono}`, color: t.faint }}>{sub}</div>
     </div>
   );
+  const items = [
+    item("median", text.median, stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", text.context),
+    item("peak", text.peak, stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80),
+    item("compacted", text.compacted, fmtInt(stats.compactions), text.times),
+    item("reasoning", text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.codexOnly),
+  ];
   return (
     <div>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-        <Label t={t}>Context health</Label>
-        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} measured turns</span>
+        <Label t={t}>{text.contextHealth}</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} {text.measuredTurns}</span>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 5 }}>
-        {item("Median", stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", "context")}
-        {item("Peak", stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80)}
-        {item("Compacted", fmtInt(stats.compactions), "times")}
-        {item("Reasoning", stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : "Codex only")}
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${open ? 4 : 3}, 1fr)`, gap: 5 }}>
+        {items.slice(0, open ? items.length : 3)}
       </div>
+      <ListToggle expanded={open} total={items.length} theme={t} onToggle={() => setOpen((value) => !value)} />
     </div>
   );
 }
@@ -525,26 +559,27 @@ function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme })
 // the session logs — data Claude doesn't expose. Bars turn amber near the cap.
 function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; theme: Theme }) {
   const t = theme;
+  const { locale, text } = useI18n();
   const now = Date.now();
   const stale = now - q.asOfMs > 60 * 60 * 1000;
   const winLabel = (min: number) =>
-    min === 10080 ? "Weekly" : min % 60 === 0 && min > 0 ? `${min / 60}h window` : `${min}m window`;
+    min === 10080 ? text.weekly : min % 60 === 0 && min > 0 ? `${min / 60}h ${text.window}` : `${min}m ${text.window}`;
   const resetsIn = (unixS: number) => {
     const ms = unixS * 1000 - now;
-    if (ms <= 0) return "resetting…";
+    if (ms <= 0) return text.resetting;
     const h = Math.floor(ms / 3.6e6), m = Math.round((ms % 3.6e6) / 6e4);
-    if (h >= 48) return `resets in ${Math.round(h / 24)}d`;
-    return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
+    if (h >= 48) return `${text.resetsIn} ${Math.round(h / 24)}d`;
+    return h > 0 ? `${text.resetsIn} ${h}h ${m}m` : `${text.resetsIn} ${m}m`;
   };
-  const asOf = new Date(q.asOfMs).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  const asOf = new Date(q.asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" });
   const quotaValues = trend.map((point) => point.usedPct);
   const first = trend[0], last = trend[trend.length - 1];
   const elapsedHours = first && last ? (last.tsMs - first.tsMs) / 3.6e6 : 0;
   const burnPerDay = elapsedHours > 0 ? ((last.usedPct - first.usedPct) / elapsedHours) * 24 : 0;
   const hoursToCap = burnPerDay > 0 && last ? ((100 - last.usedPct) / burnPerDay) * 24 : 0;
   const horizon = hoursToCap > 0
-    ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h to cap` : `${(hoursToCap / 24).toFixed(1)}d to cap`
-    : "stable";
+    ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h ${text.toCap}` : `${(hoursToCap / 24).toFixed(1)}d ${text.toCap}`
+    : text.stable;
   const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
     const p = Math.max(0, Math.min(100, pctUsed));
     const col = p >= 80 ? "#e0795f" : t.accent;
@@ -566,11 +601,11 @@ function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; th
       <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
         <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
         <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
-          {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%/day · {horizon}</> : "Collecting weekly trend"}
+          {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%{text.perDay} · {horizon}</> : text.collectingWeeklyTrend}
         </span>
       </div>
       <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
-        {q.plan && <>Plan: {q.plan}</>}{stale && <span> · as of {asOf}</span>}
+        {q.plan && <>{text.plan}: {q.plan}</>}{stale && <span> · {text.asOf} {asOf}</span>}
       </div>
     </div>
   );
@@ -585,10 +620,11 @@ const Label = ({ t, children }: { t: Theme; children: React.ReactNode }) => (
 
 function ThemeToggle({ pref, theme, onCycle }: { pref: "dark" | "light" | "system"; theme: Theme; onCycle: () => void }) {
   const t = theme;
+  const { text } = useI18n();
   // Single button cycling Dark → Light → System; the icon shows the current mode.
-  const label = pref === "system" ? "System" : pref === "dark" ? "Dark" : "Light";
+  const label = pref === "system" ? text.system : pref === "dark" ? text.dark : text.light;
   return (
-    <button onClick={onCycle} title={`Theme: ${label} (click to change)`} aria-label={`theme: ${label}`} style={{
+    <button data-no-drag="" onClick={onCycle} title={`${text.theme}: ${label} (${text.clickToChange})`} aria-label={`${text.theme}: ${label}`} style={{
       display: "inline-flex", alignItems: "center", justifyContent: "center",
       width: 26, height: 26, borderRadius: 7, cursor: "pointer", padding: 0,
       background: t.segBg, border: `1px solid ${t.segBorder}`, color: t.dim,
@@ -614,8 +650,9 @@ function ThemeToggle({ pref, theme, onCycle }: { pref: "dark" | "light" | "syste
 
 function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolean; onClick: () => void }) {
   const t = theme;
+  const { text } = useI18n();
   return (
-    <button onClick={onClick} disabled={busy} title="Save screenshot to Desktop" aria-label="save screenshot" style={{
+    <button data-no-drag="" onClick={onClick} disabled={busy} title={text.saveScreenshot} aria-label="save screenshot" style={{
       display: "inline-flex", alignItems: "center", justifyContent: "center",
       width: 26, height: 26, borderRadius: 7, cursor: busy ? "default" : "pointer", padding: 0,
       background: t.segBg, border: `1px solid ${t.segBorder}`, color: t.dim,
@@ -634,6 +671,20 @@ function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolea
   );
 }
 
+function LanguageToggle({ locale, theme, onToggle }:
+  { locale: Locale; theme: Theme; onToggle: () => void }) {
+  const { text } = useI18n();
+  return (
+    <button type="button" data-no-drag="" onClick={onToggle} title={text.switchLanguage} aria-label={text.switchLanguage} style={{
+      border: 0, background: "none", color: theme.faint, padding: 0, cursor: "pointer",
+      font: `600 8.5px ${theme.mono}`, lineHeight: 1.2,
+    }} onMouseEnter={(event) => (event.currentTarget.style.color = theme.dim)}
+      onMouseLeave={(event) => (event.currentTarget.style.color = theme.faint)}>
+      {locale === "en" ? "EN" : "CN"}
+    </button>
+  );
+}
+
 function localIso(date: Date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -641,31 +692,32 @@ function localIso(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-function formatRange(range: DateRange, year = true) {
+function formatRange(range: DateRange, locale: Locale, year = true) {
   const options: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "numeric",
     ...(year ? { year: "numeric" } : {}),
   };
-  const format = (iso: string) => new Date(`${iso}T00:00:00`).toLocaleDateString("en-US", options);
+  const format = (iso: string) => new Date(`${iso}T00:00:00`).toLocaleDateString(localeTag(locale), options);
   return range.startDate === range.endDate
     ? format(range.startDate)
     : `${format(range.startDate)} – ${format(range.endDate)}`;
 }
 
-function tokenAmount(valueM: number, targetM: number) {
+function tokenAmount(valueM: number, targetM: number, tokenUnit: string) {
   if (targetM >= 1) return { value: valueM.toFixed(2), unit: "M" };
   if (targetM >= 0.001) {
     const valueK = valueM * 1000;
     return { value: valueK.toFixed(targetM < 0.01 ? 1 : 0), unit: "K" };
   }
-  return { value: Math.round(valueM * 1_000_000).toLocaleString("en-US"), unit: "tokens" };
+  return { value: Math.round(valueM * 1_000_000).toLocaleString("en-US"), unit: tokenUnit };
 }
 
 function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onToggle, onDraft, onApply, onClear }:
   { theme: Theme; dark: boolean; open: boolean; active: boolean; draft: DateRange; max: string; busy: boolean;
     error: string; onToggle: () => void; onDraft: (range: DateRange) => void; onApply: () => void; onClear: () => void }) {
   const t = theme;
+  const { text } = useI18n();
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -690,8 +742,8 @@ function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onTog
   };
   return (
     <div ref={root} data-no-drag="" style={{ position: "relative" }}>
-      <button type="button" onClick={onToggle} title={active ? "Change date range" : "Filter by date range"}
-        aria-label="filter by date range" aria-expanded={open} style={{
+      <button type="button" onClick={onToggle} title={active ? text.changeDateRange : text.filterDateRange}
+        aria-label={text.filterDateRange} aria-expanded={open} style={{
           display: "inline-flex", alignItems: "center", justifyContent: "center",
           width: 26, height: 26, borderRadius: 7, cursor: "pointer", padding: 0,
           background: active || open ? t.segOnBg : t.segBg,
@@ -712,28 +764,28 @@ function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onTog
           border: `1px solid ${t.segBorder}`, boxShadow: "0 12px 32px rgba(0,0,0,0.28)",
         }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input aria-label="Start date" type="date" required max={draft.endDate || max}
+            <input aria-label={text.startDate} type="date" required max={draft.endDate || max}
               value={draft.startDate} onChange={(event) => onDraft({ ...draft, startDate: event.target.value })}
               style={inputStyle} />
-            <span style={{ color: t.faint, font: `500 11px ${t.mono}` }}>to</span>
-            <input aria-label="End date" type="date" required min={draft.startDate} max={max}
+            <span style={{ color: t.faint, font: `500 11px ${t.mono}` }}>{text.to}</span>
+            <input aria-label={text.endDate} type="date" required min={draft.startDate} max={max}
               value={draft.endDate} onChange={(event) => onDraft({ ...draft, endDate: event.target.value })}
               style={inputStyle} />
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 9 }}>
             <span style={{ flex: 1, minWidth: 0, color: error ? "#e0795f" : t.faint,
               font: `500 9px ${t.mono}`, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {error || "Dates are inclusive"}
+              {error || text.datesInclusive}
             </span>
             {active && <button type="button" onClick={onClear} style={{
               border: "none", background: "transparent", color: t.dim, cursor: "pointer",
               padding: "4px 6px", font: `600 10px ${t.ui}`,
-            }}>Clear</button>}
+            }}>{text.clear}</button>}
             <button type="submit" disabled={busy} style={{
               border: "none", borderRadius: 6, background: t.accent, color: "#fff",
               cursor: busy ? "default" : "pointer", padding: "4px 10px",
               opacity: busy ? 0.65 : 1, font: `600 10px ${t.ui}`,
-            }}>{busy ? "Loading…" : "Apply"}</button>
+            }}>{busy ? text.loading : text.apply}</button>
           </div>
         </form>
       )}
@@ -741,9 +793,10 @@ function RangeFilter({ theme, dark, open, active, draft, max, busy, error, onTog
   );
 }
 
-function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater }:
+function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen, active, updater }:
   { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void;
-    openGen: number; active: boolean; updater: UpdaterController }) {
+    onToggleLanguage: () => void; openGen: number; active: boolean; updater: UpdaterController }) {
+  const { locale, text } = useI18n();
   // Agent scope filter. scopes[0] is always the aggregate; a stale selection
   // (e.g. a source disappeared after a rescan) falls back to it.
   const scopes = dash.scopes;
@@ -797,7 +850,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   };
   const applyDateRange = async () => {
     if (!draftRange.startDate || !draftRange.endDate || draftRange.startDate > draftRange.endDate) {
-      setRangeError("Choose a valid date range");
+      setRangeError(text.chooseValidRange);
       return;
     }
     const request = ++rangeRequest.current;
@@ -874,7 +927,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   // animated Total tokens: counts up from 0 on each open / period / scope
   // / model switch; held at 0 while hidden so it never flashes.
   const animTotal = useCountUp(totalTokens, `${viewKey}:${scope.id}:${totalModel}:${openGen}`, active);
-  const heroTotal = tokenAmount(animTotal, totalTokens);
+  const heroTotal = tokenAmount(animTotal, totalTokens, text.tokens);
   // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
   const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
@@ -894,8 +947,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
   const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
   const trendSub = activeRange
-    ? formatRange(activeRange, false)
-    : { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+    ? formatRange(activeRange, locale, false)
+    : { Day: text.today24h, Week: text.thisWeek, Month: text.thisMonth }[period];
 
   // screenshot capture: rasterize the full panel card to a PNG and hand it to
   // the Rust `save_screenshot` command (browser preview falls back to a download).
@@ -908,13 +961,15 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
   };
   const exportProjects = async (rows: ProjectStat[]) => {
-    if (!rows.length) { showToast("No project usage to export", false); return; }
+    if (!rows.length) { showToast(text.noProjectUsage, false); return; }
     const csvCell = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
-    const periodLabel = activeRange ? formatRange(activeRange) : period;
+    const periodLabel = activeRange
+      ? formatRange(activeRange, locale)
+      : { Day: text.day, Week: text.week, Month: text.month }[period];
     const csv = "\uFEFF" + [
-      ["Scope", "Period", "Project", "Tokens", "Estimated cost USD", "Requests", "Sessions"],
+      [text.scope, text.period, text.project, "Tokens", text.estimatedCostUsd, text.requestStats, text.sessions],
       ...rows.map((project) => [
-        scope.label, periodLabel, project.name, Math.round(project.tokens * 1_000_000),
+        scope.id === "all" ? text.all : scope.label, periodLabel, project.name, Math.round(project.tokens * 1_000_000),
         project.cost.toFixed(6), project.requests, project.sessions,
       ]),
     ].map((row) => row.map(csvCell).join(",")).join("\r\n");
@@ -923,7 +978,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
       const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
       if (inTauri) {
         await invoke<string>("save_project_export", { csv, label });
-        showToast("Project CSV saved to Desktop", true);
+        showToast(text.projectCsvSaved, true);
       } else {
         const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
         const anchor = document.createElement("a");
@@ -931,16 +986,16 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         anchor.download = "tokenscope-projects.csv";
         anchor.click();
         URL.revokeObjectURL(url);
-        showToast("Project CSV downloaded", true);
+        showToast(text.projectCsvDownloaded, true);
       }
     } catch {
-      showToast("Project export failed", false);
+      showToast(text.projectExportFailed, false);
     }
   };
   const captureScreenshot = async () => {
     if (shotBusy) return;
     const el = document.querySelector<HTMLElement>(".om-scroll");
-    if (!el) { showToast("Nothing to capture", false); return; }
+    if (!el) { showToast(text.nothingToCapture, false); return; }
     setShotBusy(true);
     try {
       await document.fonts.ready;
@@ -963,7 +1018,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
       const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
       if (inTauri) {
         await invoke<string>("save_screenshot", { dataUrl });
-        showToast("Saved to Desktop", true);
+        showToast(text.savedToDesktop, true);
       } else {
         const a = document.createElement("a");
         a.href = dataUrl;
@@ -971,10 +1026,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         document.body.appendChild(a);
         a.click();
         a.remove();
-        showToast("Downloaded", true);
+        showToast(text.downloaded, true);
       }
     } catch {
-      showToast("Screenshot failed", false);
+      showToast(text.screenshotFailed, false);
     } finally {
       el.classList.remove("ts-no-transition");
       setShotBusy(false);
@@ -1026,7 +1081,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
               <TokenGlyph color={t.accent} size={16} />
               <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
             </div>
-            <VersionUpdate st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
+            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+              <VersionUpdate st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
+              <LanguageToggle locale={locale} theme={t} onToggle={onToggleLanguage} />
+            </div>
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
             <Segmented value={activeRange ? "" : period} theme={t} onSelect={selectPeriod} />
@@ -1051,8 +1109,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={t.accent} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <rect x="3" y="5" width="18" height="16" rx="2" /><path d="M16 3v4M8 3v4M3 10h18" />
             </svg>
-            <span style={{ flex: 1, font: `600 10px ${t.mono}`, color: t.text }}>{formatRange(activeRange)}</span>
-            <button type="button" onClick={clearDateRange} aria-label="clear date range" style={{
+            <span style={{ flex: 1, font: `600 10px ${t.mono}`, color: t.text }}>{formatRange(activeRange, locale)}</span>
+            <button type="button" onClick={clearDateRange} aria-label={text.clear} style={{
               border: "none", background: "transparent", color: t.faint, cursor: "pointer",
               padding: "0 2px", font: `600 12px ${t.ui}`,
             }}>✕</button>
@@ -1066,11 +1124,11 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-              <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase", whiteSpace: "nowrap" }}>Total tokens</div>
+              <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{text.totalTokens}</div>
               <select
                 data-no-drag=""
-                aria-label="Total tokens model"
-                title={selectedModel?.name ?? "All models"}
+                aria-label={text.totalTokensModel}
+                title={selectedModel?.name ?? text.allModels}
                 value={selectedModel?.name ?? ""}
                 onChange={(e) => setTotalModel(e.target.value)}
                 style={{
@@ -1080,7 +1138,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
                   font: `500 10px ${t.ui}`, cursor: "pointer",
                 }}
               >
-                <option value="">All models</option>
+                <option value="">{text.allModels}</option>
                 {modelTotals.map((model) => <option key={model.name} value={model.name}>{model.name}</option>)}
               </select>
             </div>
@@ -1090,7 +1148,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
-            <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>Est. cost</div>
+            <div style={{ font: `500 10px ${t.ui}`, color: t.dim }}>{text.estimatedCost}</div>
             <div style={{ font: `600 18px ${t.mono}`, color: t.accent, marginTop: 2 }}>{fmtMoney(totalCost)}</div>
           </div>
         </div>
@@ -1113,25 +1171,25 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
           segs={slices.length > 0 ? [...slices].reverse().map((s) => ({ color: s.color, values: s.values })) : undefined} />
         <SectionRule t={t} m="14px 0 10px" />
         {/* models */}
-        <div style={{ marginBottom: 4 }}><Label t={t}>Tokens by model</Label></div>
-        {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
-        {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
+        <div style={{ marginBottom: 4 }}><Label t={t}>{text.tokensByModel}</Label></div>
+        {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>{text.noUsagePeriod}</div>}
+        <ModelList key={`${viewKey}:${scope.id}:tokens`} models={tokenModels} shares={tokenShares} max={maxM} theme={t} />
         <SectionRule t={t} m="10px 0 10px" />
         {/* cost donut */}
-        <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
+        <div style={{ marginBottom: 8 }}><Label t={t}>{text.costByModel}</Label></div>
         {costModels.length > 0
-          ? <CostDonut models={costModels} theme={t} size={100} thickness={15} keepColors={scopes.length > 1} />
+          ? <CostDonut key={`${viewKey}:${scope.id}:cost`} models={costModels} theme={t} size={100} thickness={15} keepColors={scopes.length > 1} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>
-            {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
+            {unpricedModels.length} {unpricedModels.length > 1 ? text.models : text.model} {text.withoutPricing}:{" "}
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
         )}
         {projects.length > 0 && (
           <>
             <SectionRule t={t} m="12px 0 10px" />
-            <ProjectSettlement projects={projects} theme={t} onExport={exportProjects} />
+            <ProjectSettlement key={`${viewKey}:${scope.id}:projects`} projects={projects} theme={t} onExport={exportProjects} />
           </>
         )}
         <SectionRule t={t} m="12px 0 10px" />
@@ -1139,14 +1197,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         <SectionRule t={t} m="12px 0 10px" />
         <PerformanceSection stats={performance} theme={t} />
         <SectionRule t={t} m="12px 0 10px" />
-        <ContextSection stats={context} theme={t} />
+        <ContextSection key={`${viewKey}:${scope.id}:context`} stats={context} theme={t} />
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-          <MiniStat label="Requests" value={fmtInt(M.requests)} sub={`${M.sessions} sessions`} theme={t}>
+          <MiniStat label={text.requestStats} value={fmtInt(M.requests)} sub={`${M.sessions} ${text.sessions}`} theme={t}>
             <Sparkline values={P.reqTrend.length ? P.reqTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
-          <MiniStat label="Cost trend" value={fmtMoney(M.cost)} sub={trendSub} theme={t} accent={t.accent}>
+          <MiniStat label={text.costTrend} value={fmtMoney(M.cost)} sub={trendSub} theme={t} accent={t.accent}>
             <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
         </div>
@@ -1154,7 +1212,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         {scope.quota && (
           <>
             <SectionRule t={t} />
-            <div style={{ marginBottom: 4 }}><Label t={t}>Codex quota</Label></div>
+            <div style={{ marginBottom: 4 }}><Label t={t}>{text.codexQuota}</Label></div>
             <QuotaCard q={scope.quota} trend={scope.quotaTrend ?? []} theme={t} />
           </>
         )}
@@ -1163,12 +1221,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
           <>
             <SectionRule t={t} />
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-              <Label t={t}>MCP calls</Label>
-              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} servers</span>
+              <Label t={t}>{text.mcpCalls}</Label>
+              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.mcpCalls)}</span> · {M.servers} {text.servers}</span>
             </div>
             {P.mcp.length > 0
               ? <BarList key={`${viewKey}:${scope.id}`} items={P.mcp} theme={t} accent={t.accent} />
-              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No MCP calls in this period</div>}
+              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>{text.noMcpCalls}</div>}
           </>
         )}
         {/* Skill — shown whenever the user has installed skills */}
@@ -1176,21 +1234,21 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
           <>
             <SectionRule t={t} />
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-              <Label t={t}>Skill calls</Label>
-              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} skills</span>
+              <Label t={t}>{text.skillCalls}</Label>
+              <span style={{ font: `500 10px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}><span style={{ color: t.text, fontWeight: 600 }}>{fmtInt(M.skillCalls)}</span> · {M.skills} {text.skills}</span>
             </div>
             {P.skills.length > 0
               ? <BarList key={`${viewKey}:${scope.id}`} items={P.skills} theme={t} accent={t.accent} />
-              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>No skill calls in this period</div>}
+              : <div style={{ font: `500 10px ${t.mono}`, color: t.faint, padding: "2px 0" }}>{text.noSkillCalls}</div>}
           </>
         )}
         {/* heatmap */}
         <SectionRule t={t} />
-        <div style={{ marginBottom: 9 }}><Label t={t}>Daily activity</Label></div>
+        <div style={{ marginBottom: 9 }}><Label t={t}>{text.dailyActivity}</Label></div>
         <Heatmap days={scope.heatmap} theme={t} accent={t.accent} />
         {/* footer note */}
         <div style={{ marginTop: 12, font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "center" }}>
-          Est. cost via models.dev / LiteLLM · estimate
+          {text.estimateNote}
         </div>
         </div>{/* /scrolling body */}
       </div>
@@ -1209,7 +1267,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
       {shortcutEditor !== null && (
         <ShortcutEditor current={shortcutEditor} theme={t} dark={dark}
           onClose={() => setShortcutEditor(null)}
-          onSaved={() => { setShortcutEditor(null); showToast("Shortcut enabled", true); }} />
+          onSaved={() => { setShortcutEditor(null); showToast(text.shortcutEnabled, true); }} />
       )}
     </div>
   );
@@ -1221,6 +1279,21 @@ export default function App() {
   const [openGen, setOpenGen] = useState(0);
   const [focused, setFocused] = useState(true); // browser preview: always "focused"
   const updater = useUpdater();
+  const [locale, setLocale] = useState<Locale>(() => {
+    const saved = typeof localStorage !== "undefined" ? localStorage.getItem("tokenscope-language") : null;
+    return saved === "zh" ? "zh" : "en";
+  });
+  const applyLanguage = (next: Locale) => {
+    setLocale(next);
+    try { localStorage.setItem("tokenscope-language", next); } catch {}
+  };
+  const toggleLanguage = () => {
+    const next = locale === "en" ? "zh" : "en";
+    applyLanguage(next);
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      invoke("set_app_language", { language: next }).catch(() => {});
+    }
+  };
   // Theme preference: explicit Dark / Light, or System (follows the OS
   // appearance live on both macOS and Windows via prefers-color-scheme). First
   // run defaults to System.
@@ -1279,6 +1352,12 @@ export default function App() {
     // live updates pushed from the background refresh thread — swaps the data in
     // place (no Loading), so values update without any flicker.
     listen<Dashboard>("dashboard-updated", (e) => apply(e.payload)).then(track);
+    invoke<Locale>("get_app_language").then((value) => {
+      if (value === "en" || value === "zh") applyLanguage(value);
+    }).catch(() => {});
+    listen<Locale>("language-changed", (e) => {
+      if (e.payload === "en" || e.payload === "zh") applyLanguage(e.payload);
+    }).then(track);
     // System appearance pushed natively from Rust (macOS). The webview's
     // prefers-color-scheme is unreliable for our hidden, non-activating menu-bar
     // panel, so the native event is the source of truth for System mode there;
@@ -1306,6 +1385,10 @@ export default function App() {
     document.body.style.background = "transparent";
   }, [dark]);
 
+  useEffect(() => {
+    document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
+  }, [locale]);
+
   // Suppress per-property CSS transitions across a theme flip so the panel
   // repaints in the new theme in one step instead of cross-fading each color
   // (see .ts-no-transition in main.tsx). A background light→dark switch lands
@@ -1329,21 +1412,23 @@ export default function App() {
   }, [dark]);
 
   const t = TH[dark ? "dark" : "light"];
+  const text = TEXT[locale];
+  let content: React.ReactNode;
   if (err) {
-    return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>Failed to load: {err}</div>;
-  }
-  if (!dash) {
-    return (
+    content = <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>{text.loadFailed}: {err}</div>;
+  } else if (!dash) {
+    content = (
       <div style={{ height: "100vh", padding: 10, boxSizing: "border-box", background: "transparent" }}>
         <div style={{ height: "100%", borderRadius: 14, background: dark ? "#1f2226" : "#ffffff",
           display: "flex", alignItems: "center", justifyContent: "center",
-          font: `500 12px ${t.mono}`, color: t.dim }}>Loading…</div>
+          font: `500 12px ${t.mono}`, color: t.dim }}>{text.loading}</div>
       </div>
     );
+  } else if (!dash.scopes.length) {
+    content = <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>{text.loadFailed}: {text.noScopes}</div>;
+  } else {
+    content = <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme}
+      onToggleLanguage={toggleLanguage} openGen={openGen} active={focused} updater={updater} />;
   }
-  if (!dash.scopes.length) {
-    return <div style={{ padding: 20, font: `500 12px ${t.mono}`, color: "#e0795f" }}>Failed to load: dashboard returned no scopes</div>;
-  }
-  return <Panel dash={dash} dark={dark} themePref={themePref} onToggleTheme={cycleTheme}
-    openGen={openGen} active={focused} updater={updater} />;
+  return <I18nProvider locale={locale}>{content}</I18nProvider>;
 }

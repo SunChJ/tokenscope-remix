@@ -46,12 +46,38 @@ enum WeeklyQuotaDisplay {
     CodexAndSpark,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AppLanguage {
+    #[default]
+    En,
+    Zh,
+}
+
+impl AppLanguage {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "en" => Some(Self::En),
+            "zh" => Some(Self::Zh),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Zh => "zh",
+        }
+    }
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct TrayPreferences {
     weekly_quota_display: WeeklyQuotaDisplay,
     dashboard_shortcut: bool,
     dashboard_shortcut_key: String,
+    language: AppLanguage,
 }
 
 impl Default for TrayPreferences {
@@ -60,12 +86,82 @@ impl Default for TrayPreferences {
             weekly_quota_display: WeeklyQuotaDisplay::Off,
             dashboard_shortcut: false,
             dashboard_shortcut_key: DASHBOARD_SHORTCUT.to_string(),
+            language: AppLanguage::En,
         }
     }
 }
 
 struct TrayPreferencesState(std::sync::Mutex<TrayPreferences>);
-struct DashboardShortcutMenuState(CheckMenuItem<tauri::Wry>);
+struct TrayMenuState {
+    open: MenuItem<tauri::Wry>,
+    refresh: MenuItem<tauri::Wry>,
+    check_updates: MenuItem<tauri::Wry>,
+    weekly: Submenu<tauri::Wry>,
+    weekly_off: CheckMenuItem<tauri::Wry>,
+    dashboard_shortcut: CheckMenuItem<tauri::Wry>,
+    change_dashboard_shortcut: MenuItem<tauri::Wry>,
+    autostart: CheckMenuItem<tauri::Wry>,
+    language: Submenu<tauri::Wry>,
+    language_en: CheckMenuItem<tauri::Wry>,
+    language_zh: CheckMenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+struct TrayCopy {
+    open: &'static str,
+    refresh: &'static str,
+    check_updates: &'static str,
+    weekly: &'static str,
+    off: &'static str,
+    dashboard_shortcut: &'static str,
+    change_dashboard_shortcut: &'static str,
+    autostart: &'static str,
+    language: &'static str,
+    english: &'static str,
+    chinese: &'static str,
+    quit: &'static str,
+    today: &'static str,
+    ready: &'static str,
+}
+
+fn tray_copy(language: AppLanguage) -> &'static TrayCopy {
+    static EN: TrayCopy = TrayCopy {
+        open: "Open Tokenscope",
+        refresh: "Refresh",
+        check_updates: "Check for Updates…",
+        weekly: "Weekly Remaining",
+        off: "Off",
+        dashboard_shortcut: "Dashboard Shortcut",
+        change_dashboard_shortcut: "Change Dashboard Shortcut…",
+        autostart: "Launch at Login",
+        language: "Language",
+        english: "English",
+        chinese: "Simplified Chinese",
+        quit: "Quit",
+        today: "today",
+        ready: "Ready",
+    };
+    static ZH: TrayCopy = TrayCopy {
+        open: "打开 Tokenscope",
+        refresh: "刷新",
+        check_updates: "检查更新…",
+        weekly: "周剩余额度",
+        off: "关闭",
+        dashboard_shortcut: "Dashboard 快捷键",
+        change_dashboard_shortcut: "修改 Dashboard 快捷键…",
+        autostart: "登录时启动",
+        language: "语言",
+        english: "English",
+        chinese: "简体中文",
+        quit: "退出",
+        today: "今日",
+        ready: "就绪",
+    };
+    match language {
+        AppLanguage::En => &EN,
+        AppLanguage::Zh => &ZH,
+    }
+}
 
 fn shortcut_label(shortcut: &str) -> String {
     let macos = cfg!(target_os = "macos");
@@ -101,8 +197,34 @@ fn shortcut_label(shortcut: &str) -> String {
     }
 }
 
-fn dashboard_shortcut_menu_label(shortcut: &str) -> String {
-    format!("Dashboard Shortcut ({})", shortcut_label(shortcut))
+fn dashboard_shortcut_menu_label(shortcut: &str, language: AppLanguage) -> String {
+    format!(
+        "{} ({})",
+        tray_copy(language).dashboard_shortcut,
+        shortcut_label(shortcut)
+    )
+}
+
+fn apply_tray_language(menu: &TrayMenuState, language: AppLanguage, shortcut: &str) {
+    let copy = tray_copy(language);
+    let _ = menu.open.set_text(copy.open);
+    let _ = menu.refresh.set_text(copy.refresh);
+    let _ = menu.check_updates.set_text(copy.check_updates);
+    let _ = menu.weekly.set_text(copy.weekly);
+    let _ = menu.weekly_off.set_text(copy.off);
+    let _ = menu
+        .dashboard_shortcut
+        .set_text(dashboard_shortcut_menu_label(shortcut, language));
+    let _ = menu
+        .change_dashboard_shortcut
+        .set_text(copy.change_dashboard_shortcut);
+    let _ = menu.autostart.set_text(copy.autostart);
+    let _ = menu.language.set_text(copy.language);
+    let _ = menu.language_en.set_text(copy.english);
+    let _ = menu.language_zh.set_text(copy.chinese);
+    let _ = menu.language_en.set_checked(language == AppLanguage::En);
+    let _ = menu.language_zh.set_checked(language == AppLanguage::Zh);
+    let _ = menu.quit.set_text(copy.quit);
 }
 
 fn weekly_remaining_from_quota(quota: &model::Quota) -> Option<u8> {
@@ -149,25 +271,26 @@ fn weekly_label_suffix(
     suffix
 }
 
-fn tray_label(dash: &Dashboard, display: WeeklyQuotaDisplay) -> String {
-    let mut label = fmt_tokens_m(dash.today_tokens);
+fn tray_label(dash: &Dashboard, display: WeeklyQuotaDisplay, language: AppLanguage) -> String {
+    let mut label = fmt_tokens_m(dash.today_tokens, language);
     let (codex, spark) = dashboard_quotas(dash);
     label.push_str(&weekly_label_suffix(display, codex, spark));
     label
 }
 
 fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
-    let display = app
+    let (display, language) = app
         .try_state::<TrayPreferencesState>()
         .map(|state| {
             state
                 .0
                 .lock()
-                .map(|prefs| prefs.weekly_quota_display)
+                .map(|prefs| (prefs.weekly_quota_display, prefs.language))
                 .unwrap_or_default()
         })
         .unwrap_or_default();
-    let label = tray_label(dash, display);
+    let label = tray_label(dash, display, language);
+    let today = tray_copy(language).today;
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.tray_by_id("main") {
@@ -176,7 +299,7 @@ fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
             // tooltip there. Both APIs touch native tray state; on macOS that
             // must happen on the main thread.
             let _ = tray.set_title(Some(label.clone()));
-            let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
+            let _ = tray.set_tooltip(Some(format!("Tokenscope · {today} {label}")));
         }
     });
 }
@@ -705,10 +828,51 @@ fn set_dashboard_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(),
         })
         .map_err(|_| "shortcut state unavailable".to_string())?;
     save_tray_preferences(&preferences);
-    if let Some(menu) = app.try_state::<DashboardShortcutMenuState>() {
-        let _ = menu.0.set_checked(true);
-        let _ = menu.0.set_text(dashboard_shortcut_menu_label(&shortcut));
+    if let Some(menu) = app.try_state::<TrayMenuState>() {
+        let _ = menu.dashboard_shortcut.set_checked(true);
+        let _ = menu
+            .dashboard_shortcut
+            .set_text(dashboard_shortcut_menu_label(
+                &shortcut,
+                preferences.language,
+            ));
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_app_language(app: tauri::AppHandle) -> String {
+    app.try_state::<TrayPreferencesState>()
+        .and_then(|state| {
+            state
+                .0
+                .lock()
+                .ok()
+                .map(|prefs| prefs.language.as_str().to_string())
+        })
+        .unwrap_or_else(|| AppLanguage::En.as_str().to_string())
+}
+
+#[tauri::command]
+fn set_app_language(app: tauri::AppHandle, language: String) -> Result<(), String> {
+    let language =
+        AppLanguage::parse(language.trim()).ok_or_else(|| "invalid language".to_string())?;
+    let state = app
+        .try_state::<TrayPreferencesState>()
+        .ok_or_else(|| "language state unavailable".to_string())?;
+    let preferences = state
+        .0
+        .lock()
+        .map(|mut preferences| {
+            preferences.language = language;
+            preferences.clone()
+        })
+        .map_err(|_| "language state unavailable".to_string())?;
+    save_tray_preferences(&preferences);
+    if let Some(menu) = app.try_state::<TrayMenuState>() {
+        apply_tray_language(&menu, language, &preferences.dashboard_shortcut_key);
+    }
+    let _ = app.emit("language-changed", language.as_str());
     Ok(())
 }
 
@@ -801,7 +965,7 @@ pub fn dashboard_json() -> String {
     serde_json::to_string_pretty(&parser::build_dashboard()).unwrap_or_default()
 }
 
-fn fmt_tokens_m(m: f64) -> String {
+fn fmt_tokens_m(m: f64, language: AppLanguage) -> String {
     if m >= 1.0 {
         format!("{:.2}M", m)
     } else {
@@ -809,7 +973,7 @@ fn fmt_tokens_m(m: f64) -> String {
         // no usage yet (e.g. just past midnight) — "0K" reads like "OK", so
         // show a clearer idle label instead.
         if k <= 0 {
-            "Ready".to_string()
+            tray_copy(language).ready.to_string()
         } else {
             format!("{k}K")
         }
@@ -863,7 +1027,9 @@ pub fn run() {
             save_screenshot,
             save_project_export,
             begin_drag,
-            set_dashboard_shortcut
+            set_dashboard_shortcut,
+            get_app_language,
+            set_app_language
         ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.
@@ -897,6 +1063,7 @@ pub fn run() {
             let weekly_quota_display = tray_preferences.weekly_quota_display;
             let dashboard_shortcut_on = tray_preferences.dashboard_shortcut;
             let dashboard_shortcut_key = tray_preferences.dashboard_shortcut_key.clone();
+            let language = tray_preferences.language;
             app.manage(TrayPreferencesState(std::sync::Mutex::new(
                 tray_preferences,
             )));
@@ -1001,21 +1168,22 @@ pub fn run() {
 
             // Build the menu-bar tray: app glyph (template icon) + today's tokens.
             let dash = parser::build_dashboard();
-            let label = tray_label(&dash, weekly_quota_display);
+            let label = tray_label(&dash, weekly_quota_display, language);
+            let copy = tray_copy(language);
 
-            let open_i = MenuItem::with_id(app, "open", "Open Tokenscope", true, None::<&str>)?;
-            let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+            let open_i = MenuItem::with_id(app, "open", copy.open, true, None::<&str>)?;
+            let refresh_i = MenuItem::with_id(app, "refresh", copy.refresh, true, None::<&str>)?;
             let check_updates_i = MenuItem::with_id(
                 app,
                 "check-updates",
-                "Check for Updates…",
+                copy.check_updates,
                 true,
                 None::<&str>,
             )?;
             let weekly_off_i = CheckMenuItem::with_id(
                 app,
                 "weekly-off",
-                "Off",
+                copy.off,
                 true,
                 weekly_quota_display == WeeklyQuotaDisplay::Off,
                 None::<&str>,
@@ -1038,23 +1206,22 @@ pub fn run() {
             )?;
             let weekly_menu = Submenu::with_items(
                 app,
-                "Weekly Remaining",
+                copy.weekly,
                 true,
                 &[&weekly_off_i, &weekly_codex_i, &weekly_codex_spark_i],
             )?;
             let dashboard_shortcut_i = CheckMenuItem::with_id(
                 app,
                 "dashboard-shortcut",
-                dashboard_shortcut_menu_label(&dashboard_shortcut_key),
+                dashboard_shortcut_menu_label(&dashboard_shortcut_key, language),
                 true,
                 dashboard_shortcut_on,
                 None::<&str>,
             )?;
-            app.manage(DashboardShortcutMenuState(dashboard_shortcut_i.clone()));
             let change_dashboard_shortcut_i = MenuItem::with_id(
                 app,
                 "change-dashboard-shortcut",
-                "Change Dashboard Shortcut…",
+                copy.change_dashboard_shortcut,
                 true,
                 None::<&str>,
             )?;
@@ -1063,12 +1230,34 @@ pub fn run() {
             let autostart_i = CheckMenuItem::with_id(
                 app,
                 "autostart",
-                "Launch at Login",
+                copy.autostart,
                 true,
                 autostart_on,
                 None::<&str>,
             )?;
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let language_en_i = CheckMenuItem::with_id(
+                app,
+                "language-en",
+                copy.english,
+                true,
+                language == AppLanguage::En,
+                None::<&str>,
+            )?;
+            let language_zh_i = CheckMenuItem::with_id(
+                app,
+                "language-zh",
+                copy.chinese,
+                true,
+                language == AppLanguage::Zh,
+                None::<&str>,
+            )?;
+            let language_menu = Submenu::with_items(
+                app,
+                copy.language,
+                true,
+                &[&language_en_i, &language_zh_i],
+            )?;
+            let quit_i = MenuItem::with_id(app, "quit", copy.quit, true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
                 &[
@@ -1080,17 +1269,32 @@ pub fn run() {
                     &dashboard_shortcut_i,
                     &change_dashboard_shortcut_i,
                     &autostart_i,
+                    &language_menu,
                     &PredefinedMenuItem::separator(app)?,
                     &quit_i,
                 ],
             )?;
+            app.manage(TrayMenuState {
+                open: open_i.clone(),
+                refresh: refresh_i.clone(),
+                check_updates: check_updates_i.clone(),
+                weekly: weekly_menu.clone(),
+                weekly_off: weekly_off_i.clone(),
+                dashboard_shortcut: dashboard_shortcut_i.clone(),
+                change_dashboard_shortcut: change_dashboard_shortcut_i.clone(),
+                autostart: autostart_i.clone(),
+                language: language_menu.clone(),
+                language_en: language_en_i.clone(),
+                language_zh: language_zh_i.clone(),
+                quit: quit_i.clone(),
+            });
 
             let lh_tray = last_hidden.clone();
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(tauri::include_image!("icons/tray-icon.png"))
                 .icon_as_template(false)
                 .title(&label)
-                .tooltip(format!("Tokenscope · today {}", label))
+                .tooltip(format!("Tokenscope · {} {}", copy.today, label))
                 .menu(&menu)
                 .show_menu_on_left_click(false) // left = toggle panel, right = menu
                 .on_tray_icon_event(move |tray, event| {
@@ -1223,6 +1427,14 @@ pub fn run() {
                         let _ = autostart_i.set_checked(now_on);
                         save_autostart_pref(now_on);
                     }
+                    "language-en" | "language-zh" => {
+                        let language = if event.id.as_ref() == "language-zh" {
+                            "zh"
+                        } else {
+                            "en"
+                        };
+                        let _ = set_app_language(app.clone(), language.to_string());
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -1346,6 +1558,7 @@ mod tests {
 
         assert_eq!(preferences.weekly_quota_display, WeeklyQuotaDisplay::Codex);
         assert_eq!(preferences.dashboard_shortcut_key, DASHBOARD_SHORTCUT);
+        assert_eq!(preferences.language, AppLanguage::En);
         assert!(DASHBOARD_SHORTCUT.parse::<Shortcut>().is_ok());
         assert!("Command+Alt+KeyT".parse::<Shortcut>().is_ok());
         assert_eq!(

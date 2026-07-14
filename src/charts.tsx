@@ -3,6 +3,7 @@ import {
   Theme, ModelStat, NamedCount, SeriesPoint, HeatDay,
   fmtInt, fmtMoney, fmtTokens, linePath, fmtHeatDate,
 } from "./data";
+import { localeTag, localizeSeriesText, useI18n } from "./i18n";
 
 export function TokenGlyph({ color = "#1f9d63", size = 14 }: { color?: string; size?: number }) {
   return (
@@ -18,6 +19,8 @@ export function TokenGlyph({ color = "#1f9d63", size = 14 }: { color?: string; s
 export function Segmented({ value, items = ["Day", "Week", "Month"], theme, onSelect }:
   { value: string; items?: string[]; theme: Theme; onSelect?: (v: string) => void }) {
   const t = theme;
+  const { text } = useI18n();
+  const labels: Record<string, string> = { Day: text.day, Week: text.week, Month: text.month };
   return (
     <div style={{ display: "inline-flex", padding: 2, borderRadius: 7, background: t.segBg, border: `1px solid ${t.segBorder}`, gap: 2 }}>
       {items.map((it) => {
@@ -27,7 +30,7 @@ export function Segmented({ value, items = ["Day", "Week", "Month"], theme, onSe
             font: `600 11px ${t.ui}`, letterSpacing: ".02em", padding: "3px 11px", borderRadius: 5, cursor: "pointer", userSelect: "none",
             color: on ? t.segOnText : t.segOffText, background: on ? t.segOnBg : "transparent",
             boxShadow: on ? t.segOnShadow : "none", transition: "color .15s, background .15s",
-          }}>{it}</div>
+          }}>{labels[it] ?? it}</div>
         );
       })}
     </div>
@@ -40,6 +43,7 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
     // Each entry paints one segment per bucket; values align with `data`.
     segs?: { color: string; values: number[] }[] }) {
   const t = theme;
+  const { locale, text } = useI18n();
   accent = accent || t.accent; accentSoft = accentSoft || t.accentSoft;
   // Default stacking: output on top, input(+cache) below — the classic view.
   const stacks = segs ?? [
@@ -87,7 +91,7 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
       </div>
       <div style={{ display: "flex", gap: `${gapPct}%`, marginTop: 6 }}>
         {data.map((d, i) => (
-          <div key={i} style={{ flex: 1, textAlign: "center", font: `500 9px ${t.mono}`, color: t.dim, letterSpacing: ".03em" }}>{d.label}</div>
+          <div key={i} style={{ flex: 1, textAlign: "center", font: `500 9px ${t.mono}`, color: t.dim, letterSpacing: ".03em" }}>{localizeSeriesText(d.label, locale)}</div>
         ))}
       </div>
       {hi >= 0 && (
@@ -99,9 +103,9 @@ export function BarChart({ data, theme, height = 96, accent, accentSoft, radius 
           font: `500 10px ${t.mono}`, whiteSpace: "nowrap", pointerEvents: "none", zIndex: 9999,
           boxShadow: "0 4px 14px rgba(0,0,0,0.35)" }}>
           <span style={{ color: accent, fontWeight: 600 }}>
-            {totals[hi] === 0 ? "No tokens" : fmtTokens(totals[hi]) + " tokens"}
+            {totals[hi] === 0 ? text.noTokens : `${fmtTokens(totals[hi])} ${text.tokens}`}
           </span>
-          <span style={{ opacity: 0.7 }}> · {data[hi].full}</span>
+          <span style={{ opacity: 0.7 }}> · {localizeSeriesText(data[hi].full, locale)}</span>
         </div>
       )}
     </div>
@@ -137,18 +141,20 @@ export function Sparkline({ values, theme, width = 80, height = 24, accent, stro
 const DONUT_PALETTE = ["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const DONUT_OVERFLOW = "#79817b";
 
-export function CostDonut({ models, theme, size = 104, thickness = 16, keepColors = false }:
-  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number;
+export function CostDonut({ models, theme, size = 104, thickness = 16, keepColors = false, limit = 3 }:
+  { models: ModelStat[]; theme: Theme; size?: number; thickness?: number; limit?: number;
     // true → keep each model's own (agent-tinted) color so wedges match the
     // token-list dots; false → classic cost-rank green recoloring.
     keepColors?: boolean }) {
   const t = theme;
   const [hi, setHi] = useState(-1);
+  const [open, setOpen] = useState(false);
   // Rank by cost (desc); recolor by that rank unless colors are meaningful.
   const ranked = [...models]
     .sort((a, b) => b.cost - a.cost)
     .map((m, i) => (keepColors ? m : { ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
   models = ranked;
+  const shownModels = models.slice(0, open ? models.length : limit);
   const total = models.reduce((s, m) => s + m.cost, 0) || 1e-9;
   const cx = size / 2, cy = size / 2;
   const rOut = (size - 2) / 2, rIn = rOut - thickness;
@@ -204,7 +210,7 @@ export function CostDonut({ models, theme, size = 104, thickness = 16, keepColor
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        {models.map((m, i) => (
+        {shownModels.map((m, i) => (
           <div key={i} onMouseEnter={() => setHi(i)} onMouseLeave={() => setHi(-1)}
             style={{ display: "flex", alignItems: "center", gap: 7, padding: "2.5px 0", opacity: hi === -1 || hi === i ? 1 : 0.45, transition: "opacity .14s", cursor: "default", userSelect: "none" }}>
             <span style={{ width: 7, height: 7, borderRadius: 2, background: m.color, flex: "0 0 auto" }} />
@@ -212,12 +218,29 @@ export function CostDonut({ models, theme, size = 104, thickness = 16, keepColor
             <span style={{ font: `600 10.5px ${t.mono}`, color: hi === i ? m.color : t.dim, flex: "0 0 auto" }}>{fmtMoney(m.cost)}</span>
           </div>
         ))}
+        <ListToggle expanded={open} total={models.length} limit={limit} theme={t} onToggle={() => setOpen((value) => !value)} />
       </div>
     </div>
   );
 }
 
-export function BarList({ items, theme, accent, limit = 5 }:
+export function ListToggle({ expanded, total, limit = 3, theme, onToggle }:
+  { expanded: boolean; total: number; limit?: number; theme: Theme; onToggle: () => void }) {
+  const { text } = useI18n();
+  if (total <= limit) return null;
+  const remaining = total - limit;
+  return (
+    <button type="button" data-no-drag="" aria-expanded={expanded} onClick={onToggle} style={{
+      display: "block", border: 0, background: "none", padding: "5px 0 0", cursor: "pointer",
+      font: `500 9.5px ${theme.ui}`, color: theme.faint, userSelect: "none",
+    }} onMouseEnter={(event) => (event.currentTarget.style.color = theme.dim)}
+      onMouseLeave={(event) => (event.currentTarget.style.color = theme.faint)}>
+      {expanded ? text.showLess : `${text.showMore} (+${remaining})`}
+    </button>
+  );
+}
+
+export function BarList({ items, theme, accent, limit = 3 }:
   { items: NamedCount[]; theme: Theme; accent?: string; limit?: number }) {
   const t = theme; accent = accent || t.accent;
   const [open, setOpen] = useState(false);
@@ -227,7 +250,6 @@ export function BarList({ items, theme, accent, limit = 5 }:
   // as ModelRow's token bars, and gives a descending comparison ladder even when
   // usage is spread across many skills (count / total leaves every bar tiny).
   const max = items.reduce((m, i) => Math.max(m, i.count), 0) || 1;
-  const more = items.length - shown.length;
   return (
     <div>
       {shown.map((it, i) => (
@@ -242,18 +264,7 @@ export function BarList({ items, theme, accent, limit = 5 }:
           <span style={{ font: `600 10.5px ${t.mono}`, color: t.dim, flex: "0 0 auto", minWidth: 30, textAlign: "right" }}>{fmtInt(it.count)}</span>
         </div>
       ))}
-      {more > 0 && (
-        <div onClick={() => setOpen(true)} style={{ font: `500 9.5px ${t.ui}`, color: t.faint, paddingTop: 4, cursor: "pointer", userSelect: "none" }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = t.dim)} onMouseLeave={(e) => (e.currentTarget.style.color = t.faint)}>
-          +{more} more
-        </div>
-      )}
-      {open && items.length > limit && (
-        <div onClick={() => setOpen(false)} style={{ font: `500 9.5px ${t.ui}`, color: t.faint, paddingTop: 4, cursor: "pointer", userSelect: "none" }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = t.dim)} onMouseLeave={(e) => (e.currentTarget.style.color = t.faint)}>
-          show less
-        </div>
-      )}
+      <ListToggle expanded={open} total={items.length} limit={limit} theme={t} onToggle={() => setOpen((value) => !value)} />
     </div>
   );
 }
@@ -267,6 +278,7 @@ function ramp(accent: string, lvl: number, gridLine: string, card: string) {
 export function Heatmap({ days, theme, accent, gap = 2 }:
   { days: HeatDay[]; theme: Theme; accent?: string; gap?: number }) {
   const t = theme; accent = accent || t.accent;
+  const { locale, text } = useI18n();
   const [hi, setHi] = useState<HeatDay | null>(null);
   const [tip, setTip] = useState({ x: 0, y: 0 });
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -299,7 +311,9 @@ export function Heatmap({ days, theme, accent, gap = 2 }:
       }
     }
   });
-  const MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const MN = locale === "zh"
+    ? ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"]
+    : ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const onCell = (d: HeatDay, e: React.MouseEvent) => {
     // viewport coords → tooltip uses position:fixed so it isn't clipped by the
     // scrolling card's overflow (renders on top of the panel).
@@ -327,9 +341,9 @@ export function Heatmap({ days, theme, accent, gap = 2 }:
         ))}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 5, justifyContent: "flex-end", marginTop: 8, font: `500 8.5px ${t.mono}`, color: t.faint }}>
-        <span>Less</span>
+        <span>{text.heatLess}</span>
         {[0, 1, 2, 3, 4].map((l) => (<span key={l} style={{ width: 9, height: 9, borderRadius: 2, background: ramp(accent!, l, t.gridLine, t.card) }} />))}
-        <span>More</span>
+        <span>{text.heatMore}</span>
       </div>
       {hi && (
         <div style={{
@@ -339,8 +353,8 @@ export function Heatmap({ days, theme, accent, gap = 2 }:
           background: t.tip, color: "#fff", borderRadius: 6, padding: "5px 8px",
           font: `500 10px ${t.mono}`, whiteSpace: "nowrap", pointerEvents: "none", zIndex: 9999,
           boxShadow: "0 4px 14px rgba(0,0,0,0.35)" }}>
-          <span style={{ color: accent, fontWeight: 600 }}>{hi.tokens === 0 ? "No calls" : fmtTokens(hi.tokens) + " tokens"}</span>
-          <span style={{ opacity: 0.7 }}> · {fmtHeatDate(hi.date)}</span>
+          <span style={{ color: accent, fontWeight: 600 }}>{hi.tokens === 0 ? text.noCalls : `${fmtTokens(hi.tokens)} ${text.tokens}`}</span>
+          <span style={{ opacity: 0.7 }}> · {fmtHeatDate(hi.date, localeTag(locale))}</span>
         </div>
       )}
     </div>
