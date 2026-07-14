@@ -23,6 +23,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 - **Multi-agent**: with more than one agent detected, filter chips (All / Claude / Codex) appear — the All view stacks usage **by agent**, and filtering to one agent re-tints the whole panel with its accent (Claude coral / Codex teal). With a single agent the classic UI is unchanged
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Project settlement: groups usage by local Git repository / working directory and exports the selected period as CSV without exposing raw paths or conversation content
+- Reliability telemetry: completed/aborted turns, tool errors/denials, and estimated tokens/cost spent on aborted work; collected incrementally from this version forward
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
 - **Codex quota card**: the 5-hour and weekly rate-limit windows (used %, plan, reset countdown) read straight from Codex's own logs
 - Cost donut (hover for a single model), year-long activity heatmap

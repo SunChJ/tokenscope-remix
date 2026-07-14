@@ -43,6 +43,21 @@ pub struct ProjectStat {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct ReliabilityStats {
+    #[serde(rename = "completedTurns")]
+    pub completed_turns: u64,
+    #[serde(rename = "abortedTurns")]
+    pub aborted_turns: u64,
+    #[serde(rename = "toolErrors")]
+    pub tool_errors: u64,
+    pub denials: u64,
+    #[serde(rename = "wastedTokens")]
+    pub wasted_tokens: f64,
+    #[serde(rename = "wastedCost")]
+    pub wasted_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
     pub total_tokens: f64,
@@ -84,6 +99,7 @@ pub struct PeriodReport {
     pub series: Vec<SeriesPoint>,
     pub models: Vec<ModelStat>,
     pub projects: Vec<ProjectStat>,
+    pub reliability: ReliabilityStats,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]
@@ -147,6 +163,8 @@ pub struct Dashboard {
     pub today_tokens: f64, // M tokens across all agents, for the tray label
     #[serde(rename = "generatedAt")]
     pub generated_at: String,
+    #[serde(rename = "telemetrySinceMs")]
+    pub telemetry_since_ms: i64,
 }
 
 /// One scope's aggregation for an inclusive, user-selected date range.

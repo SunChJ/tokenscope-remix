@@ -33,6 +33,20 @@ struct Event {
     skills: Vec<String>, // user-installed skill names called in this msg
 }
 
+#[derive(Clone)]
+struct TurnEvent {
+    ts: DateTime<Local>,
+    agent: &'static str,
+    outcome: String,
+    input: f64,
+    cache_creation: f64,
+    cache_read: f64,
+    output: f64,
+    cost: f64,
+    tool_errors: u64,
+    denials: u64,
+}
+
 /// Static per-agent identity: label + accent + a 5-step chart palette (rank
 /// shades of the accent, ending in a muted overflow tone).
 pub struct AgentDef {
@@ -114,6 +128,7 @@ pub fn build_dashboard() -> Dashboard {
     }
     let codex_quota = store.codex_quota.clone();
     let codex_spark_quota = store.codex_spark_quota.clone();
+    let telemetry_since_ms = store.telemetry_since_ms;
 
     // 2. Aggregate: apply current config + prices, slice by current time.
     let cfg = UserConfig::load(&store.codex_project_dirs());
@@ -130,6 +145,12 @@ pub fn build_dashboard() -> Dashboard {
         .filter(|raw| raw.ts_ms >= report_cutoff)
         .map(|r| compute_event(r, store.project_for(r), &cfg, &pricing))
         .collect();
+    let turns: Vec<TurnEvent> = store
+        .turns
+        .iter()
+        .filter(|turn| turn.ts_ms >= report_cutoff)
+        .map(|turn| compute_turn(turn, &pricing))
+        .collect();
 
     let today = now.date_naive();
 
@@ -145,7 +166,9 @@ pub fn build_dashboard() -> Dashboard {
     let scopes = if present.len() <= 1 {
         // Single (or no) source → one scope, classic green UI, no chips.
         let agent = present.first().map(|a| a.id).unwrap_or(AGENT_CLAUDE);
-        let mut scope = build_scope("all", "All", "", &events, PALETTE, agent, &cfg, now);
+        let mut scope = build_scope(
+            "all", "All", "", &events, &turns, PALETTE, agent, &cfg, now,
+        );
         if agent == AGENT_CODEX {
             scope.quota = codex_quota;
             scope.spark_quota = codex_spark_quota;
@@ -157,14 +180,29 @@ pub fn build_dashboard() -> Dashboard {
         let mut per_agent: Vec<Scope> = Vec::new();
         for a in &present {
             let filtered: Vec<Event> = events.iter().filter(|e| e.agent == a.id).map(clone_event).collect();
-            let mut s = build_scope(a.id, a.label, a.color, &filtered, &a.palette, a.id, &cfg, now);
+            let filtered_turns: Vec<TurnEvent> = turns
+                .iter()
+                .filter(|turn| turn.agent == a.id)
+                .cloned()
+                .collect();
+            let mut s = build_scope(
+                a.id,
+                a.label,
+                a.color,
+                &filtered,
+                &filtered_turns,
+                &a.palette,
+                a.id,
+                &cfg,
+                now,
+            );
             if a.id == AGENT_CODEX {
                 s.quota = codex_quota.clone();
                 s.spark_quota = codex_spark_quota.clone();
             }
             per_agent.push(s);
         }
-        let mut all = build_scope("all", "All", "", &events, PALETTE, "", &cfg, now);
+        let mut all = build_scope("all", "All", "", &events, &turns, PALETTE, "", &cfg, now);
         // All-scope model rows keep each agent's palette (rank within agent), and
         // each period gains per-agent slices for the split bar + stacked chart.
         for idx in 0..3usize {
@@ -210,6 +248,7 @@ pub fn build_dashboard() -> Dashboard {
         scopes,
         today_tokens,
         generated_at: now.to_rfc3339(),
+        telemetry_since_ms,
     }
 }
 
@@ -249,6 +288,18 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
         })
         .map(|raw| compute_event(raw, store.project_for(raw), &cfg, &pricing))
         .collect();
+    let turns: Vec<TurnEvent> = store
+        .turns
+        .iter()
+        .filter(|turn| {
+            let Some(timestamp) = DateTime::from_timestamp_millis(turn.ts_ms) else {
+                return false;
+            };
+            let date = timestamp.with_timezone(&Local).date_naive();
+            date >= previous_start && date <= end
+        })
+        .map(|turn| compute_turn(turn, &pricing))
+        .collect();
     let present: Vec<&AgentDef> = AGENTS
         .iter()
         .filter(|agent| present_ids.contains(agent.id))
@@ -256,7 +307,7 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
 
     let scopes = if present.len() <= 1 {
         let agent = present.first().map(|a| a.id).unwrap_or(AGENT_CLAUDE);
-        let mut report = report_range(&events, start, end, PALETTE);
+        let mut report = report_range(&events, &turns, start, end, PALETTE);
         set_installed_counts(&mut report, agent, &cfg);
         vec![RangeScope {
             id: "all".to_string(),
@@ -270,7 +321,18 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
                 .filter(|event| event.agent == agent.id)
                 .map(clone_event)
                 .collect();
-            let mut report = report_range(&filtered, start, end, &agent.palette);
+            let filtered_turns: Vec<TurnEvent> = turns
+                .iter()
+                .filter(|turn| turn.agent == agent.id)
+                .cloned()
+                .collect();
+            let mut report = report_range(
+                &filtered,
+                &filtered_turns,
+                start,
+                end,
+                &agent.palette,
+            );
             set_installed_counts(&mut report, agent.id, &cfg);
             per_agent.push(RangeScope {
                 id: agent.id.to_string(),
@@ -278,7 +340,7 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
             });
         }
 
-        let mut all = report_range(&events, start, end, PALETTE);
+        let mut all = report_range(&events, &turns, start, end, PALETTE);
         set_installed_counts(&mut all, "", &cfg);
         all.models = per_agent
             .iter()
@@ -350,15 +412,16 @@ fn build_scope(
     label: &str,
     color: &str,
     events: &[Event],
+    turns: &[TurnEvent],
     palette: &[&str],
     agent_scope: &str,
     cfg: &UserConfig,
     now: DateTime<Local>,
 ) -> Scope {
     let today = now.date_naive();
-    let mut day = report_day(events, now, palette);
-    let mut week = report_week(events, now, palette);
-    let mut month = report_month(events, now, palette);
+    let mut day = report_day(events, turns, now, palette);
+    let mut week = report_week(events, turns, now, palette);
+    let mut month = report_month(events, turns, now, palette);
     let heatmap = build_heatmap(events, today);
 
     for r in [&mut day, &mut week, &mut month] {
@@ -439,6 +502,67 @@ fn compute_event(
         mcp,
         skills,
     }
+}
+
+fn compute_turn(turn: &crate::store::TurnTelemetry, pricing: &Pricing) -> TurnEvent {
+    let ts = DateTime::from_timestamp_millis(turn.ts_ms)
+        .unwrap_or_default()
+        .with_timezone(&Local);
+    let cost = pricing
+        .cost(
+            &turn.model,
+            turn.input_tokens,
+            turn.output_tokens,
+            turn.cache_creation_tokens,
+            turn.cache_read_tokens,
+        )
+        .or_else(|| {
+            pricing.cost(
+                &normalize_model(&turn.model),
+                turn.input_tokens,
+                turn.output_tokens,
+                turn.cache_creation_tokens,
+                turn.cache_read_tokens,
+            )
+        })
+        .unwrap_or(0.0);
+    TurnEvent {
+        ts,
+        agent: agent_def(&turn.agent).id,
+        outcome: turn.outcome.clone(),
+        input: turn.input_tokens,
+        cache_creation: turn.cache_creation_tokens,
+        cache_read: turn.cache_read_tokens,
+        output: turn.output_tokens,
+        cost,
+        tool_errors: turn.tool_errors,
+        denials: turn.denials,
+    }
+}
+
+fn reliability(turns: &[TurnEvent], start: NaiveDate, end: NaiveDate) -> ReliabilityStats {
+    let mut stats = ReliabilityStats::default();
+    for turn in turns {
+        let date = turn.ts.date_naive();
+        if date < start || date > end {
+            continue;
+        }
+        match turn.outcome.as_str() {
+            "completed" => stats.completed_turns += 1,
+            "aborted" => {
+                stats.aborted_turns += 1;
+                stats.wasted_tokens +=
+                    turn.input + turn.cache_creation + turn.cache_read + turn.output;
+                stats.wasted_cost += turn.cost;
+            }
+            _ => {}
+        }
+        stats.tool_errors += turn.tool_errors;
+        stats.denials += turn.denials;
+    }
+    stats.wasted_tokens = (stats.wasted_tokens / 1e6 * 1_000_000.0).round() / 1_000_000.0;
+    stats.wasted_cost = (stats.wasted_cost * 1_000_000.0).round() / 1_000_000.0;
+    stats
 }
 
 // ── aggregation helpers ────────────────────────────────────────────
@@ -604,7 +728,12 @@ fn pct_delta(cur: f64, prev: f64) -> f64 {
 }
 
 // ── Day report: today, 24 hourly buckets ───────────────────────────
-fn report_day(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
+fn report_day(
+    events: &[Event],
+    turns: &[TurnEvent],
+    now: DateTime<Local>,
+    palette: &[&str],
+) -> PeriodReport {
     let today = now.date_naive();
     let yesterday = today - Duration::days(1);
     let mut agg = Agg::default();
@@ -659,6 +788,7 @@ fn report_day(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Perio
         series,
         models: agg.models(palette),
         projects: agg.projects(),
+        reliability: reliability(turns, today, today),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -668,7 +798,12 @@ fn report_day(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Perio
 }
 
 // ── Week report: current calendar week (Mon-Sun) vs previous week ────
-fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
+fn report_week(
+    events: &[Event],
+    turns: &[TurnEvent],
+    now: DateTime<Local>,
+    palette: &[&str],
+) -> PeriodReport {
     let today = now.date_naive();
     // Monday of the current week (Mon=0 … Sun=6).
     let start = today - Duration::days(today.weekday().num_days_from_monday() as i64);
@@ -728,6 +863,7 @@ fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Peri
         series,
         models: agg.models(palette),
         projects: agg.projects(),
+        reliability: reliability(turns, start, next_start - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -737,7 +873,12 @@ fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Peri
 }
 
 // ── Month report: current calendar month vs previous calendar month ──
-fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> PeriodReport {
+fn report_month(
+    events: &[Event],
+    turns: &[TurnEvent],
+    now: DateTime<Local>,
+    palette: &[&str],
+) -> PeriodReport {
     let today = now.date_naive();
     let (y, m) = (today.year(), today.month());
     let cur_first = NaiveDate::from_ymd_opt(y, m, 1).unwrap();
@@ -806,6 +947,7 @@ fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Per
         series,
         models: agg.models(palette),
         projects: agg.projects(),
+        reliability: reliability(turns, cur_first, next_first - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -817,6 +959,7 @@ fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Per
 // ── Custom report: inclusive dates vs the preceding equal-length range ────
 fn report_range(
     events: &[Event],
+    turns: &[TurnEvent],
     start: NaiveDate,
     end: NaiveDate,
     palette: &[&str],
@@ -923,6 +1066,7 @@ fn report_range(
         series,
         models: agg.models(palette),
         projects: agg.projects(),
+        reliability: reliability(turns, start, end),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: request_buckets,
@@ -1018,6 +1162,7 @@ mod tests {
         ];
         let report = report_range(
             &events,
+            &[],
             NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
             NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
             PALETTE,
@@ -1038,17 +1183,60 @@ mod tests {
     #[test]
     fn custom_single_day_uses_hours_and_long_ranges_cap_chart_buckets() {
         let day = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
-        let hourly = report_range(&[event(2026, 7, 13, 23, 500.0)], day, day, PALETTE);
+        let hourly = report_range(&[event(2026, 7, 13, 23, 500.0)], &[], day, day, PALETTE);
         assert_eq!(hourly.series.len(), 24);
         assert_eq!(hourly.metrics.total_tokens, 0.0005);
         assert_eq!(hourly.series[23].input, 0.0005);
 
         let long = report_range(
             &[],
+            &[],
             NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 4, 10).unwrap(),
             PALETTE,
         );
         assert!(long.series.len() <= 48);
+    }
+
+    #[test]
+    fn reliability_counts_aborted_waste_and_tool_issues() {
+        let ts = Local
+            .with_ymd_and_hms(2026, 7, 13, 12, 0, 0)
+            .single()
+            .unwrap();
+        let turns = vec![
+            TurnEvent {
+                ts,
+                agent: AGENT_CODEX,
+                outcome: "aborted".to_string(),
+                input: 500_000.0,
+                cache_creation: 0.0,
+                cache_read: 400_000.0,
+                output: 100_000.0,
+                cost: 1.25,
+                tool_errors: 2,
+                denials: 1,
+            },
+            TurnEvent {
+                ts,
+                agent: AGENT_CODEX,
+                outcome: "completed".to_string(),
+                input: 0.0,
+                cache_creation: 0.0,
+                cache_read: 0.0,
+                output: 0.0,
+                cost: 0.0,
+                tool_errors: 0,
+                denials: 0,
+            },
+        ];
+        let stats = reliability(&turns, ts.date_naive(), ts.date_naive());
+
+        assert_eq!(stats.completed_turns, 1);
+        assert_eq!(stats.aborted_turns, 1);
+        assert_eq!(stats.tool_errors, 2);
+        assert_eq!(stats.denials, 1);
+        assert_eq!(stats.wasted_tokens, 1.0);
+        assert_eq!(stats.wasted_cost, 1.25);
     }
 }

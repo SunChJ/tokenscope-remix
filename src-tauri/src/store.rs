@@ -29,6 +29,40 @@ pub struct ProjectRef {
     pub name: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct TurnTelemetry {
+    pub ts_ms: i64,
+    pub source: String,
+    pub agent: String,
+    pub session: String,
+    pub turn_id: String,
+    pub model: String,
+    pub outcome: String,
+    pub abort_reason: String,
+    pub input_tokens: f64,
+    pub cache_creation_tokens: f64,
+    pub cache_read_tokens: f64,
+    pub output_tokens: f64,
+    pub reasoning_tokens: f64,
+    pub duration_ms: u64,
+    pub ttft_ms: u64,
+    pub tool_errors: u64,
+    pub denials: u64,
+    pub compactions: u64,
+    pub context_tokens: f64,
+    pub context_window: f64,
+    // Claude can repeat one assistant message across several JSONL lines.
+    // Persist ids so incremental restarts never count its usage twice.
+    usage_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct TelemetryCache {
+    since_ms: i64,
+    turns: Vec<TurnTelemetry>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RawEvent {
     pub ts_ms: i64,
@@ -78,6 +112,9 @@ struct FileState {
     // so incremental reads can still attribute later calls to their MCP server.
     #[serde(default)]
     mcp_tools: HashMap<String, String>,
+    // Runtime-only source key used while appending telemetry records.
+    #[serde(skip)]
+    source: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -97,6 +134,9 @@ pub struct Store {
     pub codex_quota: Option<Quota>,
     pub codex_spark_quota: Option<Quota>,
     projects_by_source: HashMap<String, ProjectRef>,
+    pub telemetry_since_ms: i64,
+    pub turns: Vec<TurnTelemetry>,
+    telemetry_index: HashMap<String, usize>,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -113,6 +153,7 @@ pub struct Store {
 const STORE_VERSION: u32 = 8;
 const QUOTA_CACHE_VERSION: u32 = 1;
 const PROJECT_CACHE_VERSION: u32 = 1;
+const TELEMETRY_CACHE_VERSION: u32 = 1;
 // One-time quota migration: at most 32 × 64 KiB = 2 MiB of log content.
 const RECENT_QUOTA_FILES: usize = 32;
 const QUOTA_TAIL_BYTES: u64 = 64 * 1024;
@@ -210,6 +251,10 @@ fn stable_project_id(key: &str) -> String {
     format!("project-{hash:016x}")
 }
 
+fn telemetry_key(source: &str, turn_id: &str) -> String {
+    format!("{source}\0{turn_id}")
+}
+
 fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
     let root = cwd.map(project_root).unwrap_or_else(|| PathBuf::from(fallback));
     let key = root.to_string_lossy();
@@ -233,8 +278,11 @@ impl Store {
         let mut codex_quota = None;
         let mut codex_spark_quota = None;
         let mut projects_by_source = HashMap::new();
+        let mut telemetry_since_ms = chrono::Utc::now().timestamp_millis();
+        let mut turns = Vec::new();
         let mut version_ok = false;
         let mut quota_cache_ok = false;
+        let mut telemetry_cache_ok = false;
         if let Some(dir) = cache_dir() {
             // If the cache was written by an older parser, discard it so ingest
             // does a full rescan and picks up newly-extracted facts.
@@ -283,6 +331,20 @@ impl Store {
                         .and_then(|text| serde_json::from_str(&text).ok())
                         .unwrap_or_default();
                 }
+                let telemetry_version_ok = fs::read_to_string(dir.join("telemetry_version"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    == Some(TELEMETRY_CACHE_VERSION);
+                if telemetry_version_ok {
+                    if let Some(cache) = fs::read_to_string(dir.join("telemetry.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<TelemetryCache>(&text).ok())
+                    {
+                        telemetry_since_ms = cache.since_ms;
+                        turns = cache.turns;
+                        telemetry_cache_ok = true;
+                    }
+                }
             }
         }
         let index = events
@@ -291,6 +353,11 @@ impl Store {
             .filter(|(_, e)| !e.id.is_empty())
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
+        let telemetry_index = turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| (telemetry_key(&turn.source, &turn.turn_id), index))
+            .collect();
         let mut store = Store {
             events,
             index,
@@ -298,6 +365,9 @@ impl Store {
             codex_quota,
             codex_spark_quota,
             projects_by_source,
+            telemetry_since_ms,
+            turns,
+            telemetry_index,
         };
         if version_ok && !quota_cache_ok {
             store.rebuild_codex_quotas();
@@ -308,6 +378,11 @@ impl Store {
         if version_ok && store.refresh_projects() {
             if let Some(dir) = cache_dir() {
                 store.save_project_cache(&dir);
+            }
+        }
+        if version_ok && !telemetry_cache_ok {
+            if let Some(dir) = cache_dir() {
+                store.save_telemetry_cache(&dir);
             }
         }
         store
@@ -328,8 +403,23 @@ impl Store {
             }
             self.save_quota_cache(&dir);
             self.save_project_cache(&dir);
+            self.save_telemetry_cache(&dir);
             let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
         }
+    }
+
+    fn save_telemetry_cache(&self, dir: &Path) {
+        let cache = TelemetryCache {
+            since_ms: self.telemetry_since_ms,
+            turns: self.turns.clone(),
+        };
+        if let Ok(text) = serde_json::to_string(&cache) {
+            let _ = write_atomic(&dir.join("telemetry.json"), text.as_bytes());
+        }
+        let _ = write_atomic(
+            &dir.join("telemetry_version"),
+            TELEMETRY_CACHE_VERSION.to_string().as_bytes(),
+        );
     }
 
     fn save_project_cache(&self, dir: &Path) {
@@ -442,6 +532,48 @@ impl Store {
         self.projects_by_source.get(&event.source)
     }
 
+    fn turn_mut(
+        &mut self,
+        state: &FileState,
+        agent: &str,
+        ts_ms: i64,
+    ) -> Option<&mut TurnTelemetry> {
+        if state.source.is_empty() || state.turn_id.is_empty() {
+            return None;
+        }
+        if ts_ms > 0 && (self.telemetry_since_ms == 0 || ts_ms < self.telemetry_since_ms) {
+            self.telemetry_since_ms = ts_ms;
+        }
+        let key = telemetry_key(&state.source, &state.turn_id);
+        let index = if let Some(index) = self.telemetry_index.get(&key) {
+            *index
+        } else {
+            let index = self.turns.len();
+            self.turns.push(TurnTelemetry {
+                ts_ms,
+                source: state.source.clone(),
+                agent: agent.to_string(),
+                session: state.session.clone(),
+                turn_id: state.turn_id.clone(),
+                model: state.model.clone(),
+                ..TurnTelemetry::default()
+            });
+            self.telemetry_index.insert(key, index);
+            index
+        };
+        let turn = &mut self.turns[index];
+        if turn.ts_ms == 0 || (ts_ms > 0 && ts_ms < turn.ts_ms) {
+            turn.ts_ms = ts_ms;
+        }
+        if turn.session.is_empty() {
+            turn.session = state.session.clone();
+        }
+        if !state.model.is_empty() {
+            turn.model = state.model.clone();
+        }
+        Some(turn)
+    }
+
     /// Resolve each source file to a stable project id and short display name.
     /// Existing Codex manifests already retain cwd. For old Claude caches, read
     /// at most one 64 KiB prefix per project directory, then persist the mapping
@@ -499,6 +631,15 @@ impl Store {
             .collect();
     }
 
+    fn rebuild_telemetry_index(&mut self) {
+        self.telemetry_index = self
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| (telemetry_key(&turn.source, &turn.turn_id), index))
+            .collect();
+    }
+
     /// Drop every event that came from `key`, then rebuild the index. Used before
     /// re-reading a truncated/rewritten file so re-ingestion is idempotent
     /// (otherwise the cross-line tool_use merge re-appends calls and id-less
@@ -506,6 +647,8 @@ impl Store {
     fn purge_source(&mut self, key: &str) {
         self.events.retain(|e| e.source != key);
         self.rebuild_index();
+        self.turns.retain(|turn| turn.source != key);
+        self.rebuild_telemetry_index();
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files across
@@ -560,6 +703,7 @@ impl Store {
                 }
                 None => FileState::default(),
             };
+            state.source = key.clone();
 
             let Ok(mut f) = fs::File::open(path) else { continue };
             if f.seek(SeekFrom::Start(state.offset)).is_err() {
@@ -588,7 +732,7 @@ impl Store {
                 let Ok(s) = std::str::from_utf8(line) else { continue };
                 let parsed = match agent {
                     AGENT_CODEX => self.parse_codex_line(s, &mut state),
-                    _ => parse_claude_line(s),
+                    _ => self.parse_claude_line(s, &mut state),
                 };
                 if let Some(mut ev) = parsed {
                     ev.source = key.clone();
@@ -656,16 +800,71 @@ impl Store {
             }
             "event_msg" => {
                 let event_type = payload.get("type")?.as_str()?;
-                // Older Codex logs may not carry turn_context.turn_id. A task
-                // boundary is still enough to reset per-turn Skill dedup.
-                if event_type == "task_started" {
-                    state.skills_seen.clear();
-                    return None;
-                }
-                if event_type != "token_count" {
-                    return None;
-                }
                 let ts_ms = parse_ts(&v)?;
+                if let Some(turn_id) = payload.get("turn_id").and_then(|value| value.as_str()) {
+                    if state.turn_id != turn_id {
+                        state.turn_id = turn_id.to_string();
+                        state.skills_seen.clear();
+                    }
+                }
+                match event_type {
+                    "task_started" => {
+                        state.skills_seen.clear();
+                        let context_window = payload
+                            .get("model_context_window")
+                            .and_then(|value| value.as_f64())
+                            .unwrap_or(0.0);
+                        if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                            turn.context_window = turn.context_window.max(context_window);
+                        }
+                        return None;
+                    }
+                    "task_complete" => {
+                        if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                            turn.outcome = "completed".to_string();
+                            turn.duration_ms = payload
+                                .get("duration_ms")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                            turn.ttft_ms = payload
+                                .get("time_to_first_token_ms")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                        }
+                        return None;
+                    }
+                    "turn_aborted" => {
+                        if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                            turn.outcome = "aborted".to_string();
+                            turn.abort_reason = payload
+                                .get("reason")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            turn.duration_ms = payload
+                                .get("duration_ms")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                        }
+                        return None;
+                    }
+                    "context_compacted" => {
+                        if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                            turn.compactions += 1;
+                        }
+                        return None;
+                    }
+                    "patch_apply_end" => {
+                        if payload.get("success").and_then(|value| value.as_bool()) == Some(false) {
+                            if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                                turn.tool_errors += 1;
+                            }
+                        }
+                        return None;
+                    }
+                    "token_count" => {}
+                    _ => return None,
+                }
                 if let Some(rl) = payload.get("rate_limits") {
                     self.update_codex_quota(rl, ts_ms);
                 }
@@ -678,8 +877,22 @@ impl Store {
                 let raw_in = g("input_tokens");
                 let cached = g("cached_input_tokens").min(raw_in);
                 let out = g("output_tokens");
+                let reasoning = g("reasoning_output_tokens").min(out);
                 if raw_in + out <= 0.0 {
                     return None; // rate-limit-only heartbeat, nothing to count
+                }
+                let context_window = payload
+                    .get("info")
+                    .and_then(|info| info.get("model_context_window"))
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
+                    turn.input_tokens += raw_in - cached;
+                    turn.cache_read_tokens += cached;
+                    turn.output_tokens += out;
+                    turn.reasoning_tokens += reasoning;
+                    turn.context_tokens = turn.context_tokens.max(raw_in);
+                    turn.context_window = turn.context_window.max(context_window);
                 }
                 Some(RawEvent {
                     ts_ms,
@@ -754,6 +967,118 @@ impl Store {
             }
             _ => None,
         }
+    }
+
+    fn parse_claude_line(&mut self, line: &str, state: &mut FileState) -> Option<RawEvent> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let ts_ms = parse_ts(&value).unwrap_or(0);
+        if let Some(session) = value.get("sessionId").and_then(|item| item.as_str()) {
+            state.session = session.to_string();
+        }
+        if let Some(cwd) = value.get("cwd").and_then(|item| item.as_str()) {
+            state.cwd = cwd.to_string();
+        }
+
+        match value.get("type").and_then(|item| item.as_str()) {
+            Some("user") => {
+                if value.get("interruptedMessageId").is_some() {
+                    if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                        turn.outcome = "aborted".to_string();
+                        turn.abort_reason = "interrupted".to_string();
+                    }
+                }
+                let is_tool_result = value.get("sourceToolUseID").is_some()
+                    || value.get("sourceToolAssistantUUID").is_some();
+                if !is_tool_result && value.get("isMeta").and_then(|item| item.as_bool()) != Some(true)
+                {
+                    if let Some(turn_id) = value
+                        .get("promptId")
+                        .or_else(|| value.get("uuid"))
+                        .and_then(|item| item.as_str())
+                    {
+                        state.turn_id = turn_id.to_string();
+                    }
+                }
+                let tool_errors = value
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(|content| content.as_array())
+                    .map(|content| {
+                        content
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(|item| item.as_str())
+                                    == Some("tool_result")
+                                    && block.get("is_error").and_then(|item| item.as_bool())
+                                        == Some(true)
+                            })
+                            .count() as u64
+                    })
+                    .unwrap_or(0);
+                let denied = u64::from(value.get("toolDenialKind").is_some());
+                if tool_errors > 0 || denied > 0 || !state.turn_id.is_empty() {
+                    if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                        turn.tool_errors += tool_errors;
+                        turn.denials += denied;
+                    }
+                }
+            }
+            Some("assistant") => {
+                let message = value.get("message").unwrap_or(&serde_json::Value::Null);
+                if state.turn_id.is_empty() {
+                    if let Some(turn_id) = value
+                        .get("requestId")
+                        .or_else(|| message.get("id"))
+                        .and_then(|item| item.as_str())
+                    {
+                        state.turn_id = turn_id.to_string();
+                    }
+                }
+                let usage_id = message
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("");
+                if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                    if let Some(model) = message.get("model").and_then(|item| item.as_str()) {
+                        turn.model = model.to_string();
+                    }
+                    if !usage_id.is_empty() && !turn.usage_ids.iter().any(|id| id == usage_id) {
+                        let usage = message.get("usage").unwrap_or(&serde_json::Value::Null);
+                        let number = |key: &str| {
+                            usage
+                                .get(key)
+                                .and_then(|item| item.as_f64())
+                                .unwrap_or(0.0)
+                        };
+                        turn.input_tokens += number("input_tokens");
+                        turn.cache_creation_tokens += number("cache_creation_input_tokens");
+                        turn.cache_read_tokens += number("cache_read_input_tokens");
+                        turn.output_tokens += number("output_tokens");
+                        turn.usage_ids.push(usage_id.to_string());
+                    }
+                }
+            }
+            Some("system") => match value.get("subtype").and_then(|item| item.as_str()) {
+                Some("turn_duration") => {
+                    if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                        turn.outcome = "completed".to_string();
+                        turn.duration_ms = value
+                            .get("durationMs")
+                            .and_then(|item| item.as_u64())
+                            .unwrap_or(0);
+                    }
+                }
+                Some("compact_boundary") => {
+                    if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                        turn.compactions += 1;
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+
+        parse_claude_value(&value)
     }
 
     /// Keep the newest rate-limit snapshot (files are walked in arbitrary order,
@@ -942,15 +1267,14 @@ fn codex_session_from_filename(path: &std::path::Path) -> String {
     }
 }
 
-/// Parse one Claude JSONL line into a RawEvent (assistant messages only).
-fn parse_claude_line(line: &str) -> Option<RawEvent> {
-    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+/// Parse one Claude JSON value into a RawEvent (assistant messages only).
+fn parse_claude_value(v: &serde_json::Value) -> Option<RawEvent> {
     match v.get("type")?.as_str()? {
-        "assistant" => parse_assistant(&v),
+        "assistant" => parse_assistant(v),
         // Skills invoked via slash command (e.g. `/find-skills`) are logged as a
         // user message with a <command-name> tag, NOT as a Skill tool_use, so
         // they need a separate path or they'd never be counted.
-        "user" => parse_user_command(&v),
+        "user" => parse_user_command(v),
         _ => None,
     }
 }
@@ -1080,6 +1404,9 @@ mod tests {
             codex_quota: None,
             codex_spark_quota: None,
             projects_by_source: HashMap::new(),
+            telemetry_since_ms: 0,
+            turns: Vec::new(),
+            telemetry_index: HashMap::new(),
         }
     }
 
@@ -1102,6 +1429,60 @@ mod tests {
 
         assert_eq!(store.codex_quota.unwrap().primary_pct, 24.0);
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
+    }
+
+    #[test]
+    fn records_codex_aborted_turn_and_wasted_tokens() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/codex.jsonl".to_string(),
+            session: "session-1".to_string(),
+            model: "gpt-5".to_string(),
+            ..FileState::default()
+        };
+        let started = r#"{"timestamp":"2026-07-13T12:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":200000}}"#;
+        let usage = r#"{"timestamp":"2026-07-13T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":200000,"last_token_usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":100,"reasoning_output_tokens":40}}}}"#;
+        let aborted = r#"{"timestamp":"2026-07-13T12:00:02Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","duration_ms":2000,"reason":"interrupted"}}"#;
+
+        assert!(store.parse_codex_line(started, &mut state).is_none());
+        assert!(store.parse_codex_line(usage, &mut state).is_some());
+        assert!(store.parse_codex_line(aborted, &mut state).is_none());
+
+        let turn = &store.turns[0];
+        assert_eq!(turn.outcome, "aborted");
+        assert_eq!(turn.input_tokens, 200.0);
+        assert_eq!(turn.cache_read_tokens, 800.0);
+        assert_eq!(turn.output_tokens, 100.0);
+        assert_eq!(turn.reasoning_tokens, 40.0);
+        assert_eq!(turn.duration_ms, 2000);
+    }
+
+    #[test]
+    fn deduplicates_claude_turn_usage_and_counts_tool_errors() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/claude.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let user = r#"{"timestamp":"2026-07-13T12:00:00Z","type":"user","sessionId":"session-1","promptId":"prompt-1","message":{"content":"hi"}}"#;
+        let assistant = r#"{"timestamp":"2026-07-13T12:00:01Z","type":"assistant","sessionId":"session-1","message":{"id":"message-1","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#;
+        let error = r#"{"timestamp":"2026-07-13T12:00:02Z","type":"user","sessionId":"session-1","sourceToolUseID":"tool-1","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"failed"}]}}"#;
+        let duration = r#"{"timestamp":"2026-07-13T12:00:03Z","type":"system","sessionId":"session-1","subtype":"turn_duration","durationMs":3000}"#;
+
+        let _ = store.parse_claude_line(user, &mut state);
+        let _ = store.parse_claude_line(assistant, &mut state);
+        let _ = store.parse_claude_line(assistant, &mut state);
+        let _ = store.parse_claude_line(error, &mut state);
+        let _ = store.parse_claude_line(duration, &mut state);
+
+        let turn = &store.turns[0];
+        assert_eq!(turn.outcome, "completed");
+        assert_eq!(turn.input_tokens, 10.0);
+        assert_eq!(turn.cache_creation_tokens, 20.0);
+        assert_eq!(turn.cache_read_tokens, 30.0);
+        assert_eq!(turn.output_tokens, 40.0);
+        assert_eq!(turn.tool_errors, 1);
+        assert_eq!(turn.duration_ms, 3000);
     }
 
     #[test]

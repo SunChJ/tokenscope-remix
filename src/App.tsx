@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, ProjectStat, Scope, Quota, Theme, TH,
+  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -433,6 +433,36 @@ function ProjectSettlement({ projects, theme, onExport }:
   );
 }
 
+function ReliabilitySection({ stats, sinceMs, theme }:
+  { stats: ReliabilityStats; sinceMs: number; theme: Theme }) {
+  const t = theme;
+  const turns = stats.completedTurns + stats.abortedTurns;
+  const success = turns > 0 ? Math.round((stats.completedTurns / turns) * 100) : 0;
+  const since = sinceMs > 0
+    ? new Date(sinceMs).toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    : "this version";
+  const item = (label: string, value: string, sub: string) => (
+    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
+      <div style={{ font: `500 8.5px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".04em" }}>{label}</div>
+      <div style={{ marginTop: 3, font: `600 14px ${t.mono}`, color: t.text }}>{value}</div>
+      <div style={{ marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 8.5px ${t.mono}`, color: t.faint }}>{sub}</div>
+    </div>
+  );
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+        <Label t={t}>Reliability</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>tracked since {since}</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+        {item("Success", turns > 0 ? `${success}%` : "—", `${fmtInt(turns)} turns`)}
+        {item("Aborted", fmtInt(stats.abortedTurns), stats.wastedCost > 0 ? `${fmtMoney(stats.wastedCost)} wasted` : `${fmtTokens(stats.wastedTokens)} wasted`)}
+        {item("Tool issues", fmtInt(stats.toolErrors + stats.denials), `${fmtInt(stats.toolErrors)} errors · ${fmtInt(stats.denials)} denied`)}
+      </div>
+    </div>
+  );
+}
+
 // Codex rate-limit card: the two rolling windows (5h + weekly) straight from
 // the session logs — data Claude doesn't expose. Bars turn amber near the cap.
 function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
@@ -740,6 +770,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   const M = P.metrics;
   const models = P.models;
   const projects = P.projects ?? [];
+  const reliability = P.reliability ?? {
+    completedTurns: 0, abortedTurns: 0, toolErrors: 0, denials: 0,
+    wastedTokens: 0, wastedCost: 0,
+  };
   const [totalModel, setTotalModel] = useState("");
   // The All scope can contain the same model once per agent. The selector is
   // model-based, so combine those rows before calculating its Total and cost.
@@ -1021,6 +1055,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
             <ProjectSettlement projects={projects} theme={t} onExport={exportProjects} />
           </>
         )}
+        <SectionRule t={t} m="12px 0 10px" />
+        <ReliabilitySection stats={reliability} sinceMs={dash.telemetrySinceMs ?? 0} theme={t} />
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
