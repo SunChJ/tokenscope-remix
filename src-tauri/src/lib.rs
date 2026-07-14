@@ -770,6 +770,32 @@ fn save_screenshot(data_url: String) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Save a project settlement export to Desktop. The frontend supplies only a
+/// compact generated CSV; raw JSONL content never leaves the Rust data layer.
+#[tauri::command]
+fn save_project_export(csv: String, label: String) -> Result<String, String> {
+    if csv.len() > 5 * 1024 * 1024 {
+        return Err("export is too large".to_string());
+    }
+    let label: String = label
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_'))
+        .take(48)
+        .collect();
+    let dir = dirs::desktop_dir()
+        .ok_or_else(|| "could not resolve the Desktop directory".to_string())?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d at %H.%M.%S");
+    let name = if label.trim().is_empty() {
+        format!("Tokenscope Projects {stamp}.csv")
+    } else {
+        format!("Tokenscope {} {stamp}.csv", label.trim())
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, csv.as_bytes())
+        .map_err(|error| format!("failed to write export: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// For CLI/example validation against real logs.
 pub fn dashboard_json() -> String {
     serde_json::to_string_pretty(&parser::build_dashboard()).unwrap_or_default()
@@ -835,6 +861,7 @@ pub fn run() {
             get_dashboard,
             get_range_dashboard,
             save_screenshot,
+            save_project_export,
             begin_drag,
             set_dashboard_shortcut
         ])

@@ -27,6 +27,8 @@ struct Event {
     cost: f64,   // USD (differentiated by token type), 0 if unknown model
     priced: bool, // whether a price was found for this model
     agent: &'static str, // owning agent id (interned via agent_def)
+    project_id: String,
+    project_name: String,
     mcp: Vec<String>,   // user-installed server names called in this msg
     skills: Vec<String>, // user-installed skill names called in this msg
 }
@@ -126,7 +128,7 @@ pub fn build_dashboard() -> Dashboard {
         .events
         .iter()
         .filter(|raw| raw.ts_ms >= report_cutoff)
-        .map(|r| compute_event(r, &cfg, &pricing))
+        .map(|r| compute_event(r, store.project_for(r), &cfg, &pricing))
         .collect();
 
     let today = now.date_naive();
@@ -245,7 +247,7 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
             let date = timestamp.with_timezone(&Local).date_naive();
             date >= previous_start && date <= end
         })
-        .map(|raw| compute_event(raw, &cfg, &pricing))
+        .map(|raw| compute_event(raw, store.project_for(raw), &cfg, &pricing))
         .collect();
     let present: Vec<&AgentDef> = AGENTS
         .iter()
@@ -332,6 +334,8 @@ fn clone_event(e: &Event) -> Event {
         cost: e.cost,
         priced: e.priced,
         agent: e.agent,
+        project_id: e.project_id.clone(),
+        project_name: e.project_name.clone(),
         mcp: e.mcp.clone(),
         skills: e.skills.clone(),
     }
@@ -392,7 +396,12 @@ fn set_installed_counts(report: &mut PeriodReport, agent_scope: &str, cfg: &User
 /// Derive a computed Event from a stored RawEvent, applying the *current* user
 /// config (MCP/Skill whitelist) and prices. This is why these aren't baked into
 /// the store: installing an MCP or a price refresh applies retroactively.
-fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
+fn compute_event(
+    r: &RawEvent,
+    project: Option<&crate::store::ProjectRef>,
+    cfg: &UserConfig,
+    pricing: &Pricing,
+) -> Event {
     let ts = DateTime::from_timestamp_millis(r.ts_ms)
         .unwrap_or_default()
         .with_timezone(&Local);
@@ -423,6 +432,10 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
         cost: cost_opt.unwrap_or(0.0),
         priced: cost_opt.is_some(),
         agent: agent_def(&r.agent).id,
+        project_id: project.map(|project| project.id.clone()).unwrap_or_default(),
+        project_name: project
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "Other".to_string()),
         mcp,
         skills,
     }
@@ -443,8 +456,18 @@ struct Agg {
     model_cost: HashMap<String, f64>,
     model_priced: HashMap<String, bool>,
     model_agent: HashMap<String, &'static str>,
+    projects: HashMap<String, ProjectAgg>,
     mcp_counts: HashMap<String, u64>,
     skill_counts: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+struct ProjectAgg {
+    name: String,
+    tokens: f64,
+    cost: f64,
+    requests: u64,
+    sessions: HashSet<String>,
 }
 
 impl Agg {
@@ -467,6 +490,18 @@ impl Agg {
             // a model is "priced" if any of its messages had a known price
             *self.model_priced.entry(e.model.clone()).or_default() |= e.priced;
             self.model_agent.entry(e.model.clone()).or_insert(e.agent);
+        }
+        if !e.project_id.is_empty() {
+            let project = self.projects.entry(e.project_id.clone()).or_default();
+            project.name = e.project_name.clone();
+            project.tokens += e.input + e.cache + e.output;
+            project.cost += e.cost;
+            if !e.model.is_empty() {
+                project.requests += 1;
+            }
+            if !e.session.is_empty() {
+                project.sessions.insert(e.session.clone());
+            }
         }
         for s in &e.mcp {
             self.mcp_calls += 1;
@@ -512,6 +547,32 @@ impl Agg {
             .collect();
         v.sort_by(|a, b| b.count.cmp(&a.count));
         v
+    }
+
+    fn projects(&self) -> Vec<ProjectStat> {
+        let mut projects: Vec<ProjectStat> = self
+            .projects
+            .iter()
+            .map(|(id, project)| ProjectStat {
+                id: id.clone(),
+                name: project.name.clone(),
+                tokens: project.tokens / 1e6,
+                cost: (project.cost * 1_000_000.0).round() / 1_000_000.0,
+                requests: project.requests,
+                sessions: project.sessions.len() as u64,
+            })
+            .collect();
+        projects.sort_by(|a, b| {
+            b.cost
+                .partial_cmp(&a.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.tokens
+                        .partial_cmp(&a.tokens)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        projects
     }
 
     fn metrics(&self, delta_tokens: f64, delta_cost: f64) -> Metrics {
@@ -597,6 +658,7 @@ fn report_day(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Perio
         ),
         series,
         models: agg.models(palette),
+        projects: agg.projects(),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -665,6 +727,7 @@ fn report_week(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Peri
         ),
         series,
         models: agg.models(palette),
+        projects: agg.projects(),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -742,6 +805,7 @@ fn report_month(events: &[Event], now: DateTime<Local>, palette: &[&str]) -> Per
         ),
         series,
         models: agg.models(palette),
+        projects: agg.projects(),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -858,6 +922,7 @@ fn report_range(
         ),
         series,
         models: agg.models(palette),
+        projects: agg.projects(),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: request_buckets,
@@ -936,6 +1001,8 @@ mod tests {
             cost: tokens / 1e6,
             priced: true,
             agent: AGENT_CLAUDE,
+            project_id: "project-test".to_string(),
+            project_name: "Test project".to_string(),
             mcp: Vec::new(),
             skills: Vec::new(),
         }
@@ -959,6 +1026,10 @@ mod tests {
         assert_eq!(report.metrics.total_tokens, 3.0);
         assert_eq!(report.metrics.requests, 2);
         assert_eq!(report.metrics.delta_tokens, 200.0);
+        assert_eq!(report.projects.len(), 1);
+        assert_eq!(report.projects[0].name, "Test project");
+        assert_eq!(report.projects[0].tokens, 3.0);
+        assert_eq!(report.projects[0].requests, 2);
         assert_eq!(report.series.len(), 2);
         assert_eq!(report.series[0].input, 1.0);
         assert_eq!(report.series[1].input, 2.0);

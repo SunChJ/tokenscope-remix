@@ -29,6 +29,19 @@ pub struct NamedCount {
     pub count: u64,
 }
 
+/// Settlement summary for one local project/repository in the selected period.
+/// The stable id is a hash of the local project root; raw paths never cross the
+/// Tauri boundary.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectStat {
+    pub id: String,
+    pub name: String,
+    pub tokens: f64,
+    pub cost: f64,
+    pub requests: u64,
+    pub sessions: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
@@ -70,6 +83,7 @@ pub struct PeriodReport {
     pub metrics: Metrics,
     pub series: Vec<SeriesPoint>,
     pub models: Vec<ModelStat>,
+    pub projects: Vec<ProjectStat>,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]

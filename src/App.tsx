@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, Scope, Quota, Theme, TH,
+  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, ProjectStat, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -395,6 +395,44 @@ function AgentLegend({ t, slices, cachedPct }:
   );
 }
 
+function ProjectSettlement({ projects, theme, onExport }:
+  { projects: ProjectStat[]; theme: Theme; onExport: (projects: ProjectStat[]) => void }) {
+  const t = theme;
+  const [selected, setSelected] = useState("");
+  useEffect(() => {
+    if (selected && !projects.some((project) => project.id === selected)) setSelected("");
+  }, [projects, selected]);
+  const rows = selected ? projects.filter((project) => project.id === selected) : projects;
+  return (
+    <div>
+      <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+        <Label t={t}>Project settlement</Label>
+        <select aria-label="Project settlement filter" value={selected} onChange={(event) => setSelected(event.target.value)} style={{
+          flex: 1, minWidth: 0, height: 23, borderRadius: 6, outline: "none",
+          border: `1px solid ${t.gridLine}`, background: t.gridLine, color: t.text,
+          padding: "1px 5px", font: `500 9.5px ${t.ui}`, cursor: "pointer",
+        }}>
+          <option value="">All projects</option>
+          {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+        </select>
+        <button type="button" onClick={() => onExport(rows)} title="Export project settlement as CSV" style={{
+          height: 23, borderRadius: 6, padding: "0 7px", cursor: "pointer",
+          border: `1px solid ${t.segBorder}`, background: t.segBg, color: t.dim,
+          font: `600 9px ${t.ui}`,
+        }}>CSV</button>
+      </div>
+      {rows.map((project) => (
+        <div key={project.id} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "2px 10px", padding: "4px 0" }}>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 10.5px ${t.ui}`, color: t.text }}>{project.name}</span>
+          <span style={{ font: `600 10.5px ${t.mono}`, color: t.accent }}>{fmtMoney(project.cost)}</span>
+          <span style={{ font: `500 9px ${t.mono}`, color: t.faint }}>{fmtInt(project.requests)} requests · {fmtInt(project.sessions)} sessions</span>
+          <span style={{ font: `500 9px ${t.mono}`, color: t.dim }}>{fmtTokens(project.tokens)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Codex rate-limit card: the two rolling windows (5h + weekly) straight from
 // the session logs — data Claude doesn't expose. Bars turn amber near the cap.
 function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
@@ -701,6 +739,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   const viewKey = activeRange ? `${activeRange.startDate}:${activeRange.endDate}` : period;
   const M = P.metrics;
   const models = P.models;
+  const projects = P.projects ?? [];
   const [totalModel, setTotalModel] = useState("");
   // The All scope can contain the same model once per agent. The selector is
   // model-based, so combine those rows before calculating its Total and cost.
@@ -754,6 +793,36 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     setToast({ msg, ok });
     toastTimer.current = window.setTimeout(() => setToast(null), 1800);
+  };
+  const exportProjects = async (rows: ProjectStat[]) => {
+    if (!rows.length) { showToast("No project usage to export", false); return; }
+    const csvCell = (value: string | number) => `"${String(value).replace(/"/g, '""')}"`;
+    const periodLabel = activeRange ? formatRange(activeRange) : period;
+    const csv = "\uFEFF" + [
+      ["Scope", "Period", "Project", "Tokens", "Estimated cost USD", "Requests", "Sessions"],
+      ...rows.map((project) => [
+        scope.label, periodLabel, project.name, Math.round(project.tokens * 1_000_000),
+        project.cost.toFixed(6), project.requests, project.sessions,
+      ]),
+    ].map((row) => row.map(csvCell).join(",")).join("\r\n");
+    const label = `${scope.label} ${activeRange ? `${activeRange.startDate} to ${activeRange.endDate}` : period}`;
+    try {
+      const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+      if (inTauri) {
+        await invoke<string>("save_project_export", { csv, label });
+        showToast("Project CSV saved to Desktop", true);
+      } else {
+        const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = "tokenscope-projects.csv";
+        anchor.click();
+        URL.revokeObjectURL(url);
+        showToast("Project CSV downloaded", true);
+      }
+    } catch {
+      showToast("Project export failed", false);
+    }
   };
   const captureScreenshot = async () => {
     if (shotBusy) return;
@@ -945,6 +1014,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
             {unpricedModels.length} model{unpricedModels.length > 1 ? "s" : ""} without pricing data (cost not counted):{" "}
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
+        )}
+        {projects.length > 0 && (
+          <>
+            <SectionRule t={t} m="12px 0 10px" />
+            <ProjectSettlement projects={projects} theme={t} onExport={exportProjects} />
+          </>
         )}
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}

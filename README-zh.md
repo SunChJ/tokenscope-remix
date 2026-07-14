@@ -22,6 +22,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 - 点击打开面板：Day / Week / Month 切换，以及按起止日期（含首尾日）的自定义区间筛选
 - **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿）；只装一个 Agent 则界面与经典版完全一致
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
+- 项目结算：按本地 Git 仓库 / 工作目录归集用量，可将当前时间段导出为 CSV，不暴露原始路径或对话正文
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
 - **Codex 配额卡**：直接从 Codex 自己的日志读取 5 小时窗口与周窗口的已用百分比、plan、重置倒计时
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图

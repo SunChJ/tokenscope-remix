@@ -17,11 +17,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub const AGENT_CLAUDE: &str = "claude";
 pub const AGENT_CODEX: &str = "codex";
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProjectRef {
+    pub id: String,
+    pub name: String,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RawEvent {
@@ -90,6 +96,7 @@ pub struct Store {
     // Latest general and model-specific Codex rate-limit snapshots.
     pub codex_quota: Option<Quota>,
     pub codex_spark_quota: Option<Quota>,
+    projects_by_source: HashMap<String, ProjectRef>,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -105,6 +112,7 @@ pub struct Store {
 //   v8: retain complete history for custom-range tracking and settlement.
 const STORE_VERSION: u32 = 8;
 const QUOTA_CACHE_VERSION: u32 = 1;
+const PROJECT_CACHE_VERSION: u32 = 1;
 // One-time quota migration: at most 32 × 64 KiB = 2 MiB of log content.
 const RECENT_QUOTA_FILES: usize = 32;
 const QUOTA_TAIL_BYTES: u64 = 64 * 1024;
@@ -149,6 +157,74 @@ fn cache_dir() -> Option<PathBuf> {
     Some(d)
 }
 
+fn project_group(source: &str, agent: &str, state: Option<&FileState>) -> String {
+    if agent == AGENT_CLAUDE {
+        return Path::new(source)
+            .parent()
+            .unwrap_or_else(|| Path::new(source))
+            .to_string_lossy()
+            .to_string();
+    }
+    state
+        .filter(|state| !state.cwd.is_empty())
+        .map(|state| state.cwd.clone())
+        .unwrap_or_else(|| source.to_string())
+}
+
+fn read_cwd_prefix(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(64 * 1024);
+    file.take(64 * 1024).read_to_end(&mut bytes).ok()?;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        let cwd = value
+            .get("cwd")
+            .or_else(|| value.get("payload").and_then(|payload| payload.get("cwd")))
+            .and_then(|cwd| cwd.as_str());
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+            return Some(cwd.to_string());
+        }
+    }
+    None
+}
+
+fn project_root(cwd: &str) -> PathBuf {
+    let path = PathBuf::from(cwd);
+    for ancestor in path.ancestors() {
+        if ancestor.join(".git").exists() {
+            return ancestor.to_path_buf();
+        }
+    }
+    path
+}
+
+fn stable_project_id(key: &str) -> String {
+    // FNV-1a: tiny, deterministic across platforms and Rust releases.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("project-{hash:016x}")
+}
+
+fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
+    let root = cwd.map(project_root).unwrap_or_else(|| PathBuf::from(fallback));
+    let key = root.to_string_lossy();
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Other")
+        .to_string();
+    ProjectRef {
+        id: stable_project_id(&key),
+        name,
+    }
+}
+
 impl Store {
     /// Load persisted events + offset manifest (empty on first run).
     pub fn load() -> Self {
@@ -156,6 +232,7 @@ impl Store {
         let mut manifest = Manifest::default();
         let mut codex_quota = None;
         let mut codex_spark_quota = None;
+        let mut projects_by_source = HashMap::new();
         let mut version_ok = false;
         let mut quota_cache_ok = false;
         if let Some(dir) = cache_dir() {
@@ -196,6 +273,16 @@ impl Store {
                             .ok()
                             .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
                 }
+                let project_cache_ok = fs::read_to_string(dir.join("project_version"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                    == Some(PROJECT_CACHE_VERSION);
+                if project_cache_ok {
+                    projects_by_source = fs::read_to_string(dir.join("projects.json"))
+                        .ok()
+                        .and_then(|text| serde_json::from_str(&text).ok())
+                        .unwrap_or_default();
+                }
             }
         }
         let index = events
@@ -210,11 +297,17 @@ impl Store {
             manifest,
             codex_quota,
             codex_spark_quota,
+            projects_by_source,
         };
         if version_ok && !quota_cache_ok {
             store.rebuild_codex_quotas();
             if let Some(dir) = cache_dir() {
                 store.save_quota_cache(&dir);
+            }
+        }
+        if version_ok && store.refresh_projects() {
+            if let Some(dir) = cache_dir() {
+                store.save_project_cache(&dir);
             }
         }
         store
@@ -234,8 +327,19 @@ impl Store {
                 let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
             }
             self.save_quota_cache(&dir);
+            self.save_project_cache(&dir);
             let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
         }
+    }
+
+    fn save_project_cache(&self, dir: &Path) {
+        if let Ok(text) = serde_json::to_string(&self.projects_by_source) {
+            let _ = write_atomic(&dir.join("projects.json"), text.as_bytes());
+        }
+        let _ = write_atomic(
+            &dir.join("project_version"),
+            PROJECT_CACHE_VERSION.to_string().as_bytes(),
+        );
     }
 
     fn save_quota_cache(&self, dir: &std::path::Path) {
@@ -334,6 +438,55 @@ impl Store {
         dirs
     }
 
+    pub fn project_for(&self, event: &RawEvent) -> Option<&ProjectRef> {
+        self.projects_by_source.get(&event.source)
+    }
+
+    /// Resolve each source file to a stable project id and short display name.
+    /// Existing Codex manifests already retain cwd. For old Claude caches, read
+    /// at most one 64 KiB prefix per project directory, then persist the mapping
+    /// so subsequent launches do no project-discovery IO.
+    fn refresh_projects(&mut self) -> bool {
+        let sources: HashMap<String, String> = self
+            .events
+            .iter()
+            .filter(|event| !event.source.is_empty())
+            .map(|event| (event.source.clone(), event.agent.clone()))
+            .collect();
+        let mut resolved_groups: HashMap<String, ProjectRef> = HashMap::new();
+
+        for (source, agent) in &sources {
+            if let Some(project) = self.projects_by_source.get(source) {
+                resolved_groups
+                    .entry(project_group(source, agent, self.manifest.files.get(source)))
+                    .or_insert_with(|| project.clone());
+            }
+        }
+
+        let mut dirty = false;
+        for (source, agent) in sources {
+            if self.projects_by_source.contains_key(&source) {
+                continue;
+            }
+            let state = self.manifest.files.get(&source);
+            let group = project_group(&source, &agent, state);
+            let project = if let Some(project) = resolved_groups.get(&group) {
+                project.clone()
+            } else {
+                let cwd = state
+                    .filter(|state| !state.cwd.is_empty())
+                    .map(|state| state.cwd.clone())
+                    .or_else(|| read_cwd_prefix(Path::new(&source)));
+                let project = project_ref(cwd.as_deref(), &group);
+                resolved_groups.insert(group, project.clone());
+                project
+            };
+            self.projects_by_source.insert(source, project);
+            dirty = true;
+        }
+        dirty
+    }
+
     /// Rebuild the id→index map after the `events` vector is mutated wholesale
     /// (purge/prune shift positions, so partial updates aren't enough).
     fn rebuild_index(&mut self) {
@@ -365,6 +518,9 @@ impl Store {
             if self.ingest_root(agent, &root) {
                 dirty = true;
             }
+        }
+        if self.refresh_projects() {
+            dirty = true;
         }
         dirty
     }
@@ -923,6 +1079,7 @@ mod tests {
             manifest: Manifest::default(),
             codex_quota: None,
             codex_spark_quota: None,
+            projects_by_source: HashMap::new(),
         }
     }
 

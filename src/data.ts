@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number }
 export interface ModelStat { name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean; agent: string }
 export interface NamedCount { name: string; count: number }
+export interface ProjectStat { id: string; name: string; tokens: number; cost: number; requests: number; sessions: number }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
@@ -12,7 +13,7 @@ export interface Metrics {
 // split bar, `values` (aligned with series) drives the stacked chart.
 export interface AgentSlice { id: string; label: string; color: string; tokens: number; values: number[] }
 export interface PeriodReport {
-  metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
+  metrics: Metrics; series: SeriesPoint[]; models: ModelStat[]; projects: ProjectStat[];
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
   agents: AgentSlice[];
 }
