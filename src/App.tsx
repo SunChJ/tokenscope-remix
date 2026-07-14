@@ -1169,6 +1169,14 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
         )}
+        {/* Codex quota — rate-limit windows read straight from the session logs */}
+        {scope.quota && (
+          <>
+            <SectionRule t={t} />
+            <div style={{ marginBottom: 4 }}><Label t={t}>{text.codexQuota}</Label></div>
+            <QuotaCard q={scope.quota} trend={scope.quotaTrend ?? []} theme={t} />
+          </>
+        )}
         {projects.length > 0 && (
           <>
             <SectionRule t={t} m="12px 0 10px" />
@@ -1189,14 +1197,6 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
             <Sparkline values={P.costTrend.length ? P.costTrend : [0, 0]} theme={t} width={52} height={20} accent={t.accent} />
           </MiniStat>
         </div>
-        {/* Codex quota — rate-limit windows read straight from the session logs */}
-        {scope.quota && (
-          <>
-            <SectionRule t={t} />
-            <div style={{ marginBottom: 4 }}><Label t={t}>{text.codexQuota}</Label></div>
-            <QuotaCard q={scope.quota} trend={scope.quotaTrend ?? []} theme={t} />
-          </>
-        )}
         {/* MCP — shown whenever the user has installed MCP servers */}
         {M.servers > 0 && (
           <>
