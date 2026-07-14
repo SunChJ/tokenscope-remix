@@ -79,7 +79,7 @@ trait UsageSource {
 | `session_meta` | 会话元信息 | `session_id`、`cwd`、`cli_version`、`model_provider`、`source.subagent`（子代理标记）、`parent_thread_id` |
 | `turn_context` | 回合上下文 | `turn_id`、`model`（如 `gpt-5.5`）、`cwd`、`reasoning_effort` |
 | `event_msg / token_count` | **Token 用量** | `info.last_token_usage`（本回合增量）与 `info.total_token_usage`（会话累计）：`input_tokens` / `cached_input_tokens` / `output_tokens` / `reasoning_output_tokens` |
-| `event_msg / token_count` | **配额** | `rate_limits.primary`（5h 窗口 used_percent / resets_at）、`rate_limits.secondary`（周窗口）、`plan_type` |
+| `event_msg / token_count` | **配额** | `rate_limits.primary` / `rate_limits.secondary` 的有效窗口与 `plan_type`；历史记录可能仍含已停用的 5h 窗口 |
 | `response_item / function_call` | 工具调用 | MCP / 自定义工具调用统计 |
 
 **解析要点**：
@@ -160,13 +160,12 @@ Gemini CLI、Cursor CLI、OpenCode、Copilot CLI……只要实现 UsageSource �
 
 ```
 ┌ CODEX QUOTA ────────────────────────────┐
-│ 5h window    ████████░░░░░░  62%        │
 │ Weekly       ███░░░░░░░░░░░  23%        │
-│ Plan: Pro          resets in 2h 14m     │
+│ Plan: Pro              resets in 5d     │
 └─────────────────────────────────────────┘
 ```
 
-  取**最新一条** `token_count.rate_limits`；数据超过 1 小时未更新时置灰并标注「as of HH:MM」。≥80% 时进度条转警示色，可选系统通知（后期）。
+  取**最新一条** `token_count.rate_limits`；展示有效窗口，隐藏官方已停用的 5h 窗口及缺失字段形成的空窗口。数据超过 1 小时未更新时置灰并标注「as of HH:MM」。≥80% 时进度条转警示色，可选系统通知（后期）。
 - Codex 视图中 output 条内再细分 **reasoning tokens**（浅色纹理段），hover 显示占比。
 
 ### 3.5 各区块在不同过滤态下的行为

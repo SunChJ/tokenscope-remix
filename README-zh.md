@@ -24,11 +24,10 @@ brew install --cask sunchj/tokenscope/tokenscope
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 项目结算：按本地 Git 仓库 / 工作目录归集用量，可将当前时间段导出为 CSV，不暴露原始路径或对话正文
 - 可靠性遥测：统计完成/中止 Turn、工具错误/拒绝，以及中止任务消耗的 Token 与估算成本；从本版本开始增量采集
-- 响应性能：展示 Turn 耗时中位数、P95，以及 Codex 首 Token 时间；复用同一条增量 telemetry 数据流
 - Context 健康度：上下文窗口中位/峰值压力、≥80% 提醒、压缩次数与 Codex reasoning Token 占比
 - 周额度趋势：对 Codex 快照下采样，展示当前重置周期的每日消耗速度与预计触顶时间
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
-- **Codex 配额卡**：直接从 Codex 自己的日志读取 5 小时窗口与周窗口的已用百分比、plan、重置倒计时
+- **Codex 配额卡**：直接从 Codex 自己的日志读取当前周额度的已用百分比、plan 与重置倒计时
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
 - **只统计用户自己安装的 MCP / Skill**，过滤所有内置工具与自带 MCP
 

@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, PerformanceStats, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
+  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -142,13 +142,16 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
 
 // ── In-app updates ──────────────────────────────────────────────
 // Poll the GitHub release feed (plugin-updater endpoint) on launch and every
-// hour; keep version and update actions below the Tokenscope brand. Download
+// hour; keep actionable update states below the Tokenscope brand. Download
 // and install happen in-app, then a relaunch finishes the update. A dismissed
 // version stays hidden until the next version appears (localStorage).
+type UpdateFeedbackState = {
+  phase: "checking" | "current" | "check-failed";
+  manual: boolean;
+};
+
 type UpdateState =
-  | { phase: "checking" }
-  | { phase: "current" }
-  | { phase: "check-failed" }
+  | UpdateFeedbackState
   | { phase: "skipped"; version: string }
   | { phase: "available"; update: Update }
   | { phase: "downloading"; version: string; pct: number }
@@ -158,8 +161,8 @@ type UpdateState =
 function useUpdater(): [UpdateState, () => void, () => void] {
   const [st, setSt] = useState<UpdateState>(() =>
     typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
-      ? { phase: "checking" }
-      : { phase: "current" }
+      ? { phase: "checking", manual: false }
+      : { phase: "current", manual: false }
   );
   const updRef = useRef<Update | null>(null);
   useEffect(() => {
@@ -168,16 +171,30 @@ function useUpdater(): [UpdateState, () => void, () => void] {
     let dead = false;
     let checking = false;
     let unlisten: (() => void) | null = null;
+    let feedbackTimer = 0;
+    const settle = (phase: "current" | "check-failed", manual: boolean) => {
+      const next: UpdateFeedbackState = { phase, manual };
+      setSt(next);
+      window.clearTimeout(feedbackTimer);
+      if (manual) {
+        feedbackTimer = window.setTimeout(() => {
+          if (!dead) setSt((current) => current === next ? { ...next, manual: false } : current);
+        }, 2500);
+      }
+    };
     const probe = async (manual = false) => {
       if (checking) return;
       checking = true;
-      if (manual) setSt({ phase: "checking" });
+      if (manual) {
+        window.clearTimeout(feedbackTimer);
+        setSt({ phase: "checking", manual: true });
+      }
       try {
         const u = await checkUpdate();
         if (dead) return;
         if (!u) {
           updRef.current = null;
-          setSt({ phase: "current" });
+          settle("current", manual);
           return;
         }
         const skipped = localStorage.getItem("tokenscope-skip-update") === u.version;
@@ -192,7 +209,7 @@ function useUpdater(): [UpdateState, () => void, () => void] {
       } catch {
         // Offline / rate-limited / no latest.json: no automatic immediate
         // retry; wait for the next hourly check or an explicit tray-menu check.
-        if (!dead) setSt({ phase: "check-failed" });
+        if (!dead) settle("check-failed", manual);
       } finally {
         checking = false;
       }
@@ -206,6 +223,7 @@ function useUpdater(): [UpdateState, () => void, () => void] {
     return () => {
       dead = true;
       window.clearInterval(t);
+      window.clearTimeout(feedbackTimer);
       unlisten?.();
     };
   }, []);
@@ -230,14 +248,14 @@ function useUpdater(): [UpdateState, () => void, () => void] {
   const dismiss = () => {
     const u = updRef.current;
     if (u) try { localStorage.setItem("tokenscope-skip-update", u.version); } catch {}
-    setSt(u ? { phase: "skipped", version: u.version } : { phase: "current" });
+    setSt(u ? { phase: "skipped", version: u.version } : { phase: "current", manual: false });
   };
   return [st, install, dismiss];
 }
 
 type UpdaterController = ReturnType<typeof useUpdater>;
 
-function VersionUpdate({ st, theme, onInstall, onDismiss }:
+function UpdateNotice({ st, theme, onInstall, onDismiss }:
   { st: UpdateState; theme: Theme; onInstall: () => void; onDismiss: () => void }) {
   const t = theme;
   const { text } = useI18n();
@@ -249,29 +267,26 @@ function VersionUpdate({ st, theme, onInstall, onDismiss }:
   );
   let status: React.ReactNode;
   let title: string | undefined;
-  if (st.phase === "checking") status = text.checking;
-  else if (st.phase === "current") status = text.latest;
-  else if (st.phase === "check-failed") status = text.checkFailed;
-  else if (st.phase === "skipped") {
-    status = text.skipped;
-    title = `${text.update} v${st.version} ${text.updateSkipped}`;
-  } else if (st.phase === "available") {
-    status = <><Action label={text.update} title={`${text.updateTo} v${st.update.version}`} onClick={onInstall} />
+  if (st.phase === "checking" && st.manual) status = text.checking;
+  else if (st.phase === "current" && st.manual) status = text.latest;
+  else if (st.phase === "check-failed" && st.manual) status = <span style={{ color: "#e0795f" }}>{text.checkFailed}</span>;
+  else if (st.phase === "available") {
+    status = <><Action label={`${text.update} v${st.update.version}`} title={`${text.updateTo} v${st.update.version}`} onClick={onInstall} />
       <Action label="×" title={text.skipVersion} onClick={onDismiss} /></>;
     title = [`v${st.update.version} ${text.available}`, st.update.body].filter(Boolean).join("\n\n");
-  } else if (st.phase === "downloading") status = `${st.pct}%`;
+  } else if (st.phase === "downloading") status = `v${st.version} · ${st.pct}%`;
   else if (st.phase === "ready") {
     status = <Action label={text.restart} title={`${text.restartInto} v${st.version}`} onClick={() => relaunch().catch(() => {})} />;
-  } else {
+  } else if (st.phase === "install-failed") {
     status = <><span style={{ color: "#e0795f" }}>{text.failed}</span>
       <Action label="×" title={text.dismiss} onClick={onDismiss} /></>;
-  }
+  } else return null;
   return (
     <div data-no-drag="" title={title} style={{
-      display: "flex", alignItems: "center", gap: 4, maxWidth: 94, overflow: "hidden",
+      display: "flex", alignItems: "center", gap: 5, maxWidth: 106, overflow: "hidden",
       font: `500 8.5px/1.2 ${t.mono}`, color: t.faint, whiteSpace: "nowrap",
     }}>
-      <span>v{appPackage.version}</span><span>·</span>{status}
+      {status}
     </div>
   );
 }
@@ -490,73 +505,35 @@ function ReliabilitySection({ stats, sinceMs, theme }:
   );
 }
 
-function formatDuration(ms: number) {
-  if (ms <= 0) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return minutes < 60 ? `${minutes}m ${seconds}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-}
-
-function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: Theme }) {
-  const t = theme;
-  const { text } = useI18n();
-  const item = (label: string, value: string, sub: string) => (
-    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
-      <div style={{ font: `500 8.5px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".04em" }}>{label}</div>
-      <div style={{ marginTop: 3, font: `600 14px ${t.mono}`, color: t.text }}>{value}</div>
-      <div style={{ marginTop: 2, font: `500 8.5px ${t.mono}`, color: t.faint }}>{sub}</div>
-    </div>
-  );
-  return (
-    <div>
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
-        <Label t={t}>{text.responsePerformance}</Label>
-        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} {text.timedTurns}</span>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
-        {item(text.median, formatDuration(stats.medianDurationMs), text.turnDuration)}
-        {item(text.p95, formatDuration(stats.p95DurationMs), text.slowTail)}
-        {item(text.firstToken, formatDuration(stats.medianTtftMs), stats.p95TtftMs > 0 ? `P95 ${formatDuration(stats.p95TtftMs)}` : text.codexOnly)}
-      </div>
-    </div>
-  );
-}
-
 function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme }) {
   const t = theme;
   const { text } = useI18n();
-  const [open, setOpen] = useState(false);
-  const item = (key: string, label: string, value: string, sub: string, warn = false) => (
-    <div key={key} style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
+  const item = (label: string, value: string, sub: string, warn = false) => (
+    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
       <div style={{ font: `500 8px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".03em" }}>{label}</div>
       <div style={{ marginTop: 3, font: `600 13px ${t.mono}`, color: warn ? "#e0795f" : t.text }}>{value}</div>
       <div style={{ marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 8px ${t.mono}`, color: t.faint }}>{sub}</div>
     </div>
   );
-  const items = [
-    item("median", text.median, stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", text.context),
-    item("peak", text.peak, stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80),
-    item("compacted", text.compacted, fmtInt(stats.compactions), text.times),
-    item("reasoning", text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.codexOnly),
-  ];
   return (
     <div>
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
         <Label t={t}>{text.contextHealth}</Label>
         <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} {text.measuredTurns}</span>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: `repeat(${open ? 4 : 3}, 1fr)`, gap: 5 }}>
-        {items.slice(0, open ? items.length : 3)}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 5 }}>
+        {item(text.median, stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", text.context)}
+        {item(text.peak, stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80)}
+        {item(text.compacted, fmtInt(stats.compactions), text.times)}
+        {item(text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.codexOnly)}
       </div>
-      <ListToggle expanded={open} total={items.length} theme={t} onToggle={() => setOpen((value) => !value)} />
     </div>
   );
 }
 
-// Codex rate-limit card: the two rolling windows (5h + weekly) straight from
-// the session logs — data Claude doesn't expose. Bars turn amber near the cap.
+// Codex rate-limit card straight from the session logs. Keep collecting every
+// window for compatibility, but do not render the retired 5h limit or empty
+// windows omitted by newer Codex clients. Bars turn amber near the cap.
 function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; theme: Theme }) {
   const t = theme;
   const { locale, text } = useI18n();
@@ -580,6 +557,10 @@ function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; th
   const horizon = hoursToCap > 0
     ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h ${text.toCap}` : `${(hoursToCap / 24).toFixed(1)}d ${text.toCap}`
     : text.stable;
+  const windows = [
+    { id: "primary", minutes: q.primaryMinutes, pct: q.primaryPct, resetsAt: q.primaryResetsAt },
+    { id: "secondary", minutes: q.secondaryMinutes, pct: q.secondaryPct, resetsAt: q.secondaryResetsAt },
+  ].filter((window) => window.minutes > 0 && window.minutes !== 5 * 60);
   const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
     const p = Math.max(0, Math.min(100, pctUsed));
     const col = p >= 80 ? "#e0795f" : t.accent;
@@ -596,8 +577,9 @@ function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; th
   };
   return (
     <div style={{ opacity: stale ? 0.65 : 1 }}>
-      <Bar label={winLabel(q.primaryMinutes)} pctUsed={q.primaryPct} sub={resetsIn(q.primaryResetsAt)} />
-      <Bar label={winLabel(q.secondaryMinutes)} pctUsed={q.secondaryPct} sub={resetsIn(q.secondaryResetsAt)} />
+      {windows.map((window) => (
+        <Bar key={window.id} label={winLabel(window.minutes)} pctUsed={window.pct} sub={resetsIn(window.resetsAt)} />
+      ))}
       <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
         <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
         <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
@@ -676,10 +658,11 @@ function LanguageToggle({ locale, theme, onToggle }:
   const { text } = useI18n();
   return (
     <button type="button" data-no-drag="" onClick={onToggle} title={text.switchLanguage} aria-label={text.switchLanguage} style={{
-      border: 0, background: "none", color: theme.faint, padding: 0, cursor: "pointer",
-      font: `600 8.5px ${theme.mono}`, lineHeight: 1.2,
-    }} onMouseEnter={(event) => (event.currentTarget.style.color = theme.dim)}
-      onMouseLeave={(event) => (event.currentTarget.style.color = theme.faint)}>
+      display: "inline-flex", alignItems: "center", justifyContent: "center",
+      minWidth: 22, height: 15, borderRadius: 4, padding: "0 4px", cursor: "default",
+      border: `1px solid ${theme.segBorder}`, background: theme.segBg, color: theme.dim,
+      font: `600 8px ${theme.mono}`, lineHeight: 1,
+    }}>
       {locale === "en" ? "EN" : "CN"}
     </button>
   );
@@ -899,9 +882,6 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
     completedTurns: 0, abortedTurns: 0, toolErrors: 0, denials: 0,
     wastedTokens: 0, wastedCost: 0,
   };
-  const performance = P.performance ?? {
-    trackedTurns: 0, medianDurationMs: 0, p95DurationMs: 0, medianTtftMs: 0, p95TtftMs: 0,
-  };
   const context = P.context ?? {
     trackedTurns: 0, medianPct: 0, peakPct: 0, nearLimitTurns: 0,
     compactions: 0, reasoningTokens: 0, reasoningPct: 0,
@@ -1081,9 +1061,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
               <TokenGlyph color={t.accent} size={16} />
               <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-              <VersionUpdate st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
-              <LanguageToggle locale={locale} theme={t} onToggle={onToggleLanguage} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginLeft: 24 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ font: `500 8.5px/1.2 ${t.mono}`, color: t.faint }}>v{appPackage.version}</span>
+                <LanguageToggle locale={locale} theme={t} onToggle={onToggleLanguage} />
+              </div>
+              <UpdateNotice st={updSt} theme={t} onInstall={updInstall} onDismiss={updDismiss} />
             </div>
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
@@ -1195,9 +1178,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
         <SectionRule t={t} m="12px 0 10px" />
         <ReliabilitySection stats={reliability} sinceMs={dash.telemetrySinceMs ?? 0} theme={t} />
         <SectionRule t={t} m="12px 0 10px" />
-        <PerformanceSection stats={performance} theme={t} />
-        <SectionRule t={t} m="12px 0 10px" />
-        <ContextSection key={`${viewKey}:${scope.id}:context`} stats={context} theme={t} />
+        <ContextSection stats={context} theme={t} />
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
