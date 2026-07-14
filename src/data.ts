@@ -12,6 +12,11 @@ export interface PerformanceStats {
   trackedTurns: number; medianDurationMs: number; p95DurationMs: number;
   medianTtftMs: number; p95TtftMs: number;
 }
+export interface ContextStats {
+  trackedTurns: number; medianPct: number; peakPct: number; nearLimitTurns: number;
+  compactions: number; reasoningTokens: number; reasoningPct: number;
+}
+export interface QuotaTrendPoint { tsMs: number; usedPct: number }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
@@ -22,7 +27,7 @@ export interface Metrics {
 export interface AgentSlice { id: string; label: string; color: string; tokens: number; values: number[] }
 export interface PeriodReport {
   metrics: Metrics; series: SeriesPoint[]; models: ModelStat[]; projects: ProjectStat[];
-  reliability: ReliabilityStats; performance: PerformanceStats;
+  reliability: ReliabilityStats; performance: PerformanceStats; context: ContextStats;
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
   agents: AgentSlice[];
 }
@@ -41,6 +46,7 @@ export interface Scope {
   id: string; label: string; color: string;
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
   heatmap: HeatDay[]; quota: Quota | null; sparkQuota?: Quota | null;
+  quotaTrend?: QuotaTrendPoint[]; sparkQuotaTrend?: QuotaTrendPoint[];
 }
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string; telemetrySinceMs?: number;

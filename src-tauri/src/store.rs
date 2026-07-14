@@ -57,10 +57,20 @@ pub struct TurnTelemetry {
     usage_ids: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct QuotaHistoryPoint {
+    pub ts_ms: i64,
+    pub limit_id: String,
+    pub used_pct: f64,
+    pub resets_at: i64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct TelemetryCache {
     since_ms: i64,
     turns: Vec<TurnTelemetry>,
+    #[serde(default)]
+    quota_history: Vec<QuotaHistoryPoint>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -136,6 +146,7 @@ pub struct Store {
     projects_by_source: HashMap<String, ProjectRef>,
     pub telemetry_since_ms: i64,
     pub turns: Vec<TurnTelemetry>,
+    pub quota_history: Vec<QuotaHistoryPoint>,
     telemetry_index: HashMap<String, usize>,
 }
 
@@ -280,6 +291,7 @@ impl Store {
         let mut projects_by_source = HashMap::new();
         let mut telemetry_since_ms = chrono::Utc::now().timestamp_millis();
         let mut turns = Vec::new();
+        let mut quota_history = Vec::new();
         let mut version_ok = false;
         let mut quota_cache_ok = false;
         let mut telemetry_cache_ok = false;
@@ -342,6 +354,7 @@ impl Store {
                     {
                         telemetry_since_ms = cache.since_ms;
                         turns = cache.turns;
+                        quota_history = cache.quota_history;
                         telemetry_cache_ok = true;
                     }
                 }
@@ -367,6 +380,7 @@ impl Store {
             projects_by_source,
             telemetry_since_ms,
             turns,
+            quota_history,
             telemetry_index,
         };
         if version_ok && !quota_cache_ok {
@@ -412,6 +426,7 @@ impl Store {
         let cache = TelemetryCache {
             since_ms: self.telemetry_since_ms,
             turns: self.turns.clone(),
+            quota_history: self.quota_history.clone(),
         };
         if let Ok(text) = serde_json::to_string(&cache) {
             let _ = write_atomic(&dir.join("telemetry.json"), text.as_bytes());
@@ -1084,12 +1099,17 @@ impl Store {
     /// Keep the newest rate-limit snapshot (files are walked in arbitrary order,
     /// so compare timestamps rather than trusting encounter order).
     fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64) {
-        let slot = match rl.get("limit_id").and_then(|value| value.as_str()) {
-            None | Some("codex") => &mut self.codex_quota,
-            Some("codex_bengalfox") => &mut self.codex_spark_quota,
+        let limit_id = match rl.get("limit_id").and_then(|value| value.as_str()) {
+            None | Some("codex") => "codex",
+            Some("codex_bengalfox") => "codex_bengalfox",
             _ => return,
         };
-        if slot.as_ref().map(|q| q.as_of_ms >= ts_ms).unwrap_or(false) {
+        let previous = if limit_id == "codex" {
+            self.codex_quota.as_ref()
+        } else {
+            self.codex_spark_quota.as_ref()
+        };
+        if previous.map(|quota| quota.as_of_ms >= ts_ms).unwrap_or(false) {
             return;
         }
         let win = |k: &str| rl.get(k);
@@ -1101,7 +1121,7 @@ impl Store {
         if p.is_none() && s.is_none() {
             return;
         }
-        *slot = Some(Quota {
+        let quota = Quota {
             plan: rl
                 .get("plan_type")
                 .and_then(|x| x.as_str())
@@ -1114,7 +1134,51 @@ impl Store {
             secondary_minutes: num(s, "window_minutes") as u64,
             secondary_resets_at: num(s, "resets_at") as i64,
             as_of_ms: ts_ms,
+        };
+        self.record_quota_history(limit_id, &quota);
+        if limit_id == "codex" {
+            self.codex_quota = Some(quota);
+        } else {
+            self.codex_spark_quota = Some(quota);
+        }
+    }
+
+    fn record_quota_history(&mut self, limit_id: &str, quota: &Quota) {
+        let weekly = if quota.primary_minutes == 7 * 24 * 60 {
+            Some((quota.primary_pct, quota.primary_resets_at))
+        } else if quota.secondary_minutes == 7 * 24 * 60 {
+            Some((quota.secondary_pct, quota.secondary_resets_at))
+        } else {
+            None
+        };
+        let Some((used_pct, resets_at)) = weekly else {
+            return;
+        };
+        let last = self
+            .quota_history
+            .iter()
+            .rev()
+            .find(|point| point.limit_id == limit_id);
+        if let Some(last) = last {
+            if quota.as_of_ms <= last.ts_ms {
+                return;
+            }
+            let same_value = (used_pct - last.used_pct).abs() < 0.1;
+            let recent = quota.as_of_ms - last.ts_ms < 15 * 60 * 1000;
+            if resets_at == last.resets_at && same_value && recent {
+                return;
+            }
+        }
+        self.quota_history.push(QuotaHistoryPoint {
+            ts_ms: quota.as_of_ms,
+            limit_id: limit_id.to_string(),
+            used_pct,
+            resets_at,
         });
+        if self.quota_history.len() % 256 == 0 {
+            let cutoff = quota.as_of_ms - 180 * 24 * 60 * 60 * 1000;
+            self.quota_history.retain(|point| point.ts_ms >= cutoff);
+        }
     }
 }
 
@@ -1406,6 +1470,7 @@ mod tests {
             projects_by_source: HashMap::new(),
             telemetry_since_ms: 0,
             turns: Vec::new(),
+            quota_history: Vec::new(),
             telemetry_index: HashMap::new(),
         }
     }
@@ -1426,9 +1491,11 @@ mod tests {
 
         store.update_codex_quota(&snapshot("codex", 24.0), 100);
         store.update_codex_quota(&snapshot("codex_bengalfox", 7.0), 200);
+        store.update_codex_quota(&snapshot("codex", 24.05), 300);
 
-        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.0);
+        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.05);
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
+        assert_eq!(store.quota_history.len(), 2);
     }
 
     #[test]

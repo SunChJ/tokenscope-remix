@@ -72,6 +72,31 @@ pub struct PerformanceStats {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct ContextStats {
+    #[serde(rename = "trackedTurns")]
+    pub tracked_turns: u64,
+    #[serde(rename = "medianPct")]
+    pub median_pct: f64,
+    #[serde(rename = "peakPct")]
+    pub peak_pct: f64,
+    #[serde(rename = "nearLimitTurns")]
+    pub near_limit_turns: u64,
+    pub compactions: u64,
+    #[serde(rename = "reasoningTokens")]
+    pub reasoning_tokens: f64,
+    #[serde(rename = "reasoningPct")]
+    pub reasoning_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaTrendPoint {
+    #[serde(rename = "tsMs")]
+    pub ts_ms: i64,
+    #[serde(rename = "usedPct")]
+    pub used_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
     pub total_tokens: f64,
@@ -115,6 +140,7 @@ pub struct PeriodReport {
     pub projects: Vec<ProjectStat>,
     pub reliability: ReliabilityStats,
     pub performance: PerformanceStats,
+    pub context: ContextStats,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]
@@ -169,6 +195,10 @@ pub struct Scope {
     pub quota: Option<Quota>, // Codex only
     #[serde(rename = "sparkQuota")]
     pub spark_quota: Option<Quota>, // codex_bengalfox only
+    #[serde(rename = "quotaTrend")]
+    pub quota_trend: Vec<QuotaTrendPoint>,
+    #[serde(rename = "sparkQuotaTrend")]
+    pub spark_quota_trend: Vec<QuotaTrendPoint>,
 }
 
 #[derive(Debug, Clone, Serialize)]

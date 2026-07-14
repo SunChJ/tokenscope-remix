@@ -47,6 +47,10 @@ struct TurnEvent {
     denials: u64,
     duration_ms: u64,
     ttft_ms: u64,
+    reasoning: f64,
+    context_tokens: f64,
+    context_window: f64,
+    compactions: u64,
 }
 
 /// Static per-agent identity: label + accent + a 5-step chart palette (rank
@@ -118,6 +122,48 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
+fn quota_trend(
+    history: &[crate::store::QuotaHistoryPoint],
+    limit_id: &str,
+    current: Option<&Quota>,
+) -> Vec<QuotaTrendPoint> {
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    let (used_pct, resets_at) = if current.primary_minutes == 7 * 24 * 60 {
+        (current.primary_pct, current.primary_resets_at)
+    } else if current.secondary_minutes == 7 * 24 * 60 {
+        (current.secondary_pct, current.secondary_resets_at)
+    } else {
+        return Vec::new();
+    };
+    let mut points: Vec<QuotaTrendPoint> = history
+        .iter()
+        .filter(|point| point.limit_id == limit_id && point.resets_at == resets_at)
+        .map(|point| QuotaTrendPoint {
+            ts_ms: point.ts_ms,
+            used_pct: point.used_pct,
+        })
+        .collect();
+    points.sort_by_key(|point| point.ts_ms);
+    if points.last().map(|point| point.ts_ms) != Some(current.as_of_ms) {
+        points.push(QuotaTrendPoint {
+            ts_ms: current.as_of_ms,
+            used_pct,
+        });
+    }
+    const MAX_POINTS: usize = 48;
+    if points.len() <= MAX_POINTS {
+        return points;
+    }
+    (0..MAX_POINTS)
+        .map(|index| {
+            let source = index * (points.len() - 1) / (MAX_POINTS - 1);
+            points[source].clone()
+        })
+        .collect()
+}
+
 pub fn build_dashboard() -> Dashboard {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -130,6 +176,12 @@ pub fn build_dashboard() -> Dashboard {
     }
     let codex_quota = store.codex_quota.clone();
     let codex_spark_quota = store.codex_spark_quota.clone();
+    let codex_quota_trend = quota_trend(&store.quota_history, "codex", codex_quota.as_ref());
+    let codex_spark_quota_trend = quota_trend(
+        &store.quota_history,
+        "codex_bengalfox",
+        codex_spark_quota.as_ref(),
+    );
     let telemetry_since_ms = store.telemetry_since_ms;
 
     // 2. Aggregate: apply current config + prices, slice by current time.
@@ -174,6 +226,8 @@ pub fn build_dashboard() -> Dashboard {
         if agent == AGENT_CODEX {
             scope.quota = codex_quota;
             scope.spark_quota = codex_spark_quota;
+            scope.quota_trend = codex_quota_trend;
+            scope.spark_quota_trend = codex_spark_quota_trend;
         }
         vec![scope]
     } else {
@@ -201,6 +255,8 @@ pub fn build_dashboard() -> Dashboard {
             if a.id == AGENT_CODEX {
                 s.quota = codex_quota.clone();
                 s.spark_quota = codex_spark_quota.clone();
+                s.quota_trend = codex_quota_trend.clone();
+                s.spark_quota_trend = codex_spark_quota_trend.clone();
             }
             per_agent.push(s);
         }
@@ -440,6 +496,8 @@ fn build_scope(
         heatmap,
         quota: None,
         spark_quota: None,
+        quota_trend: Vec::new(),
+        spark_quota_trend: Vec::new(),
     }
 }
 
@@ -541,6 +599,10 @@ fn compute_turn(turn: &crate::store::TurnTelemetry, pricing: &Pricing) -> TurnEv
         denials: turn.denials,
         duration_ms: turn.duration_ms,
         ttft_ms: turn.ttft_ms,
+        reasoning: turn.reasoning_tokens,
+        context_tokens: turn.context_tokens,
+        context_window: turn.context_window,
+        compactions: turn.compactions,
     }
 }
 
@@ -606,6 +668,43 @@ fn performance(turns: &[TurnEvent], start: NaiveDate, end: NaiveDate) -> Perform
         p95_duration_ms,
         median_ttft_ms,
         p95_ttft_ms,
+    }
+}
+
+fn context_stats(turns: &[TurnEvent], start: NaiveDate, end: NaiveDate) -> ContextStats {
+    let selected: Vec<&TurnEvent> = turns
+        .iter()
+        .filter(|turn| {
+            let date = turn.ts.date_naive();
+            date >= start && date <= end
+        })
+        .collect();
+    let mut pressure: Vec<f64> = selected
+        .iter()
+        .filter(|turn| turn.context_window > 0.0 && turn.context_tokens > 0.0)
+        .map(|turn| (turn.context_tokens / turn.context_window * 100.0).clamp(0.0, 100.0))
+        .collect();
+    pressure.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if pressure.is_empty() {
+        0.0
+    } else {
+        pressure[(pressure.len() - 1) / 2]
+    };
+    let peak = pressure.last().copied().unwrap_or(0.0);
+    let reasoning: f64 = selected.iter().map(|turn| turn.reasoning).sum();
+    let output: f64 = selected.iter().map(|turn| turn.output).sum();
+    ContextStats {
+        tracked_turns: pressure.len() as u64,
+        median_pct: (median * 10.0).round() / 10.0,
+        peak_pct: (peak * 10.0).round() / 10.0,
+        near_limit_turns: pressure.iter().filter(|value| **value >= 80.0).count() as u64,
+        compactions: selected.iter().map(|turn| turn.compactions).sum(),
+        reasoning_tokens: (reasoning / 1e6 * 1_000_000.0).round() / 1_000_000.0,
+        reasoning_pct: if output > 0.0 {
+            (reasoning / output * 1000.0).round() / 10.0
+        } else {
+            0.0
+        },
     }
 }
 
@@ -834,6 +933,7 @@ fn report_day(
         projects: agg.projects(),
         reliability: reliability(turns, today, today),
         performance: performance(turns, today, today),
+        context: context_stats(turns, today, today),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -910,6 +1010,7 @@ fn report_week(
         projects: agg.projects(),
         reliability: reliability(turns, start, next_start - Duration::days(1)),
         performance: performance(turns, start, next_start - Duration::days(1)),
+        context: context_stats(turns, start, next_start - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -995,6 +1096,7 @@ fn report_month(
         projects: agg.projects(),
         reliability: reliability(turns, cur_first, next_first - Duration::days(1)),
         performance: performance(turns, cur_first, next_first - Duration::days(1)),
+        context: context_stats(turns, cur_first, next_first - Duration::days(1)),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: req_b,
@@ -1115,6 +1217,7 @@ fn report_range(
         projects: agg.projects(),
         reliability: reliability(turns, start, end),
         performance: performance(turns, start, end),
+        context: context_stats(turns, start, end),
         mcp: Agg::named(&agg.mcp_counts),
         skills: Agg::named(&agg.skill_counts),
         req_trend: request_buckets,
@@ -1266,6 +1369,10 @@ mod tests {
                 denials: 1,
                 duration_ms: 1_000,
                 ttft_ms: 100,
+                reasoning: 50_000.0,
+                context_tokens: 160_000.0,
+                context_window: 200_000.0,
+                compactions: 1,
             },
             TurnEvent {
                 ts,
@@ -1280,6 +1387,10 @@ mod tests {
                 denials: 0,
                 duration_ms: 3_000,
                 ttft_ms: 300,
+                reasoning: 0.0,
+                context_tokens: 100_000.0,
+                context_window: 200_000.0,
+                compactions: 0,
             },
         ];
         let stats = reliability(&turns, ts.date_naive(), ts.date_naive());
@@ -1297,5 +1408,13 @@ mod tests {
         assert_eq!(perf.p95_duration_ms, 3_000);
         assert_eq!(perf.median_ttft_ms, 100);
         assert_eq!(perf.p95_ttft_ms, 300);
+
+        let context = context_stats(&turns, ts.date_naive(), ts.date_naive());
+        assert_eq!(context.tracked_turns, 2);
+        assert_eq!(context.median_pct, 50.0);
+        assert_eq!(context.peak_pct, 80.0);
+        assert_eq!(context.near_limit_turns, 1);
+        assert_eq!(context.compactions, 1);
+        assert_eq!(context.reasoning_tokens, 0.05);
     }
 }

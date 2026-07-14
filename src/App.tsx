@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  Dashboard, DateRange, PeriodReport, RangeDashboard, ModelStat, PerformanceStats, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
+  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, PerformanceStats, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -496,9 +496,34 @@ function PerformanceSection({ stats, theme }: { stats: PerformanceStats; theme: 
   );
 }
 
+function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme }) {
+  const t = theme;
+  const item = (label: string, value: string, sub: string, warn = false) => (
+    <div style={{ minWidth: 0, padding: "7px 8px", borderRadius: 8, background: t.segBg }}>
+      <div style={{ font: `500 8px ${t.ui}`, color: t.faint, textTransform: "uppercase", letterSpacing: ".03em" }}>{label}</div>
+      <div style={{ marginTop: 3, font: `600 13px ${t.mono}`, color: warn ? "#e0795f" : t.text }}>{value}</div>
+      <div style={{ marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 8px ${t.mono}`, color: t.faint }}>{sub}</div>
+    </div>
+  );
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 7 }}>
+        <Label t={t}>Context health</Label>
+        <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{fmtInt(stats.trackedTurns)} measured turns</span>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 5 }}>
+        {item("Median", stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", "context")}
+        {item("Peak", stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80)}
+        {item("Compacted", fmtInt(stats.compactions), "times")}
+        {item("Reasoning", stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : "Codex only")}
+      </div>
+    </div>
+  );
+}
+
 // Codex rate-limit card: the two rolling windows (5h + weekly) straight from
 // the session logs — data Claude doesn't expose. Bars turn amber near the cap.
-function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
+function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; theme: Theme }) {
   const t = theme;
   const now = Date.now();
   const stale = now - q.asOfMs > 60 * 60 * 1000;
@@ -512,6 +537,14 @@ function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
     return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
   };
   const asOf = new Date(q.asOfMs).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+  const quotaValues = trend.map((point) => point.usedPct);
+  const first = trend[0], last = trend[trend.length - 1];
+  const elapsedHours = first && last ? (last.tsMs - first.tsMs) / 3.6e6 : 0;
+  const burnPerDay = elapsedHours > 0 ? ((last.usedPct - first.usedPct) / elapsedHours) * 24 : 0;
+  const hoursToCap = burnPerDay > 0 && last ? ((100 - last.usedPct) / burnPerDay) * 24 : 0;
+  const horizon = hoursToCap > 0
+    ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h to cap` : `${(hoursToCap / 24).toFixed(1)}d to cap`
+    : "stable";
   const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
     const p = Math.max(0, Math.min(100, pctUsed));
     const col = p >= 80 ? "#e0795f" : t.accent;
@@ -530,6 +563,12 @@ function QuotaCard({ q, theme }: { q: Quota; theme: Theme }) {
     <div style={{ opacity: stale ? 0.65 : 1 }}>
       <Bar label={winLabel(q.primaryMinutes)} pctUsed={q.primaryPct} sub={resetsIn(q.primaryResetsAt)} />
       <Bar label={winLabel(q.secondaryMinutes)} pctUsed={q.secondaryPct} sub={resetsIn(q.secondaryResetsAt)} />
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
+        <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
+        <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
+          {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%/day · {horizon}</> : "Collecting weekly trend"}
+        </span>
+      </div>
       <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
         {q.plan && <>Plan: {q.plan}</>}{stale && <span> · as of {asOf}</span>}
       </div>
@@ -809,6 +848,10 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
   };
   const performance = P.performance ?? {
     trackedTurns: 0, medianDurationMs: 0, p95DurationMs: 0, medianTtftMs: 0, p95TtftMs: 0,
+  };
+  const context = P.context ?? {
+    trackedTurns: 0, medianPct: 0, peakPct: 0, nearLimitTurns: 0,
+    compactions: 0, reasoningTokens: 0, reasoningPct: 0,
   };
   const [totalModel, setTotalModel] = useState("");
   // The All scope can contain the same model once per agent. The selector is
@@ -1095,6 +1138,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
         <ReliabilitySection stats={reliability} sinceMs={dash.telemetrySinceMs ?? 0} theme={t} />
         <SectionRule t={t} m="12px 0 10px" />
         <PerformanceSection stats={performance} theme={t} />
+        <SectionRule t={t} m="12px 0 10px" />
+        <ContextSection stats={context} theme={t} />
         <SectionRule t={t} m="12px 0 12px" />
         {/* footer stats */}
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
@@ -1110,7 +1155,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active, updater 
           <>
             <SectionRule t={t} />
             <div style={{ marginBottom: 4 }}><Label t={t}>Codex quota</Label></div>
-            <QuotaCard q={scope.quota} theme={t} />
+            <QuotaCard q={scope.quota} trend={scope.quotaTrend ?? []} theme={t} />
           </>
         )}
         {/* MCP — shown whenever the user has installed MCP servers */}
