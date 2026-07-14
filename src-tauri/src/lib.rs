@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(not(target_os = "macos"))]
 use tauri::WindowEvent;
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
@@ -37,10 +37,19 @@ fn now_ms() -> i64 {
 
 const DASHBOARD_SHORTCUT: &str = "CommandOrControl+Alt+T";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WeeklyQuotaDisplay {
+    #[default]
+    Off,
+    Codex,
+    CodexAndSpark,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct TrayPreferences {
-    show_weekly_remaining: bool,
+    weekly_quota_display: WeeklyQuotaDisplay,
     dashboard_shortcut: bool,
     dashboard_shortcut_key: String,
 }
@@ -48,7 +57,7 @@ struct TrayPreferences {
 impl Default for TrayPreferences {
     fn default() -> Self {
         Self {
-            show_weekly_remaining: false,
+            weekly_quota_display: WeeklyQuotaDisplay::Off,
             dashboard_shortcut: false,
             dashboard_shortcut_key: DASHBOARD_SHORTCUT.to_string(),
         }
@@ -96,11 +105,6 @@ fn dashboard_shortcut_menu_label(shortcut: &str) -> String {
     format!("Dashboard Shortcut ({})", shortcut_label(shortcut))
 }
 
-fn weekly_remaining_pct(dash: &Dashboard) -> Option<u8> {
-    let quota = dash.scopes.iter().find_map(|scope| scope.quota.as_ref())?;
-    weekly_remaining_from_quota(quota)
-}
-
 fn weekly_remaining_from_quota(quota: &model::Quota) -> Option<u8> {
     let used = if quota.primary_minutes == 7 * 24 * 60 {
         quota.primary_pct
@@ -112,28 +116,58 @@ fn weekly_remaining_from_quota(quota: &model::Quota) -> Option<u8> {
     Some((100.0 - used).clamp(0.0, 100.0).round() as u8)
 }
 
-fn tray_label(dash: &Dashboard, show_weekly_remaining: bool) -> String {
-    let mut label = fmt_tokens_m(dash.today_tokens);
-    if show_weekly_remaining {
-        if let Some(remaining) = weekly_remaining_pct(dash) {
-            label.push_str(&format!("-{remaining}%"));
+fn dashboard_quotas(dash: &Dashboard) -> (Option<&model::Quota>, Option<&model::Quota>) {
+    dash.scopes
+        .iter()
+        .find(|scope| scope.quota.is_some() || scope.spark_quota.is_some())
+        .map(|scope| (scope.quota.as_ref(), scope.spark_quota.as_ref()))
+        .unwrap_or((None, None))
+}
+
+fn weekly_label_suffix(
+    display: WeeklyQuotaDisplay,
+    codex: Option<&model::Quota>,
+    spark: Option<&model::Quota>,
+) -> String {
+    let mut suffix = String::new();
+    match display {
+        WeeklyQuotaDisplay::Off => {}
+        WeeklyQuotaDisplay::Codex => {
+            if let Some(remaining) = codex.and_then(weekly_remaining_from_quota) {
+                suffix.push_str(&format!("-{remaining}%"));
+            }
+        }
+        WeeklyQuotaDisplay::CodexAndSpark => {
+            if let Some(remaining) = codex.and_then(weekly_remaining_from_quota) {
+                suffix.push_str(&format!("-C{remaining}%"));
+            }
+            if let Some(remaining) = spark.and_then(weekly_remaining_from_quota) {
+                suffix.push_str(&format!("-S{remaining}%"));
+            }
         }
     }
+    suffix
+}
+
+fn tray_label(dash: &Dashboard, display: WeeklyQuotaDisplay) -> String {
+    let mut label = fmt_tokens_m(dash.today_tokens);
+    let (codex, spark) = dashboard_quotas(dash);
+    label.push_str(&weekly_label_suffix(display, codex, spark));
     label
 }
 
 fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
-    let show_weekly_remaining = app
+    let display = app
         .try_state::<TrayPreferencesState>()
         .map(|state| {
             state
                 .0
                 .lock()
-                .map(|prefs| prefs.show_weekly_remaining)
-                .unwrap_or(false)
+                .map(|prefs| prefs.weekly_quota_display)
+                .unwrap_or_default()
         })
-        .unwrap_or(false);
-    let label = tray_label(dash, show_weekly_remaining);
+        .unwrap_or_default();
+    let label = tray_label(dash, display);
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.tray_by_id("main") {
@@ -189,10 +223,23 @@ fn load_tray_preferences() -> TrayPreferences {
     let Some(path) = tray_preferences_path() else {
         return TrayPreferences::default();
     };
-    std::fs::read_to_string(path)
+    let Some(text) = std::fs::read_to_string(path).ok() else {
+        return TrayPreferences::default();
+    };
+    parse_tray_preferences(&text)
+}
+
+fn parse_tray_preferences(text: &str) -> TrayPreferences {
+    let mut preferences: TrayPreferences = serde_json::from_str(text).unwrap_or_default();
+    let legacy_weekly_on = serde_json::from_str::<serde_json::Value>(text)
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .filter(|value| value.get("weekly_quota_display").is_none())
+        .and_then(|value| value.get("show_weekly_remaining")?.as_bool())
+        .unwrap_or(false);
+    if legacy_weekly_on {
+        preferences.weekly_quota_display = WeeklyQuotaDisplay::Codex;
+    }
+    preferences
 }
 
 fn save_tray_preferences(preferences: &TrayPreferences) {
@@ -820,7 +867,7 @@ pub fn run() {
                 tray_preferences.dashboard_shortcut = false;
                 save_tray_preferences(&tray_preferences);
             }
-            let weekly_remaining_on = tray_preferences.show_weekly_remaining;
+            let weekly_quota_display = tray_preferences.weekly_quota_display;
             let dashboard_shortcut_on = tray_preferences.dashboard_shortcut;
             let dashboard_shortcut_key = tray_preferences.dashboard_shortcut_key.clone();
             app.manage(TrayPreferencesState(std::sync::Mutex::new(
@@ -927,7 +974,7 @@ pub fn run() {
 
             // Build the menu-bar tray: app glyph (template icon) + today's tokens.
             let dash = parser::build_dashboard();
-            let label = tray_label(&dash, weekly_remaining_on);
+            let label = tray_label(&dash, weekly_quota_display);
 
             let open_i = MenuItem::with_id(app, "open", "Open Tokenscope", true, None::<&str>)?;
             let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
@@ -938,13 +985,35 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let weekly_remaining_i = CheckMenuItem::with_id(
+            let weekly_off_i = CheckMenuItem::with_id(
                 app,
-                "weekly-remaining",
-                "Show Weekly Remaining",
+                "weekly-off",
+                "Off",
                 true,
-                weekly_remaining_on,
+                weekly_quota_display == WeeklyQuotaDisplay::Off,
                 None::<&str>,
+            )?;
+            let weekly_codex_i = CheckMenuItem::with_id(
+                app,
+                "weekly-codex",
+                "Codex",
+                true,
+                weekly_quota_display == WeeklyQuotaDisplay::Codex,
+                None::<&str>,
+            )?;
+            let weekly_codex_spark_i = CheckMenuItem::with_id(
+                app,
+                "weekly-codex-spark",
+                "Codex + Spark",
+                true,
+                weekly_quota_display == WeeklyQuotaDisplay::CodexAndSpark,
+                None::<&str>,
+            )?;
+            let weekly_menu = Submenu::with_items(
+                app,
+                "Weekly Remaining",
+                true,
+                &[&weekly_off_i, &weekly_codex_i, &weekly_codex_spark_i],
             )?;
             let dashboard_shortcut_i = CheckMenuItem::with_id(
                 app,
@@ -980,7 +1049,7 @@ pub fn run() {
                     &refresh_i,
                     &check_updates_i,
                     &PredefinedMenuItem::separator(app)?,
-                    &weekly_remaining_i,
+                    &weekly_menu,
                     &dashboard_shortcut_i,
                     &change_dashboard_shortcut_i,
                     &autostart_i,
@@ -1056,15 +1125,23 @@ pub fn run() {
                         show_popover(app);
                         let _ = app.emit("check-for-updates", ());
                     }
-                    "weekly-remaining" => {
+                    "weekly-off" | "weekly-codex" | "weekly-codex-spark" => {
+                        let display = match event.id.as_ref() {
+                            "weekly-codex" => WeeklyQuotaDisplay::Codex,
+                            "weekly-codex-spark" => WeeklyQuotaDisplay::CodexAndSpark,
+                            _ => WeeklyQuotaDisplay::Off,
+                        };
                         if let Some(state) = app.try_state::<TrayPreferencesState>() {
-                            let Some((enabled, preferences)) = state.0.lock().ok().map(|mut prefs| {
-                                prefs.show_weekly_remaining = !prefs.show_weekly_remaining;
-                                (prefs.show_weekly_remaining, prefs.clone())
+                            let Some(preferences) = state.0.lock().ok().map(|mut prefs| {
+                                prefs.weekly_quota_display = display;
+                                prefs.clone()
                             }) else {
                                 return;
                             };
-                            let _ = weekly_remaining_i.set_checked(enabled);
+                            let _ = weekly_off_i.set_checked(display == WeeklyQuotaDisplay::Off);
+                            let _ = weekly_codex_i.set_checked(display == WeeklyQuotaDisplay::Codex);
+                            let _ = weekly_codex_spark_i
+                                .set_checked(display == WeeklyQuotaDisplay::CodexAndSpark);
                             save_tray_preferences(&preferences);
                             refresh(app);
                         }
@@ -1203,7 +1280,7 @@ mod tests {
 
     #[test]
     fn weekly_remaining_uses_seven_day_quota() {
-        let quota = model::Quota {
+        let codex = model::Quota {
             plan: "pro".into(),
             primary_pct: 20.0,
             primary_minutes: 300,
@@ -1213,16 +1290,34 @@ mod tests {
             secondary_resets_at: 0,
             as_of_ms: 0,
         };
+        let spark = model::Quota {
+            primary_pct: 7.0,
+            primary_minutes: 7 * 24 * 60,
+            ..codex.clone()
+        };
 
-        assert_eq!(weekly_remaining_from_quota(&quota), Some(81));
+        assert_eq!(weekly_remaining_from_quota(&codex), Some(81));
+        assert_eq!(
+            weekly_label_suffix(WeeklyQuotaDisplay::Codex, Some(&codex), Some(&spark)),
+            "-81%"
+        );
+        assert_eq!(
+            weekly_label_suffix(
+                WeeklyQuotaDisplay::CodexAndSpark,
+                Some(&codex),
+                Some(&spark)
+            ),
+            "-C81%-S93%"
+        );
     }
 
     #[test]
-    fn old_tray_preferences_get_the_default_shortcut() {
-        let preferences: TrayPreferences =
-            serde_json::from_str(r#"{"show_weekly_remaining":true,"dashboard_shortcut":true}"#)
-                .unwrap();
+    fn old_tray_preferences_are_migrated() {
+        let preferences = parse_tray_preferences(
+            r#"{"show_weekly_remaining":true,"dashboard_shortcut":true}"#,
+        );
 
+        assert_eq!(preferences.weekly_quota_display, WeeklyQuotaDisplay::Codex);
         assert_eq!(preferences.dashboard_shortcut_key, DASHBOARD_SHORTCUT);
         assert!(DASHBOARD_SHORTCUT.parse::<Shortcut>().is_ok());
         assert!("Command+Alt+KeyT".parse::<Shortcut>().is_ok());

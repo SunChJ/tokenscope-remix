@@ -87,8 +87,9 @@ pub struct Store {
     // count its token usage only once.
     index: HashMap<String, usize>,
     manifest: Manifest,
-    // Latest Codex rate-limit snapshot seen across all session files.
+    // Latest general and model-specific Codex rate-limit snapshots.
     pub codex_quota: Option<Quota>,
+    pub codex_spark_quota: Option<Quota>,
 }
 
 // Bump when the parsing/extraction logic changes in a way that requires
@@ -103,6 +104,10 @@ pub struct Store {
 //   v7: extract Codex MCP calls from tool search and app custom-tool formats.
 //   v8: retain complete history for custom-range tracking and settlement.
 const STORE_VERSION: u32 = 8;
+const QUOTA_CACHE_VERSION: u32 = 1;
+// One-time quota migration: at most 32 × 64 KiB = 2 MiB of log content.
+const RECENT_QUOTA_FILES: usize = 32;
+const QUOTA_TAIL_BYTES: u64 = 64 * 1024;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -150,10 +155,13 @@ impl Store {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
         let mut codex_quota = None;
+        let mut codex_spark_quota = None;
+        let mut version_ok = false;
+        let mut quota_cache_ok = false;
         if let Some(dir) = cache_dir() {
             // If the cache was written by an older parser, discard it so ingest
             // does a full rescan and picks up newly-extracted facts.
-            let version_ok = fs::read_to_string(dir.join("version"))
+            version_ok = fs::read_to_string(dir.join("version"))
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 == Some(STORE_VERSION);
@@ -175,11 +183,19 @@ impl Store {
                     events = e;
                     manifest = m;
                 }
-                // Quota is a best-effort side channel — a missing/corrupt file
-                // just means "no snapshot yet", never a rescan.
-                codex_quota = fs::read_to_string(dir.join("codex_quota.json"))
+                quota_cache_ok = fs::read_to_string(dir.join("quota_version"))
                     .ok()
-                    .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    == Some(QUOTA_CACHE_VERSION);
+                if quota_cache_ok {
+                    codex_quota = fs::read_to_string(dir.join("codex_quota.json"))
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
+                    codex_spark_quota =
+                        fs::read_to_string(dir.join("codex_bengalfox_quota.json"))
+                            .ok()
+                            .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
+                }
             }
         }
         let index = events
@@ -188,12 +204,20 @@ impl Store {
             .filter(|(_, e)| !e.id.is_empty())
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
-        Store {
+        let mut store = Store {
             events,
             index,
             manifest,
             codex_quota,
+            codex_spark_quota,
+        };
+        if version_ok && !quota_cache_ok {
+            store.rebuild_codex_quotas();
+            if let Some(dir) = cache_dir() {
+                store.save_quota_cache(&dir);
+            }
         }
+        store
     }
 
     pub fn save(&self) {
@@ -209,12 +233,89 @@ impl Store {
             if let Ok(t) = serde_json::to_string(&self.manifest) {
                 let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
             }
-            if let Some(q) = &self.codex_quota {
-                if let Ok(t) = serde_json::to_string(q) {
-                    let _ = write_atomic(&dir.join("codex_quota.json"), t.as_bytes());
+            self.save_quota_cache(&dir);
+            let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
+        }
+    }
+
+    fn save_quota_cache(&self, dir: &std::path::Path) {
+        let save = |name: &str, quota: &Option<Quota>| match quota {
+            Some(quota) => {
+                if let Ok(text) = serde_json::to_string(quota) {
+                    let _ = write_atomic(&dir.join(name), text.as_bytes());
                 }
             }
-            let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
+            None => {
+                let _ = fs::remove_file(dir.join(name));
+            }
+        };
+        save("codex_quota.json", &self.codex_quota);
+        save("codex_bengalfox_quota.json", &self.codex_spark_quota);
+        let _ = write_atomic(
+            &dir.join("quota_version"),
+            QUOTA_CACHE_VERSION.to_string().as_bytes(),
+        );
+    }
+
+    /// One-time migration from the old single-quota cache. Read only the tails
+    /// of recently active Codex logs; token_count snapshots occur frequently,
+    /// so this separates current quota buckets without rescanning usage history.
+    fn rebuild_codex_quotas(&mut self) {
+        self.codex_quota = None;
+        self.codex_spark_quota = None;
+        let Some(root) = codex_dir() else {
+            return;
+        };
+        let mut files: Vec<_> = WalkDir::new(root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|x| x == "jsonl")
+                    .unwrap_or(false)
+            })
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, entry.into_path()))
+            })
+            .collect();
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (_, path) in files.into_iter().take(RECENT_QUOTA_FILES) {
+            let Ok(mut file) = fs::File::open(path) else {
+                continue;
+            };
+            let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+                continue;
+            };
+            let start = size.saturating_sub(QUOTA_TAIL_BYTES);
+            if file.seek(SeekFrom::Start(start)).is_err() {
+                continue;
+            }
+            let mut bytes = Vec::with_capacity((size - start) as usize);
+            if file.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            let skip = if start == 0 {
+                0
+            } else {
+                bytes
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(bytes.len())
+            };
+            let mut state = FileState::default();
+            for line in bytes[skip..].split(|byte| *byte == b'\n') {
+                let Ok(text) = std::str::from_utf8(line) else {
+                    continue;
+                };
+                if text.contains("\"rate_limits\"") {
+                    let _ = self.parse_codex_line(text, &mut state);
+                }
+            }
         }
     }
 
@@ -502,7 +603,12 @@ impl Store {
     /// Keep the newest rate-limit snapshot (files are walked in arbitrary order,
     /// so compare timestamps rather than trusting encounter order).
     fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64) {
-        if self.codex_quota.as_ref().map(|q| q.as_of_ms >= ts_ms).unwrap_or(false) {
+        let slot = match rl.get("limit_id").and_then(|value| value.as_str()) {
+            None | Some("codex") => &mut self.codex_quota,
+            Some("codex_bengalfox") => &mut self.codex_spark_quota,
+            _ => return,
+        };
+        if slot.as_ref().map(|q| q.as_of_ms >= ts_ms).unwrap_or(false) {
             return;
         }
         let win = |k: &str| rl.get(k);
@@ -514,7 +620,7 @@ impl Store {
         if p.is_none() && s.is_none() {
             return;
         }
-        self.codex_quota = Some(Quota {
+        *slot = Some(Quota {
             plan: rl
                 .get("plan_type")
                 .and_then(|x| x.as_str())
@@ -816,7 +922,29 @@ mod tests {
             index: HashMap::new(),
             manifest: Manifest::default(),
             codex_quota: None,
+            codex_spark_quota: None,
         }
+    }
+
+    #[test]
+    fn keeps_general_and_spark_quotas_separate() {
+        let mut store = empty_store();
+        let snapshot = |limit_id: &str, used_percent: f64| {
+            serde_json::json!({
+                "limit_id": limit_id,
+                "primary": {
+                    "used_percent": used_percent,
+                    "window_minutes": 10080,
+                    "resets_at": 123
+                }
+            })
+        };
+
+        store.update_codex_quota(&snapshot("codex", 24.0), 100);
+        store.update_codex_quota(&snapshot("codex_bengalfox", 7.0), 200);
+
+        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.0);
+        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
     }
 
     #[test]

@@ -30,7 +30,7 @@ export interface Quota {
 export interface Scope {
   id: string; label: string; color: string;
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
-  heatmap: HeatDay[]; quota: Quota | null;
+  heatmap: HeatDay[]; quota: Quota | null; sparkQuota?: Quota | null;
 }
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string;

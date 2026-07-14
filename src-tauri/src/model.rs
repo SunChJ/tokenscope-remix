@@ -122,6 +122,8 @@ pub struct Scope {
     pub month: PeriodReport,
     pub heatmap: Vec<HeatDay>,
     pub quota: Option<Quota>, // Codex only
+    #[serde(rename = "sparkQuota")]
+    pub spark_quota: Option<Quota>, // codex_bengalfox only
 }
 
 #[derive(Debug, Clone, Serialize)]

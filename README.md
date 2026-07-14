@@ -133,7 +133,7 @@ right-click menu to check immediately.
 - **macOS**: an icon plus today's token count appears in the menu bar (e.g. `⬡ 12.40M`)
 - **Windows**: the tray icon appears in the notification area. The Windows tray API doesn't show a label beside the icon — **hover the tray icon** to see today's token count in the tooltip (e.g. `Tokenscope · today 12.40M`)
 - Left-click the icon to toggle the panel; right-click for the menu (Open / Refresh / Check for Updates / display preferences / Quit)
-- **Show Weekly Remaining** optionally appends Codex's remaining weekly quota to the menu-bar label (for example `12.40M-81%`); it is off by default and remembers your choice
+- **Weekly Remaining** controls the quota shown beside the menu-bar token count: **Off**, **Codex** (for example `12.40M-76%`), or **Codex + Spark** (`codex_bengalfox`, shown as `12.40M-C76%-S93%`). It is off by default and remembers your choice
 - **Dashboard Shortcut** toggles the panel with a global hotkey (`⌥⌘T` on macOS, `Ctrl+Alt+T` on Windows/Linux by default); use **Change Dashboard Shortcut…** to record your own combination. It is off by default and remembers your choice
 - **Launch-at-login is set up automatically** — no manual configuration needed
 

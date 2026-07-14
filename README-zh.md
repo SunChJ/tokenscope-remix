@@ -131,7 +131,7 @@ App 会在启动时及此后每小时检测新版本。当前版本和更新操�
 - **macOS**：菜单栏出现图标 + 当日 Token 数（如 `⬡ 12.40M`）
 - **Windows**：系统托盘出现图标。Windows 任务栏托盘 API 不支持在图标旁显示文字，**鼠标悬停托盘图标**即可看到当日 Token 数（提示气泡形如 `Tokenscope · today 12.40M`）
 - 左键点击图标开/关面板，右键出菜单（Open / Refresh / Check for Updates / 显示偏好 / Quit）
-- **Show Weekly Remaining** 可在菜单栏 Token 数后追加 Codex 每周剩余配额（如 `12.40M-81%`）；默认关闭，选择会被记住
+- **Weekly Remaining** 可配置菜单栏 Token 数后的周剩余额度：**Off**、仅 **Codex**（如 `12.40M-76%`），或 **Codex + Spark**（`codex_bengalfox`，显示为 `12.40M-C76%-S93%`）；默认关闭，选择会被记住
 - **Dashboard Shortcut** 可用全局快捷键切换面板的显示/隐藏（默认 macOS 为 `⌥⌘T`，Windows/Linux 为 `Ctrl+Alt+T`）；通过 **Change Dashboard Shortcut…** 可直接录入自定义组合键。默认关闭，选择会被记住
 - 已自动设置**登录自启**，无需手动配置
 

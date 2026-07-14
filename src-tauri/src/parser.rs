@@ -111,6 +111,7 @@ pub fn build_dashboard() -> Dashboard {
         store.save();
     }
     let codex_quota = store.codex_quota.clone();
+    let codex_spark_quota = store.codex_spark_quota.clone();
 
     // 2. Aggregate: apply current config + prices, slice by current time.
     let cfg = UserConfig::load(&store.codex_project_dirs());
@@ -145,6 +146,7 @@ pub fn build_dashboard() -> Dashboard {
         let mut scope = build_scope("all", "All", "", &events, PALETTE, agent, &cfg, now);
         if agent == AGENT_CODEX {
             scope.quota = codex_quota;
+            scope.spark_quota = codex_spark_quota;
         }
         vec![scope]
     } else {
@@ -156,6 +158,7 @@ pub fn build_dashboard() -> Dashboard {
             let mut s = build_scope(a.id, a.label, a.color, &filtered, &a.palette, a.id, &cfg, now);
             if a.id == AGENT_CODEX {
                 s.quota = codex_quota.clone();
+                s.spark_quota = codex_spark_quota.clone();
             }
             per_agent.push(s);
         }
@@ -367,6 +370,7 @@ fn build_scope(
         month,
         heatmap,
         quota: None,
+        spark_quota: None,
     }
 }
 
