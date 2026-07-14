@@ -530,7 +530,7 @@ fn system_is_dark() -> bool {
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let key: id = msg_send![
             class!(NSString),
-            stringWithUTF8String: b"AppleInterfaceStyle\0".as_ptr() as *const std::os::raw::c_char
+            stringWithUTF8String: c"AppleInterfaceStyle".as_ptr()
         ];
         let val: id = msg_send![defaults, stringForKey: key];
         if val == nil {

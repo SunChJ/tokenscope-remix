@@ -490,7 +490,7 @@ impl Store {
                 Some((modified, entry.into_path()))
             })
             .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|item| std::cmp::Reverse(item.0));
 
         for (_, path) in files.into_iter().take(RECENT_QUOTA_FILES) {
             let Ok(mut file) = fs::File::open(path) else {
@@ -1175,7 +1175,7 @@ impl Store {
             used_pct,
             resets_at,
         });
-        if self.quota_history.len() % 256 == 0 {
+        if self.quota_history.len().is_multiple_of(256) {
             let cutoff = quota.as_of_ms - 180 * 24 * 60 * 60 * 1000;
             self.quota_history.retain(|point| point.ts_ms >= cutoff);
         }
@@ -1260,7 +1260,7 @@ fn codex_skill_names(text: &str) -> Vec<String> {
                 || path.contains("/plugins/cache/")
                 || path.contains("\\plugins\\cache\\");
             let start = path
-                .rfind(|c| c == '/' || c == '\\')
+                .rfind(['/', '\\'])
                 .map(|i| i + 1)
                 .unwrap_or(0);
             let name = path[start..]

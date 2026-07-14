@@ -812,7 +812,7 @@ impl Agg {
                 count: *c,
             })
             .collect();
-        v.sort_by(|a, b| b.count.cmp(&a.count));
+        v.sort_by_key(|item| std::cmp::Reverse(item.count));
         v
     }
 
@@ -957,7 +957,7 @@ fn report_week(
 
     let mut agg = Agg::default();
     let mut prev = Agg::default();
-    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 7];
+    let mut buckets = [(0.0f64, 0.0f64, 0.0f64); 7];
     let mut req_b = vec![0.0f64; 7];
     let mut cost_b = vec![0.0f64; 7];
 
@@ -1068,7 +1068,7 @@ fn report_month(
     let series = (0..days_in_month)
         .map(|i| {
             let dn = (i + 1) as u32;
-            let label = if i == 0 || dn % 5 == 0 {
+            let label = if i == 0 || dn.is_multiple_of(5) {
                 dn.to_string()
             } else {
                 String::new()
