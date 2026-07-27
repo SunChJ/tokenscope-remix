@@ -122,6 +122,20 @@ struct FileState {
     // so incremental reads can still attribute later calls to their MCP server.
     #[serde(default)]
     mcp_tools: HashMap<String, String>,
+    // Codex forks a subagent/resumed thread by replaying the parent thread's
+    // entire history — token_count, task_started/complete, tool calls, even the
+    // parent's session_meta — into the head of the child's rollout file, all
+    // restamped with the fork instant. Those lines are not new activity: the
+    // parent file still holds them, and Codex events carry no message id to
+    // dedupe on, so ingesting them double-counts tokens (measured ~5% of a
+    // month) and duplicates turn telemetry. Skip everything until the child's
+    // first `turn_context`, which is where its own turns begin.
+    #[serde(default)]
+    replaying: bool,
+    // Whether this file's own `session_meta` (its first line) has been read.
+    // Replayed parent metas follow it and must not overwrite session/cwd.
+    #[serde(default)]
+    meta_seen: bool,
     // Runtime-only source key used while appending telemetry records.
     #[serde(skip)]
     source: String,
@@ -161,7 +175,9 @@ pub struct Store {
 //   v6: extract Codex Skill calls and track project skill directories.
 //   v7: extract Codex MCP calls from tool search and app custom-tool formats.
 //   v8: retain complete history for custom-range tracking and settlement.
-const STORE_VERSION: u32 = 8;
+//   v9: drop the replayed parent history at the head of a forked Codex thread
+//       (it was double-counting tokens and turn telemetry).
+const STORE_VERSION: u32 = 9;
 const QUOTA_CACHE_VERSION: u32 = 1;
 const PROJECT_CACHE_VERSION: u32 = 1;
 const TELEMETRY_CACHE_VERSION: u32 = 1;
@@ -782,8 +798,24 @@ impl Store {
     fn parse_codex_line(&mut self, line: &str, state: &mut FileState) -> Option<RawEvent> {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         let payload = v.get("payload")?;
-        match v.get("type")?.as_str()? {
+        let line_type = v.get("type")?.as_str()?;
+        // A forked thread replays its parent's history before its own first
+        // turn_context. Drop that whole window (see FileState::replaying).
+        if state.replaying && line_type != "turn_context" {
+            return None;
+        }
+        match line_type {
             "session_meta" => {
+                // Only the file's own meta (its first line) counts; the replayed
+                // parent metas that follow would clobber session/cwd.
+                if state.meta_seen {
+                    return None;
+                }
+                state.meta_seen = true;
+                // A fork/resume names the thread it continues; everything up to
+                // this file's first turn_context is that thread's replayed log.
+                state.replaying = payload.get("forked_from_id").is_some()
+                    || payload.get("parent_thread_id").is_some();
                 // `id` is this thread's own session id; `session_id` can be the
                 // parent for subagent threads. Prefer the file's own id.
                 if let Some(id) = payload
@@ -799,6 +831,8 @@ impl Store {
                 None
             }
             "turn_context" => {
+                // The child's own turns start here; the replay window is over.
+                state.replaying = false;
                 if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
                     state.model = m.to_string();
                 }
@@ -1496,6 +1530,67 @@ mod tests {
         assert_eq!(store.codex_quota.unwrap().primary_pct, 24.05);
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
         assert_eq!(store.quota_history.len(), 2);
+    }
+
+    // A forked/subagent thread replays the parent's whole history — usage, turn
+    // telemetry, tool calls, even the parent's session_meta — at the head of its
+    // rollout file, restamped with the fork instant. The parent file still holds
+    // all of it and Codex events have no message id to dedupe on, so counting
+    // the replay would double-count. Everything before the child's first
+    // turn_context must be dropped.
+    #[test]
+    fn skips_replayed_parent_history_in_a_forked_codex_thread() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/child.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let own_meta = r#"{"timestamp":"2026-07-24T02:30:43Z","type":"session_meta","payload":{"id":"child-1","forked_from_id":"parent-1","parent_thread_id":"parent-1","cwd":"/work/child"}}"#;
+        let replayed_meta = r#"{"timestamp":"2026-07-24T02:30:44Z","type":"session_meta","payload":{"id":"parent-1","cwd":"/work/parent"}}"#;
+        let replayed_started = r#"{"timestamp":"2026-07-24T02:30:44Z","type":"event_msg","payload":{"type":"task_started","turn_id":"old-turn","model_context_window":200000}}"#;
+        let replayed_usage = r#"{"timestamp":"2026-07-24T02:30:44Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":116643,"cached_input_tokens":114432,"output_tokens":592}}}}"#;
+        let replayed_mcp = r#"{"timestamp":"2026-07-24T02:30:44Z","type":"response_item","payload":{"type":"function_call","name":"mcp__server__tool"}}"#;
+        let own_context = r#"{"timestamp":"2026-07-24T02:31:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","turn_id":"new-turn","cwd":"/work/child"}}"#;
+        let own_usage = r#"{"timestamp":"2026-07-24T02:31:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":50}}}}"#;
+
+        assert!(store.parse_codex_line(own_meta, &mut state).is_none());
+        assert!(store.parse_codex_line(replayed_meta, &mut state).is_none());
+        assert!(store.parse_codex_line(replayed_started, &mut state).is_none());
+        assert!(store.parse_codex_line(replayed_usage, &mut state).is_none());
+        assert!(store.parse_codex_line(replayed_mcp, &mut state).is_none());
+        // The replayed parent meta must not have hijacked the child's identity.
+        assert_eq!(state.session, "child-1");
+        assert_eq!(state.cwd, "/work/child");
+        // Nothing before the first turn_context may produce turn telemetry.
+        assert!(store.turns.is_empty());
+
+        // The child's first turn_context ends the replay window; its own turns
+        // count normally from there.
+        assert!(store.parse_codex_line(own_context, &mut state).is_none());
+        let event = store
+            .parse_codex_line(own_usage, &mut state)
+            .expect("the child's own usage still counts");
+        assert_eq!(event.in_tok, 400.0);
+        assert_eq!(event.cr, 100.0);
+        assert_eq!(event.out_tok, 50.0);
+        assert_eq!(event.model, "gpt-5.6-sol");
+    }
+
+    // A fresh (non-forked) session has no replay window, so its very first
+    // events count even before any turn_context.
+    #[test]
+    fn keeps_all_events_in_a_fresh_codex_session() {
+        let mut store = empty_store();
+        let mut state = FileState::default();
+        let meta = r#"{"timestamp":"2026-07-24T02:30:43Z","type":"session_meta","payload":{"id":"fresh-1","cwd":"/work"}}"#;
+        let usage = r#"{"timestamp":"2026-07-24T02:30:44Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":300,"cached_input_tokens":100,"output_tokens":20}}}}"#;
+
+        assert!(store.parse_codex_line(meta, &mut state).is_none());
+        let event = store
+            .parse_codex_line(usage, &mut state)
+            .expect("a fresh session's usage counts from the start");
+        assert_eq!(event.in_tok, 200.0);
+        assert_eq!(event.session, "fresh-1");
     }
 
     #[test]
