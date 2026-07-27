@@ -50,9 +50,65 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ---
 
+## Data accuracy (cost & token totals)
+
+### 4. Cache tokens priced at $0, undercounting Claude cost ~4×
+
+- **Symptom**: Claude's monthly cost read far too low ($328 where the real
+  API-equivalent figure was $1409), while Codex looked correct. The error came
+  and went depending on which model was in use.
+- **Cause**: models.dev lists the same model under many providers (first-party
+  vendor plus resellers / gateways / clouds). `ingest_modelsdev` is
+  first-writer-wins over providers iterated in key order — and `serde_json`
+  has no `preserve_order`, so that order is **alphabetical**. The previous sort
+  only pushed bare ids ahead of `vendor/model` ones, so among bare entries the
+  alphabetically first provider won. For `claude-fable-5` that is `abacus`,
+  whose entry is not a cheaper price but an **incomplete record**: identical
+  `input`/`output` to Anthropic's, with `cache_read`/`cache_write` simply
+  absent, so both defaulted to `0`. Claude Code usage is ~98% cache-read
+  tokens, so this charged for only ~2% of the volume. `claude-sonnet-5` was
+  worse — the shadowing entry also carried a 50% higher input price.
+- **Fix**: Added `is_first_party()` and ordered entries best-first in
+  `pricing.rs`: the model's first-party vendor, then entries that actually
+  carry cache pricing, then bare ids over `vendor/model` duplicates. Ported
+  from upstream `3a30273` / `0987a4c`.
+
+### 5. Forked Codex threads double-counted their parent's history
+
+- **Symptom**: Codex token totals ran high — measured 8.5% (day), 4.7% (week),
+  5.7% (month) — and the model breakdown didn't sum to Total tokens. Some
+  events were attributed to the wrong session and project.
+- **Cause**: Codex forks a subagent/resumed thread by replaying the parent
+  thread's **entire history** — `token_count`, `task_started`/`task_complete`,
+  tool calls, even the parent's `session_meta` — into the head of the child's
+  rollout file, all restamped with the fork instant. Claude events dedupe by
+  `message.id`, but **Codex events carry no id**, so nothing caught it and
+  every replayed turn was counted a second time. The replayed `session_meta`
+  also clobbered the child's own session id and cwd. Because `state.model` is
+  only set by `turn_context`, the replayed events also had an empty model, so
+  they landed in Total tokens but were excluded from requests, the model
+  breakdown, and cost.
+- **Fix**: `FileState` gained `replaying`/`meta_seen`; a file whose
+  `session_meta` names a `forked_from_id`/`parent_thread_id` skips **every**
+  line until its own first `turn_context`. The window is unambiguous: across
+  131 fresh sessions there were zero `token_count` lines before the first
+  `turn_context`, versus 7234 in forked ones — and all 7234 were verified to
+  still have an exact usage match in a parent file, so nothing is lost.
+  Bumped `STORE_VERSION` to 9 for a one-time rescan.
+- **Known limitation**: this is a *window skip*, not content-level dedup, so it
+  assumes the parent rollout file is still on disk. Existing installs are safe
+  (the event cache retains what it already ingested), but Codex rotates
+  `~/.codex/sessions`, so a **fresh install after a parent was rotated away
+  would silently lose that history**. A content-level key (session id +
+  original timestamp + usage tuple) would close this, but the replay restamps
+  timestamps, so the original would have to be recoverable first. Left as-is:
+  correct for every case observed, and strictly simpler.
+
+---
+
 ## Release & distribution (CI)
 
-### 4. Release CI failed: empty Apple signing env var
+### 6. Release CI failed: empty Apple signing env var
 
 - **Symptom**: The `v0.1.1` build failed at the bundle step with
   `security: SecKeychainItemImport: ... parameters ... not valid` /
@@ -65,7 +121,7 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Fix**: Commented out the Apple signing/notarization env in `release.yml`
   until the real secrets exist. The build now does ad-hoc signing, like local.
 
-### 5. GitHub Release had no .dmg / .app — it was a draft
+### 7. GitHub Release had no .dmg / .app — it was a draft
 
 - **Symptom**: "The release has no artifacts."
 - **Cause**: `releaseDraft: true` — the build *did* succeed and attach the
@@ -76,7 +132,7 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Fix**: Set `releaseDraft: false` so each tag publishes immediately and the
   asset URL is live for the Homebrew step and `brew install`.
 
-### 6. Homebrew Cask step would hash a 404 page
+### 8. Homebrew Cask step would hash a 404 page
 
 - **Symptom**: Latent — the cask `sha256` could be computed from an error page.
 - **Cause**: The cask step fetched the asset with `curl -sL` (no `-f`), so a 404
@@ -85,7 +141,7 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Fix**: Use `curl -fsSL` so a missing asset fails and retries; fail loudly
   (`exit 1`) if the asset never appears.
 
-### 7. DMG name didn't match the tag
+### 9. DMG name didn't match the tag
 
 - **Symptom**: A `v0.1.1` tag would build `Tokenscope_0.1.0_universal.dmg`,
   which the cask step (computing the name from the tag) couldn't download → 404.
@@ -99,7 +155,7 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ## App behavior & packaging
 
-### 8. Two menu-bar icons after reinstall
+### 10. Two menu-bar icons after reinstall
 
 - **Symptom**: Reinstalling/relaunching left two Tokenscope icons in the menu
   bar.
@@ -108,7 +164,7 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Fix**: Added `tauri-plugin-single-instance` (registered first) so a second
   launch hands off to the running instance (showing the popover) and exits.
 
-### 9. Unsigned app blocked by Gatekeeper on first open
+### 11. Unsigned app blocked by Gatekeeper on first open
 
 - **Symptom**: "Apple cannot verify Tokenscope.app is free of malware."
 - **Cause**: The build is unsigned/unnotarized, and Homebrew adds a quarantine
@@ -118,7 +174,7 @@ fix. Newest first. Useful as a reference for similar issues.
   manual right-click → Open or `xattr -cr`; a full fix needs Developer ID
   signing + notarization.)
 
-### 10. App icon had opaque white corners
+### 12. App icon had opaque white corners
 
 - **Symptom**: The rounded app icon showed white square corners in Launchpad.
 - **Cause**: The icon PNGs had a white (opaque) background in the corners
@@ -131,7 +187,7 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ## UI / charts
 
-### 11. Bar-chart tooltip overlapped the legend above it
+### 13. Bar-chart tooltip overlapped the legend above it
 
 - **Symptom**: Hovering a token bar showed its tooltip floating up over the
   Total-tokens "Input … cached" legend, even for short bars.
@@ -143,7 +199,7 @@ fix. Newest first. Useful as a reference for similar issues.
   *visible bar top* (`r.bottom − barPx`, baseline minus bar height) instead of
   the column top, so short bars get a low tooltip clear of the legend.
 
-### 12. Mockup tooltip drifted to the panel centre (backdrop-filter)
+### 14. Mockup tooltip drifted to the panel centre (backdrop-filter)
 
 - **Symptom**: In `tokenscope-panel.html` only, the heatmap/bar tooltips
   appeared near the middle of the panel instead of next to the hovered cell/bar.
@@ -157,7 +213,7 @@ fix. Newest first. Useful as a reference for similar issues.
   relative to each chart's own wrapper (coords offset from the wrapper rect).
   The mockup never scrolls, so it doesn't need `fixed`.
 
-### 13. Total-tokens bar showed slivers when usage was zero
+### 15. Total-tokens bar showed slivers when usage was zero
 
 - **Symptom**: With no usage in the period (Total = 0.00M), the input/output
   split bar still showed a small coloured sliver instead of being empty.
@@ -171,7 +227,7 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ## Theme
 
-### 14. "System" theme mode didn't follow the macOS appearance
+### 16. "System" theme mode didn't follow the macOS appearance
 
 - **Symptom**: On macOS, the "System" theme option didn't track the OS dark/light
   mode — neither when toggling system appearance with the popover open, nor after
@@ -200,7 +256,7 @@ fix. Newest first. Useful as a reference for similar issues.
   `block` re-exports already imported in `lib.rs`. (`src-tauri/src/lib.rs`,
   `src/App.tsx`)
 
-### 15. Selected period pill flashed white→transparent on a light→dark switch
+### 17. Selected period pill flashed white→transparent on a light→dark switch
 
 - **Symptom**: After the fix above, switching the system theme from light to dark
   while the popover was hidden, then opening it, showed a brief "white →
@@ -223,7 +279,7 @@ fix. Newest first. Useful as a reference for similar issues.
   Day/Week/Month still animates). Skipped on the very first render.
   (`src/main.tsx`, `src/App.tsx`)
 
-### 16. Total-tokens split bar didn't fill — gray track showed through
+### 18. Total-tokens split bar didn't fill — gray track showed through
 
 - **Symptom**: The split bar under Total tokens was only partly filled, leaving
   gray track visible on the right. It was most obvious with a lopsided split.

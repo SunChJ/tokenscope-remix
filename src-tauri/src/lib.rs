@@ -312,6 +312,43 @@ fn refresh(app: &tauri::AppHandle) {
     let _ = app.emit("dashboard-updated", &dash);
 }
 
+/// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
+/// change at most a few times a day, so back-to-back clicks inside this window
+/// coalesce into one fetch.
+const FORCE_COOLDOWN_MS: i64 = 30_000;
+static LAST_FORCE_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Off-thread, silent price-table refresh (models.dev + LiteLLM) bypassing the
+/// 24h cache, folded into the tray's "Refresh" item. Returns immediately; once
+/// the new table is swapped in, refresh() pushes dashboard-updated so an open
+/// panel re-prices live, same silent path as the 30s background poll (no
+/// loading state, no UI feedback). Throttled to one per FORCE_COOLDOWN_MS via
+/// compare_exchange (fixed window, not sliding) so rapid clicks can't spawn
+/// concurrent fetches racing on the cache.
+fn refresh_pricing_bg(app: &tauri::AppHandle) {
+    let now = now_ms();
+    loop {
+        let prev = LAST_FORCE_MS.load(Ordering::Relaxed);
+        if now - prev < FORCE_COOLDOWN_MS {
+            return;
+        }
+        match LAST_FORCE_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        pricing::Pricing::reload_shared(true);
+        refresh(&handle);
+    });
+}
+
+#[tauri::command]
+fn refresh_pricing(app: tauri::AppHandle) {
+    refresh_pricing_bg(&app);
+}
+
 // ── Launch-at-login preference ──────────────────────────────────────
 // Persisted in the data dir so it survives restarts and updates. The
 // on/off toggle lives in the tray's right-click menu; on startup we reconcile
@@ -1029,7 +1066,8 @@ pub fn run() {
             begin_drag,
             set_dashboard_shortcut,
             get_app_language,
-            set_app_language
+            set_app_language,
+            refresh_pricing
         ])
         .setup(move |app| {
             // Menu-bar–only app: no Dock icon, runs in the background.
@@ -1351,7 +1389,10 @@ pub fn run() {
                 })
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "open" => show_popover(app),
-                    "refresh" => refresh(app),
+                    "refresh" => {
+                        refresh(app);
+                        refresh_pricing_bg(app);
+                    }
                     "check-updates" => {
                         show_popover(app);
                         let _ = app.emit("check-for-updates", ());
@@ -1446,7 +1487,7 @@ pub fn run() {
             // while BUILD_LOCK is held.
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
-                pricing::Pricing::reload_shared();
+                pricing::Pricing::reload_shared(false);
                 // Rebuild immediately with the newly loaded prices. Otherwise
                 // an open panel can keep showing the startup built-in snapshot
                 // (and false "without pricing data" warnings) until the next
