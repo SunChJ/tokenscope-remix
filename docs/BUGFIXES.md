@@ -54,9 +54,9 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ### 4. Cache tokens priced at $0, undercounting Claude cost ~4×
 
-- **Symptom**: Claude's monthly cost read far too low ($328 where the real
-  API-equivalent figure was $1409), while Codex looked correct. The error came
-  and went depending on which model was in use.
+- **Symptom**: Claude's monthly cost read several-fold too low (~4× on the logs
+  it was found with), while Codex looked correct. The error came and went
+  depending on which model was in use.
 - **Cause**: models.dev lists the same model under many providers (first-party
   vendor plus resellers / gateways / clouds). `ingest_modelsdev` is
   first-writer-wins over providers iterated in key order — and `serde_json`
@@ -65,9 +65,10 @@ fix. Newest first. Useful as a reference for similar issues.
   alphabetically first provider won. For `claude-fable-5` that is `abacus`,
   whose entry is not a cheaper price but an **incomplete record**: identical
   `input`/`output` to Anthropic's, with `cache_read`/`cache_write` simply
-  absent, so both defaulted to `0`. Claude Code usage is ~98% cache-read
-  tokens, so this charged for only ~2% of the volume. `claude-sonnet-5` was
-  worse — the shadowing entry also carried a 50% higher input price.
+  absent, so both defaulted to `0`. Claude Code usage is ~95%+ cache-read
+  tokens, so this charged for only a small fraction of the volume.
+  `claude-sonnet-5` was worse — the shadowing entry also carried a 50% higher
+  input price.
 - **Fix**: Added `is_first_party()` and ordered entries best-first in
   `pricing.rs`: the model's first-party vendor, then entries that actually
   carry cache pricing, then bare ids over `vendor/model` duplicates. Ported
@@ -75,9 +76,9 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ### 5. Forked Codex threads double-counted their parent's history
 
-- **Symptom**: Codex token totals ran high — measured 8.5% (day), 4.7% (week),
-  5.7% (month) — and the model breakdown didn't sum to Total tokens. Some
-  events were attributed to the wrong session and project.
+- **Symptom**: Codex token totals ran high by a single-digit percentage, varying
+  by period, and the model breakdown didn't sum to Total tokens. Some events
+  were attributed to the wrong session and project.
 - **Cause**: Codex forks a subagent/resumed thread by replaying the parent
   thread's **entire history** — `token_count`, `task_started`/`task_complete`,
   tool calls, even the parent's `session_meta` — into the head of the child's
@@ -90,11 +91,11 @@ fix. Newest first. Useful as a reference for similar issues.
   breakdown, and cost.
 - **Fix**: `FileState` gained `replaying`/`meta_seen`; a file whose
   `session_meta` names a `forked_from_id`/`parent_thread_id` skips **every**
-  line until its own first `turn_context`. The window is unambiguous: across
-  131 fresh sessions there were zero `token_count` lines before the first
-  `turn_context`, versus 7234 in forked ones — and all 7234 were verified to
-  still have an exact usage match in a parent file, so nothing is lost.
-  Bumped `STORE_VERSION` to 9 for a one-time rescan.
+  line until its own first `turn_context`. The window is unambiguous: fresh
+  sessions emit no `token_count` lines before their first `turn_context`, while
+  forked ones emit many — and every replayed event sampled was verified to still
+  have an exact usage match in a parent file, so nothing is lost. Bumped
+  `STORE_VERSION` to 9 for a one-time rescan.
 - **Known limitation**: this is a *window skip*, not content-level dedup, so it
   assumes the parent rollout file is still on disk. Existing installs are safe
   (the event cache retains what it already ingested), but Codex rotates
