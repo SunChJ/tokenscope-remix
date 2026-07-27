@@ -14,7 +14,7 @@
 use crate::model::Quota;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -178,10 +178,17 @@ pub struct Store {
 //   v9: drop the replayed parent history at the head of a forked Codex thread
 //       (it was double-counting tokens and turn telemetry).
 const STORE_VERSION: u32 = 9;
-const QUOTA_CACHE_VERSION: u32 = 1;
+// v2: quota pools are determined by the active model. Recent Codex logs report
+// Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
+// the other Codex models have independent allowances.
+// v3: during the v2 migration, fully read source files that contain Spark
+// usage. A session can switch away from Spark after its last Spark snapshot,
+// leaving its model context outside the usual 64 KiB quota-file tail.
+const QUOTA_CACHE_VERSION: u32 = 3;
 const PROJECT_CACHE_VERSION: u32 = 1;
 const TELEMETRY_CACHE_VERSION: u32 = 1;
-// One-time quota migration: at most 32 × 64 KiB = 2 MiB of log content.
+// One-time quota migration: tail the 32 newest files, and fully read only
+// files which already contain Spark usage in the local event cache.
 const RECENT_QUOTA_FILES: usize = 32;
 const QUOTA_TAIL_BYTES: u64 = 64 * 1024;
 
@@ -297,6 +304,38 @@ fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
     }
 }
 
+const CODEX_QUOTA_POOL: &str = "codex";
+const SPARK_QUOTA_POOL: &str = "codex_bengalfox";
+
+fn is_codex_spark_model(model: &str) -> bool {
+    let model = model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    model == "gpt-5.3-codex-spark" || model.starts_with("gpt-5.3-codex-spark-")
+}
+
+/// Assign a quota snapshot to the pool consumed by its active model.
+///
+/// Codex now emits `limit_id: "codex"` for Spark turns as well, so that raw
+/// id cannot distinguish the two independent pools. The old ids are retained
+/// only as a fallback for pre-model/legacy records.
+fn codex_quota_pool(model: &str, rl: &serde_json::Value) -> Option<&'static str> {
+    if is_codex_spark_model(model) {
+        return Some(SPARK_QUOTA_POOL);
+    }
+    if !model.trim().is_empty() {
+        return Some(CODEX_QUOTA_POOL);
+    }
+    match rl.get("limit_id").and_then(|value| value.as_str()) {
+        None | Some(CODEX_QUOTA_POOL) => Some(CODEX_QUOTA_POOL),
+        Some(SPARK_QUOTA_POOL) => Some(SPARK_QUOTA_POOL),
+        _ => None,
+    }
+}
+
 impl Store {
     /// Load persisted events + offset manifest (empty on first run).
     pub fn load() -> Self {
@@ -403,6 +442,9 @@ impl Store {
             store.rebuild_codex_quotas();
             if let Some(dir) = cache_dir() {
                 store.save_quota_cache(&dir);
+                // The quota trend uses the same pool id as the current
+                // snapshot, so persist the rebuilt history with it.
+                store.save_telemetry_cache(&dir);
             }
         }
         if version_ok && store.refresh_projects() {
@@ -488,6 +530,14 @@ impl Store {
     fn rebuild_codex_quotas(&mut self) {
         self.codex_quota = None;
         self.codex_spark_quota = None;
+        self.quota_history.clear();
+        let spark_sources: HashSet<String> = self
+            .events
+            .iter()
+            .filter(|event| is_codex_spark_model(&event.model))
+            .map(|event| event.source.clone())
+            .filter(|source| !source.is_empty())
+            .collect();
         let Some(root) = codex_dir() else {
             return;
         };
@@ -506,16 +556,29 @@ impl Store {
                 Some((modified, entry.into_path()))
             })
             .collect();
-        files.sort_by_key(|item| std::cmp::Reverse(item.0));
+        // Read the recent files oldest-first so quota history remains ordered.
+        // `update_codex_quota` still compares timestamps before replacing a
+        // current snapshot, so this is safe if filesystem mtimes are imperfect.
+        files.sort_by_key(|item| item.0);
+        let recent_start = files.len().saturating_sub(RECENT_QUOTA_FILES);
 
-        for (_, path) in files.into_iter().take(RECENT_QUOTA_FILES) {
-            let Ok(mut file) = fs::File::open(path) else {
+        for (index, (_, path)) in files.into_iter().enumerate() {
+            let key = path.to_string_lossy().to_string();
+            let full_scan = spark_sources.contains(&key);
+            if index < recent_start && !full_scan {
+                continue;
+            }
+            let Ok(mut file) = fs::File::open(&path) else {
                 continue;
             };
             let Ok(size) = file.metadata().map(|meta| meta.len()) else {
                 continue;
             };
-            let start = size.saturating_sub(QUOTA_TAIL_BYTES);
+            let start = if full_scan {
+                0
+            } else {
+                size.saturating_sub(QUOTA_TAIL_BYTES)
+            };
             if file.seek(SeekFrom::Start(start)).is_err() {
                 continue;
             }
@@ -532,12 +595,32 @@ impl Store {
                     .map(|i| i + 1)
                     .unwrap_or(bytes.len())
             };
-            let mut state = FileState::default();
+            // Tails usually begin after their last turn_context, so seed them
+            // with the final model from normal ingest. Spark source files are
+            // read from their start, where each turn_context is available.
+            // Keep `source` blank so this quota-only migration cannot alter
+            // persisted turn telemetry.
+            let mut state = if full_scan {
+                FileState::default()
+            } else {
+                self.manifest.files.get(&key).cloned().unwrap_or_default()
+            };
+            state.source.clear();
             for line in bytes[skip..].split(|byte| *byte == b'\n') {
                 let Ok(text) = std::str::from_utf8(line) else {
                     continue;
                 };
-                if text.contains("\"rate_limits\"") {
+                // `session_meta` is what arms the forked-thread replay skip, so
+                // a full scan must feed it through too — otherwise `replaying`
+                // never gets set and the parent's restamped rate_limits (216 in
+                // one sampled fork, all stamped with the fork instant) would be
+                // ingested as fresh quota readings. Tails don't need it: they
+                // inherit the flag from the manifest and start well past the
+                // replay window anyway.
+                if text.contains("\"session_meta\"")
+                    || text.contains("\"turn_context\"")
+                    || text.contains("\"rate_limits\"")
+                {
                     let _ = self.parse_codex_line(text, &mut state);
                 }
             }
@@ -915,7 +998,7 @@ impl Store {
                     _ => return None,
                 }
                 if let Some(rl) = payload.get("rate_limits") {
-                    self.update_codex_quota(rl, ts_ms);
+                    self.update_codex_quota(rl, ts_ms, &state.model);
                 }
                 // Per-turn delta. `input_tokens` INCLUDES `cached_input_tokens`
                 // (unlike Claude, where cache_read is separate) — subtract so
@@ -1130,15 +1213,15 @@ impl Store {
         parse_claude_value(&value)
     }
 
-    /// Keep the newest rate-limit snapshot (files are walked in arbitrary order,
-    /// so compare timestamps rather than trusting encounter order).
-    fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64) {
-        let limit_id = match rl.get("limit_id").and_then(|value| value.as_str()) {
-            None | Some("codex") => "codex",
-            Some("codex_bengalfox") => "codex_bengalfox",
-            _ => return,
+    /// Keep the newest rate-limit snapshot. Spark and standard Codex models
+    /// consume separate pools, but recent JSONL snapshots no longer reflect
+    /// that in `rate_limits.limit_id`; classify known models before using the
+    /// legacy limit id as a fallback.
+    fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64, model: &str) {
+        let Some(limit_id) = codex_quota_pool(model, rl) else {
+            return;
         };
-        let previous = if limit_id == "codex" {
+        let previous = if limit_id == CODEX_QUOTA_POOL {
             self.codex_quota.as_ref()
         } else {
             self.codex_spark_quota.as_ref()
@@ -1170,7 +1253,7 @@ impl Store {
             as_of_ms: ts_ms,
         };
         self.record_quota_history(limit_id, &quota);
-        if limit_id == "codex" {
+        if limit_id == CODEX_QUOTA_POOL {
             self.codex_quota = Some(quota);
         } else {
             self.codex_spark_quota = Some(quota);
@@ -1510,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_general_and_spark_quotas_separate() {
+    fn keeps_spark_and_standard_codex_quotas_separate_by_model() {
         let mut store = empty_store();
         let snapshot = |limit_id: &str, used_percent: f64| {
             serde_json::json!({
@@ -1523,13 +1606,60 @@ mod tests {
             })
         };
 
-        store.update_codex_quota(&snapshot("codex", 24.0), 100);
-        store.update_codex_quota(&snapshot("codex_bengalfox", 7.0), 200);
-        store.update_codex_quota(&snapshot("codex", 24.05), 300);
+        // Recent Spark JSONL events use `limit_id: codex`; model identity must
+        // still put that weekly usage in Spark's independent pool.
+        store.update_codex_quota(&snapshot("codex", 7.0), 100, "gpt-5.3-codex-spark");
+        store.update_codex_quota(&snapshot("codex", 24.05), 200, "gpt-5.6-sol");
+        // Conversely, a stale legacy id cannot move a non-Spark model into
+        // Spark's pool.
+        store.update_codex_quota(
+            &snapshot("codex_bengalfox", 24.1),
+            300,
+            "gpt-5.6-sol",
+        );
 
-        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.05);
+        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.1);
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
         assert_eq!(store.quota_history.len(), 2);
+    }
+
+    #[test]
+    fn uses_legacy_limit_id_only_when_model_is_unavailable() {
+        let legacy_spark = serde_json::json!({
+            "limit_id": "codex_bengalfox",
+            "primary": {
+                "used_percent": 7.0,
+                "window_minutes": 10080,
+                "resets_at": 123
+            }
+        });
+
+        assert_eq!(
+            codex_quota_pool("", &legacy_spark),
+            Some(SPARK_QUOTA_POOL)
+        );
+        assert_eq!(
+            codex_quota_pool("chatgpt/gpt-5.3-codex-spark", &legacy_spark),
+            Some(SPARK_QUOTA_POOL)
+        );
+        assert_eq!(
+            codex_quota_pool("gpt-5.6-sol", &legacy_spark),
+            Some(CODEX_QUOTA_POOL)
+        );
+    }
+
+    #[test]
+    fn routes_codex_limit_id_to_spark_after_a_spark_turn_context() {
+        let mut store = empty_store();
+        let mut state = FileState::default();
+        let spark_context = r#"{"timestamp":"2026-07-15T09:50:00Z","type":"turn_context","payload":{"model":"gpt-5.3-codex-spark","turn_id":"spark-turn"}}"#;
+        let spark_usage = r#"{"timestamp":"2026-07-15T09:51:13Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":21,"window_minutes":10080,"resets_at":1784684425}}}}"#;
+
+        assert!(store.parse_codex_line(spark_context, &mut state).is_none());
+        assert!(store.parse_codex_line(spark_usage, &mut state).is_some());
+
+        assert!(store.codex_quota.is_none());
+        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 21.0);
     }
 
     // A forked/subagent thread replays the parent's whole history — usage, turn
