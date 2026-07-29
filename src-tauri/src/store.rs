@@ -132,6 +132,10 @@ struct FileState {
     // first `turn_context`, which is where its own turns begin.
     #[serde(default)]
     replaying: bool,
+    // Position of the next usage event within `turn_id`. Together they form a
+    // Codex event's dedup id — see the `codex_event_id` doc comment.
+    #[serde(default)]
+    turn_seq: u64,
     // Whether this file's own `session_meta` (its first line) has been read.
     // Replayed parent metas follow it and must not overwrite session/cwd.
     #[serde(default)]
@@ -177,7 +181,11 @@ pub struct Store {
 //   v8: retain complete history for custom-range tracking and settlement.
 //   v9: drop the replayed parent history at the head of a forked Codex thread
 //       (it was double-counting tokens and turn telemetry).
-const STORE_VERSION: u32 = 9;
+//  v10: dedup Codex usage events by (turn id, position). v9 only caught replays
+//       that precede a fork's first turn_context; the common layout puts the
+//       replay *after* it, leaving ~80% of Codex tokens double-counted and the
+//       weekly quota pinned at the parent's stale reading.
+const STORE_VERSION: u32 = 10;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -287,6 +295,21 @@ fn stable_project_id(key: &str) -> String {
 
 fn telemetry_key(source: &str, turn_id: &str) -> String {
     format!("{source}\0{turn_id}")
+}
+
+/// Dedup id for a Codex usage event: its turn id plus its position within that
+/// turn. Codex `token_count` lines carry no id of their own, but a forked or
+/// resumed thread replays its parent's turns verbatim into the head of its own
+/// rollout file — same turn ids, same order, restamped with the fork instant.
+/// Keying on (turn, position) therefore identifies a replayed event as the one
+/// already ingested from the parent, the same way `message.id` does for Claude.
+/// Empty when the turn is unknown, which disables dedup for that event rather
+/// than risking a collision between unrelated turns.
+fn codex_event_id(state: &FileState) -> String {
+    if state.turn_id.is_empty() {
+        return String::new();
+    }
+    format!("codex:{}#{}", state.turn_id, state.turn_seq)
 }
 
 fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
@@ -784,12 +807,20 @@ impl Store {
 
     fn ingest_root(&mut self, agent: &'static str, root: &PathBuf) -> bool {
         let mut dirty = false;
-        for entry in WalkDir::new(root)
+        // Sort by path so a parent thread is ingested before the forks that
+        // replay it: Codex lays sessions out as YYYY/MM/DD/rollout-<ISO>-<id>,
+        // so path order is chronological. Codex dedup is first-writer-wins, and
+        // the first writer should be the original — the replay carries the fork
+        // instant instead of the turn's real timestamp.
+        let mut entries: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-        {
-            let path = entry.path();
+            .map(|e| e.into_path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let path = path.as_path();
             let key = path.to_string_lossy().to_string();
             let Ok(meta) = fs::metadata(path) else { continue };
             let size = meta.len();
@@ -926,6 +957,7 @@ impl Store {
                     if state.turn_id != turn_id {
                         state.turn_id = turn_id.to_string();
                         state.skills_seen.clear();
+                        state.turn_seq = 0;
                     }
                 }
                 None
@@ -937,6 +969,7 @@ impl Store {
                     if state.turn_id != turn_id {
                         state.turn_id = turn_id.to_string();
                         state.skills_seen.clear();
+                        state.turn_seq = 0;
                     }
                 }
                 match event_type {
@@ -997,9 +1030,6 @@ impl Store {
                     "token_count" => {}
                     _ => return None,
                 }
-                if let Some(rl) = payload.get("rate_limits") {
-                    self.update_codex_quota(rl, ts_ms, &state.model);
-                }
                 // Per-turn delta. `input_tokens` INCLUDES `cached_input_tokens`
                 // (unlike Claude, where cache_read is separate) — subtract so
                 // in_tok means "uncached new input" for both agents and
@@ -1011,7 +1041,27 @@ impl Store {
                 let out = g("output_tokens");
                 let reasoning = g("reasoning_output_tokens").min(out);
                 if raw_in + out <= 0.0 {
-                    return None; // rate-limit-only heartbeat, nothing to count
+                    // Rate-limit-only heartbeat: no usage to count, but the
+                    // reading itself is this thread's own and worth keeping.
+                    if let Some(rl) = payload.get("rate_limits") {
+                        self.update_codex_quota(rl, ts_ms, &state.model);
+                    }
+                    return None;
+                }
+                // Replay check must precede every side effect below. A forked
+                // thread reproduces its parent's turns verbatim — same turn ids,
+                // same order — so a usage event already seen under this
+                // (turn, position) is that replay, not new work. Counting it
+                // would double the tokens, duplicate the turn telemetry, and
+                // (worst) let the parent's stale rate_limits win the "newest
+                // snapshot" race, since the replay is restamped with the fork
+                // instant. That is what pinned the weekly quota at 100%.
+                let id = codex_event_id(state);
+                if !id.is_empty() && self.index.contains_key(&id) {
+                    return None;
+                }
+                if let Some(rl) = payload.get("rate_limits") {
+                    self.update_codex_quota(rl, ts_ms, &state.model);
                 }
                 let context_window = payload
                     .get("info")
@@ -1026,6 +1076,7 @@ impl Store {
                     turn.context_tokens = turn.context_tokens.max(raw_in);
                     turn.context_window = turn.context_window.max(context_window);
                 }
+                state.turn_seq += 1;
                 Some(RawEvent {
                     ts_ms,
                     session: state.session.clone(),
@@ -1036,7 +1087,7 @@ impl Store {
                     out_tok: out,
                     mcp: Vec::new(),
                     skills: Vec::new(),
-                    id: String::new(), // no message id; file purge keeps re-reads idempotent
+                    id,
                     source: String::new(),
                     agent: String::new(),
                 })
@@ -1660,6 +1711,130 @@ mod tests {
 
         assert!(store.codex_quota.is_none());
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 21.0);
+    }
+
+    // The replay is not always a head-of-file window. In the common Codex
+    // layout the fork's own turn_context sits at line ~7 and the parent's
+    // history is replayed *after* it, which the v9 window check disarmed on and
+    // therefore ingested. Dedup by (turn id, position) catches it regardless of
+    // layout: the replay reproduces the parent's turn ids in the same order, so
+    // the ids collide with what the parent file already contributed.
+    #[test]
+    fn dedupes_replayed_usage_that_follows_the_forks_first_turn_context() {
+        let mut store = empty_store();
+        let usage = |turn: &str, ts: &str, input: u64| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":0,"output_tokens":10}}}}}}}}"#
+            )
+            .replace("TURN", turn)
+        };
+        let context = |turn: &str, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.6-sol","turn_id":"{turn}"}}}}"#
+            )
+        };
+
+        // Parent thread: one turn, two usage events.
+        let mut parent = FileState {
+            source: "/tmp/parent.jsonl".to_string(),
+            session: "parent-1".to_string(),
+            ..FileState::default()
+        };
+        store.parse_codex_line(&context("turn-a", "2026-07-27T00:00:00Z"), &mut parent);
+        for (index, line) in [
+            usage("turn-a", "2026-07-27T00:00:01Z", 100),
+            usage("turn-a", "2026-07-27T00:00:02Z", 200),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let event = store
+                .parse_codex_line(line, &mut parent)
+                .expect("parent usage counts");
+            assert_eq!(event.id, format!("codex:turn-a#{index}"));
+            store.index.insert(event.id.clone(), store.events.len());
+            store.events.push(event);
+        }
+
+        // Forked child: its own turn_context first (so the v9 window is closed),
+        // then the parent's turn replayed verbatim, then its own new turn.
+        let mut child = FileState {
+            source: "/tmp/child.jsonl".to_string(),
+            session: "child-1".to_string(),
+            ..FileState::default()
+        };
+        let meta = r#"{"timestamp":"2026-07-27T01:00:00Z","type":"session_meta","payload":{"id":"child-1","forked_from_id":"parent-1","parent_thread_id":"parent-1"}}"#;
+        store.parse_codex_line(meta, &mut child);
+        store.parse_codex_line(&context("turn-own", "2026-07-27T01:00:00Z"), &mut child);
+        store.parse_codex_line(&context("turn-a", "2026-07-27T01:00:00Z"), &mut child);
+        for line in [
+            usage("turn-a", "2026-07-27T01:00:00Z", 100),
+            usage("turn-a", "2026-07-27T01:00:00Z", 200),
+        ] {
+            assert!(
+                store.parse_codex_line(&line, &mut child).is_none(),
+                "replayed usage must not be counted again"
+            );
+        }
+
+        // A genuinely new turn in the child still counts.
+        store.parse_codex_line(&context("turn-b", "2026-07-27T01:05:00Z"), &mut child);
+        let fresh = store
+            .parse_codex_line(&usage("turn-b", "2026-07-27T01:05:01Z", 300), &mut child)
+            .expect("the child's own work counts");
+        assert_eq!(fresh.id, "codex:turn-b#0");
+        assert_eq!(fresh.in_tok, 300.0);
+    }
+
+    // A replayed usage event must not update the quota either: it carries the
+    // parent's stale rate_limits restamped with the fork instant, so letting it
+    // through made a long-past 100% reading beat the real current one.
+    #[test]
+    fn replayed_rate_limits_do_not_overwrite_the_current_quota() {
+        let mut store = empty_store();
+        let line = |pct: f64, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":5,"cached_input_tokens":0,"output_tokens":1}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":100}}}}}}}}"#
+            )
+        };
+        let context = |turn: &str, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.6-sol","turn_id":"{turn}"}}}}"#
+            )
+        };
+
+        let mut parent = FileState {
+            source: "/tmp/p.jsonl".to_string(),
+            ..FileState::default()
+        };
+        store.parse_codex_line(&context("cap", "2026-07-23T00:00:00Z"), &mut parent);
+        let capped = store
+            .parse_codex_line(&line(100.0, "2026-07-23T00:00:01Z"), &mut parent)
+            .expect("real reading");
+        store.index.insert(capped.id.clone(), store.events.len());
+        store.events.push(capped);
+        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 100.0);
+
+        // The window rolled over; a real later reading drops back to 9%.
+        store.parse_codex_line(&context("now", "2026-07-29T00:00:00Z"), &mut parent);
+        let fresh = store
+            .parse_codex_line(&line(9.0, "2026-07-29T00:00:01Z"), &mut parent)
+            .expect("real reading");
+        store.index.insert(fresh.id.clone(), store.events.len());
+        store.events.push(fresh);
+        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 9.0);
+
+        // A fork now replays the capped turn, restamped as "now". It must not
+        // drag the displayed quota back to 100%.
+        let mut child = FileState {
+            source: "/tmp/c.jsonl".to_string(),
+            ..FileState::default()
+        };
+        store.parse_codex_line(&context("cap", "2026-07-29T00:05:00Z"), &mut child);
+        assert!(store
+            .parse_codex_line(&line(100.0, "2026-07-29T00:05:00Z"), &mut child)
+            .is_none());
+        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 9.0);
     }
 
     // A forked/subagent thread replays the parent's whole history — usage, turn
