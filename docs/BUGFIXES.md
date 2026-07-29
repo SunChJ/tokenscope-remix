@@ -76,9 +76,10 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ### 5. Forked Codex threads double-counted their parent's history
 
-- **Symptom**: Codex token totals ran high by a single-digit percentage, varying
-  by period, and the model breakdown didn't sum to Total tokens. Some events
-  were attributed to the wrong session and project.
+- **Symptom**: Codex token totals ran several-fold high — most of the ingested
+  Codex volume was duplicate — the model breakdown didn't sum to Total tokens,
+  some events were attributed to the wrong session and project, and the weekly
+  quota bar sat pinned at 100% long after the window had rolled over.
 - **Cause**: Codex forks a subagent/resumed thread by replaying the parent
   thread's **entire history** — `token_count`, `task_started`/`task_complete`,
   tool calls, even the parent's `session_meta` — into the head of the child's
@@ -89,21 +90,30 @@ fix. Newest first. Useful as a reference for similar issues.
   only set by `turn_context`, the replayed events also had an empty model, so
   they landed in Total tokens but were excluded from requests, the model
   breakdown, and cost.
-- **Fix**: `FileState` gained `replaying`/`meta_seen`; a file whose
-  `session_meta` names a `forked_from_id`/`parent_thread_id` skips **every**
-  line until its own first `turn_context`. The window is unambiguous: fresh
-  sessions emit no `token_count` lines before their first `turn_context`, while
-  forked ones emit many — and every replayed event sampled was verified to still
-  have an exact usage match in a parent file, so nothing is lost. Bumped
-  `STORE_VERSION` to 9 for a one-time rescan.
-- **Known limitation**: this is a *window skip*, not content-level dedup, so it
-  assumes the parent rollout file is still on disk. Existing installs are safe
-  (the event cache retains what it already ingested), but Codex rotates
-  `~/.codex/sessions`, so a **fresh install after a parent was rotated away
-  would silently lose that history**. A content-level key (session id +
-  original timestamp + usage tuple) would close this, but the replay restamps
-  timestamps, so the original would have to be recoverable first. Left as-is:
-  correct for every case observed, and strictly simpler.
+- **First attempt (v9, incomplete)**: `FileState` gained `replaying`/`meta_seen`
+  and a forked file skipped every line until its own first `turn_context`. That
+  assumed the replay always *precedes* the fork's first turn. It does in one
+  layout; in the more common one the fork's `turn_context` sits at line ~7 and
+  the parent's history is replayed **after** it, so the window closed
+  immediately and the replay was ingested anyway. The window check caught a
+  small minority of replayed events and missed an order of magnitude more.
+- **Why the first verification missed it**: the parser was reconciled against a
+  "ground truth" that summed every `token_count` in the raw logs. Both sides
+  shared the same duplicate-counting flaw, so agreeing to 0.01% proved only that
+  they were consistent, not that either was right. A reconciliation has to be
+  derived independently of the code under test.
+- **Fix (v10)**: dedup by content instead of by position. Codex `token_count`
+  lines carry no id, but a replay reproduces the parent's turns verbatim — same
+  turn ids, same order — so `(turn_id, position-within-turn)` identifies a
+  replayed event as one already ingested, exactly the way `message.id` does for
+  Claude. The check runs *before* any side effect, so a replay can no longer
+  double-count tokens, duplicate turn telemetry, or let the parent's stale
+  `rate_limits` win the newest-snapshot race. Files are now walked in path order
+  (chronological for Codex's `YYYY/MM/DD/rollout-<ISO>` layout) so the original,
+  not the restamped replay, is the first writer. `STORE_VERSION` 10.
+- **Known limitation**: dedup needs a turn id. Events parsed before any
+  `turn_context` is seen get no id and are still counted as-is; that is the
+  conservative direction (keep, don't drop), and such events are rare.
 
 ---
 
