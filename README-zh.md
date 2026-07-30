@@ -44,7 +44,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 
 ### 关键处理
 - Claude：按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
-- Codex：取 `token_count` 事件的每回合增量（`last_token_usage`），模型归属来自前置的 `turn_context`；Codex 的 `cached_input_tokens` 是其 `input_tokens` 的**子集**，已拆分成与 Claude 一致的独立 cache-read 口径——跨 Agent 的 token 数可直接对比
+- Codex：由独立 adapter 将单次响应的精确 `last_token_usage` 与累计 `total_token_usage` 快照交叉校验，quota-only 重复事件和 fork 回放不会被当成新用量；持久化回放使用稳定的 `(turn, 累计快照)` ID 去重，并从包含缓存的 `input_tokens` 中分别拆出 `cached_input_tokens` 与 `cache_write_input_tokens`，形成可与 Claude 对比的四类统计口径
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
 - 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**

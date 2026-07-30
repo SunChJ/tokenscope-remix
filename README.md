@@ -44,7 +44,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 
 ### Key processing
 - Claude: deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
-- Codex: per-turn deltas from `token_count` events (`last_token_usage`), model attribution from the preceding `turn_context`; Codex's `cached_input_tokens` is a *subset* of its `input_tokens`, so it's split out to match Claude's separate cache-read accounting — token math is comparable across agents
+- Codex: a dedicated adapter cross-checks exact per-response `last_token_usage` against the accumulated `total_token_usage` snapshot, so quota-only repeats and fork replays are not counted as new work; stable `(turn, total snapshot)` ids deduplicate persisted replays, while `cached_input_tokens` and `cache_write_input_tokens` are split out of Codex's inclusive `input_tokens` for comparable four-category accounting
 - Token split: `input` (uncached) / `cache` (creation+read) / `output`; the UI folds cache into "In" by default and shows a separate "cached %"
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins
 - Cost is priced per the four token types; each model carries a `priced` flag — **models not found in either source still count tokens but are labelled "no price" in the UI**

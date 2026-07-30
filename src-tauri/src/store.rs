@@ -11,6 +11,7 @@
 // Two sources are ingested, normalized to the same RawEvent shape:
 //   claude — ~/.claude/projects/**/*.jsonl   (assistant messages)
 //   codex  — ~/.codex/sessions/**/*.jsonl    (token_count turn deltas)
+use crate::codex_adapter::{self, TokenCountOutcome};
 use crate::model::Quota;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
@@ -79,8 +80,8 @@ pub struct RawEvent {
     pub session: String,
     pub model: String, // raw model id (price lookup), normalized later for grouping
     pub in_tok: f64,   // uncached new input only (both agents)
-    pub cc: f64, // cache creation (claude only; codex has no such concept → 0)
-    pub cr: f64, // cache read (codex: cached_input_tokens, a subset of its raw input)
+    pub cc: f64,       // cache creation/write
+    pub cr: f64,       // cache read (codex: cached_input_tokens, a subset of its raw input)
     pub out_tok: f64,
     pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
     pub skills: Vec<String>, // all detected Skill ids called (unfiltered)
@@ -132,10 +133,11 @@ struct FileState {
     // first `turn_context`, which is where its own turns begin.
     #[serde(default)]
     replaying: bool,
-    // Position of the next usage event within `turn_id`. Together they form a
-    // Codex event's dedup id — see the `codex_event_id` doc comment.
+    // Codex cumulative usage cursor. A positive last_token_usage can be emitted
+    // repeatedly while this total stays unchanged, especially for quota-only
+    // updates, so it must survive incremental reads and app restarts.
     #[serde(default)]
-    turn_seq: u64,
+    codex_usage: codex_adapter::State,
     // Whether this file's own `session_meta` (its first line) has been read.
     // Replayed parent metas follow it and must not overwrite session/cwd.
     #[serde(default)]
@@ -148,6 +150,10 @@ struct FileState {
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
     files: HashMap<String, FileState>,
+    // Stable token-count payload fingerprint -> original source file. This
+    // prevents a fork's restamped replay from mutating either usage or quota.
+    #[serde(default)]
+    codex_token_counts: HashMap<String, String>,
 }
 
 pub struct Store {
@@ -185,7 +191,10 @@ pub struct Store {
 //       that precede a fork's first turn_context; the common layout puts the
 //       replay *after* it, leaving ~80% of Codex tokens double-counted and the
 //       weekly quota pinned at the parent's stale reading.
-const STORE_VERSION: u32 = 10;
+//  v11: route Codex through its own cumulative-snapshot adapter. Stable
+//       (turn,total) ids replace position ids; unchanged totals are quota-only
+//       repeats; cache-write usage is split and priced independently.
+const STORE_VERSION: u32 = 11;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -295,21 +304,6 @@ fn stable_project_id(key: &str) -> String {
 
 fn telemetry_key(source: &str, turn_id: &str) -> String {
     format!("{source}\0{turn_id}")
-}
-
-/// Dedup id for a Codex usage event: its turn id plus its position within that
-/// turn. Codex `token_count` lines carry no id of their own, but a forked or
-/// resumed thread replays its parent's turns verbatim into the head of its own
-/// rollout file — same turn ids, same order, restamped with the fork instant.
-/// Keying on (turn, position) therefore identifies a replayed event as the one
-/// already ingested from the parent, the same way `message.id` does for Claude.
-/// Empty when the turn is unknown, which disables dedup for that event rather
-/// than risking a collision between unrelated turns.
-fn codex_event_id(state: &FileState) -> String {
-    if state.turn_id.is_empty() {
-        return String::new();
-    }
-    format!("codex:{}#{}", state.turn_id, state.turn_seq)
 }
 
 fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
@@ -786,6 +780,9 @@ impl Store {
         self.rebuild_index();
         self.turns.retain(|turn| turn.source != key);
         self.rebuild_telemetry_index();
+        self.manifest
+            .codex_token_counts
+            .retain(|_, source| source != key);
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files across
@@ -914,8 +911,14 @@ impl Store {
         let payload = v.get("payload")?;
         let line_type = v.get("type")?.as_str()?;
         // A forked thread replays its parent's history before its own first
-        // turn_context. Drop that whole window (see FileState::replaying).
+        // turn_context. Drop that whole window, but retain the final cumulative
+        // token snapshot as the baseline for the child's first own event.
         if state.replaying && line_type != "turn_context" {
+            if line_type == "event_msg"
+                && payload.get("type").and_then(|value| value.as_str()) == Some("token_count")
+            {
+                state.codex_usage.remember_total(payload.get("info"));
+            }
             return None;
         }
         match line_type {
@@ -957,7 +960,6 @@ impl Store {
                     if state.turn_id != turn_id {
                         state.turn_id = turn_id.to_string();
                         state.skills_seen.clear();
-                        state.turn_seq = 0;
                     }
                 }
                 None
@@ -969,7 +971,6 @@ impl Store {
                     if state.turn_id != turn_id {
                         state.turn_id = turn_id.to_string();
                         state.skills_seen.clear();
-                        state.turn_seq = 0;
                     }
                 }
                 match event_type {
@@ -1030,34 +1031,47 @@ impl Store {
                     "token_count" => {}
                     _ => return None,
                 }
-                // Per-turn delta. `input_tokens` INCLUDES `cached_input_tokens`
-                // (unlike Claude, where cache_read is separate) — subtract so
-                // in_tok means "uncached new input" for both agents and
-                // in + cr + out reproduces Codex's own total.
-                let usage = payload.get("info")?.get("last_token_usage")?;
-                let g = |k: &str| usage.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let raw_in = g("input_tokens");
-                let cached = g("cached_input_tokens").min(raw_in);
-                let out = g("output_tokens");
-                let reasoning = g("reasoning_output_tokens").min(out);
-                if raw_in + out <= 0.0 {
-                    // Rate-limit-only heartbeat: no usage to count, but the
-                    // reading itself is this thread's own and worth keeping.
+                let info = payload.get("info");
+                let fingerprint = if state.source.is_empty() || state.turn_id.is_empty() {
+                    None
+                } else {
+                    Some(codex_adapter::token_count_fingerprint(
+                        &state.turn_id,
+                        info,
+                        payload.get("rate_limits"),
+                    ))
+                };
+                let already_seen = fingerprint
+                    .as_ref()
+                    .is_some_and(|id| self.manifest.codex_token_counts.contains_key(id));
+
+                // Always advance the per-file cumulative cursor, including for
+                // replays. Side effects are allowed only for the first original
+                // occurrence of this timestamp-independent payload.
+                let outcome = state.codex_usage.observe(info, &state.turn_id);
+                if already_seen {
+                    return None;
+                }
+                if let Some(fingerprint) = fingerprint {
+                    self.manifest
+                        .codex_token_counts
+                        .insert(fingerprint, state.source.clone());
+                }
+
+                let TokenCountOutcome::Usage(usage) = outcome else {
+                    // Estimated context snapshots and unchanged-total quota
+                    // heartbeats are not new upstream usage.
                     if let Some(rl) = payload.get("rate_limits") {
                         self.update_codex_quota(rl, ts_ms, &state.model);
                     }
                     return None;
-                }
-                // Replay check must precede every side effect below. A forked
-                // thread reproduces its parent's turns verbatim — same turn ids,
-                // same order — so a usage event already seen under this
-                // (turn, position) is that replay, not new work. Counting it
-                // would double the tokens, duplicate the turn telemetry, and
-                // (worst) let the parent's stale rate_limits win the "newest
-                // snapshot" race, since the replay is restamped with the fork
-                // instant. That is what pinned the weekly quota at 100%.
-                let id = codex_event_id(state);
-                if !id.is_empty() && self.index.contains_key(&id) {
+                };
+
+                // A replay can carry a different rate-limit payload while still
+                // naming the same upstream response. The stable (turn,total)
+                // usage id is the second line of defense and must precede quota
+                // and telemetry side effects.
+                if !usage.event_id.is_empty() && self.index.contains_key(&usage.event_id) {
                     return None;
                 }
                 if let Some(rl) = payload.get("rate_limits") {
@@ -1069,25 +1083,25 @@ impl Store {
                     .and_then(|value| value.as_f64())
                     .unwrap_or(0.0);
                 if let Some(turn) = self.turn_mut(state, AGENT_CODEX, ts_ms) {
-                    turn.input_tokens += raw_in - cached;
-                    turn.cache_read_tokens += cached;
-                    turn.output_tokens += out;
-                    turn.reasoning_tokens += reasoning;
-                    turn.context_tokens = turn.context_tokens.max(raw_in);
+                    turn.input_tokens += usage.input_tokens as f64;
+                    turn.cache_creation_tokens += usage.cache_write_input_tokens as f64;
+                    turn.cache_read_tokens += usage.cache_read_input_tokens as f64;
+                    turn.output_tokens += usage.output_tokens as f64;
+                    turn.reasoning_tokens += usage.reasoning_output_tokens as f64;
+                    turn.context_tokens = turn.context_tokens.max(usage.raw_input_tokens as f64);
                     turn.context_window = turn.context_window.max(context_window);
                 }
-                state.turn_seq += 1;
                 Some(RawEvent {
                     ts_ms,
                     session: state.session.clone(),
                     model: state.model.clone(),
-                    in_tok: raw_in - cached,
-                    cc: 0.0,
-                    cr: cached,
-                    out_tok: out,
+                    in_tok: usage.input_tokens as f64,
+                    cc: usage.cache_write_input_tokens as f64,
+                    cr: usage.cache_read_input_tokens as f64,
+                    out_tok: usage.output_tokens as f64,
                     mcp: Vec::new(),
                     skills: Vec::new(),
-                    id,
+                    id: usage.event_id,
                     source: String::new(),
                     agent: String::new(),
                 })
@@ -1713,20 +1727,151 @@ mod tests {
         assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 21.0);
     }
 
+    #[test]
+    fn ignores_unchanged_codex_usage_but_keeps_its_new_quota() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/codex-heartbeat.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let context = |turn: &str| {
+            format!(
+                r#"{{"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5.6-sol","turn_id":"{turn}"}}}}"#
+            )
+        };
+        let token_count = |ts: &str, last_input: u64, total_input: u64, pct: f64| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{last_input},"cached_input_tokens":0,"output_tokens":10,"total_tokens":{last_total}}},"total_token_usage":{{"input_tokens":{total_input},"cached_input_tokens":0,"output_tokens":{total_output},"total_tokens":{total}}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":200}}}}}}}}"#,
+                last_total = last_input + 10,
+                total_output = if total_input == 100 { 10 } else { 20 },
+                total = total_input + if total_input == 100 { 10 } else { 20 },
+            )
+        };
+
+        store.parse_codex_line(&context("turn-a"), &mut state);
+        let first = store
+            .parse_codex_line(
+                &token_count("2026-07-30T00:00:01Z", 100, 100, 10.0),
+                &mut state,
+            )
+            .expect("first response counts");
+        store.index.insert(first.id.clone(), store.events.len());
+        store.events.push(first);
+
+        // A new turn starts by publishing fresher quota with the previous
+        // positive last_token_usage and an unchanged accumulated total.
+        store.parse_codex_line(&context("turn-b"), &mut state);
+        assert!(store
+            .parse_codex_line(
+                &token_count("2026-07-30T00:00:02Z", 100, 100, 11.0),
+                &mut state,
+            )
+            .is_none());
+        assert_eq!(store.events.len(), 1);
+        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 11.0);
+
+        let second = store
+            .parse_codex_line(
+                &token_count("2026-07-30T00:00:03Z", 100, 200, 12.0),
+                &mut state,
+            )
+            .expect("next completed response counts");
+        assert_eq!(second.in_tok, 100.0);
+        assert_ne!(second.id, store.events[0].id);
+    }
+
+    #[test]
+    fn counts_new_cumulative_snapshots_when_codex_returns_to_an_old_turn_id() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/codex-returned-turn.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let context = |turn: &str| {
+            format!(
+                r#"{{"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{{"model":"gpt-5.6-sol","turn_id":"{turn}"}}}}"#
+            )
+        };
+        let usage = |total_input: u64| {
+            let total_output = total_input / 10;
+            serde_json::json!({
+                "timestamp": "2026-07-30T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 100,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 10,
+                            "total_tokens": 110
+                        },
+                        "total_token_usage": {
+                            "input_tokens": total_input,
+                            "cached_input_tokens": 0,
+                            "output_tokens": total_output,
+                            "total_tokens": total_input + total_output
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+
+        for (turn, total_input) in [("turn-a", 100), ("turn-b", 200), ("turn-a", 300)] {
+            store.parse_codex_line(&context(turn), &mut state);
+            let event = store
+                .parse_codex_line(&usage(total_input), &mut state)
+                .expect("each new cumulative snapshot counts");
+            assert!(!store.index.contains_key(&event.id));
+            store.index.insert(event.id.clone(), store.events.len());
+            store.events.push(event);
+        }
+
+        assert_eq!(store.events.len(), 3);
+        assert_eq!(store.events.iter().map(|event| event.in_tok).sum::<f64>(), 300.0);
+    }
+
+    #[test]
+    fn stores_codex_cache_write_as_its_own_pricing_category() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/codex-cache-write.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let context = r#"{"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","turn_id":"turn-cache"}}"#;
+        let usage = r#"{"timestamp":"2026-07-30T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}"#;
+
+        store.parse_codex_line(context, &mut state);
+        let event = store
+            .parse_codex_line(usage, &mut state)
+            .expect("cache-write response counts");
+
+        assert_eq!(event.in_tok, 10.0);
+        assert_eq!(event.cc, 50.0);
+        assert_eq!(event.cr, 40.0);
+        assert_eq!(event.out_tok, 10.0);
+        let turn = store.turns.first().expect("turn telemetry");
+        assert_eq!(turn.input_tokens, 10.0);
+        assert_eq!(turn.cache_creation_tokens, 50.0);
+        assert_eq!(turn.cache_read_tokens, 40.0);
+        assert_eq!(turn.output_tokens, 10.0);
+    }
+
     // The replay is not always a head-of-file window. In the common Codex
     // layout the fork's own turn_context sits at line ~7 and the parent's
     // history is replayed *after* it, which the v9 window check disarmed on and
-    // therefore ingested. Dedup by (turn id, position) catches it regardless of
-    // layout: the replay reproduces the parent's turn ids in the same order, so
-    // the ids collide with what the parent file already contributed.
+    // therefore ingested. Stable (turn id, cumulative snapshot) ids catch it
+    // regardless of layout without conflating later work in a resumed turn.
     #[test]
     fn dedupes_replayed_usage_that_follows_the_forks_first_turn_context() {
         let mut store = empty_store();
-        let usage = |turn: &str, ts: &str, input: u64| {
+        let usage = |ts: &str, input: u64, total_input: u64, total_output: u64| {
             format!(
-                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":0,"output_tokens":10}}}}}}}}"#
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":0,"output_tokens":10,"total_tokens":{last_total}}},"total_token_usage":{{"input_tokens":{total_input},"cached_input_tokens":0,"output_tokens":{total_output},"total_tokens":{total}}}}}}}}}"#,
+                last_total = input + 10,
+                total = total_input + total_output,
             )
-            .replace("TURN", turn)
         };
         let context = |turn: &str, ts: &str| {
             format!(
@@ -1741,17 +1886,20 @@ mod tests {
             ..FileState::default()
         };
         store.parse_codex_line(&context("turn-a", "2026-07-27T00:00:00Z"), &mut parent);
-        for (index, line) in [
-            usage("turn-a", "2026-07-27T00:00:01Z", 100),
-            usage("turn-a", "2026-07-27T00:00:02Z", 200),
-        ]
-        .iter()
-        .enumerate()
-        {
+        for (line, expected_id) in [
+            (
+                usage("2026-07-27T00:00:01Z", 100, 100, 10),
+                "codex:turn-a@100:0:0:10:0:110",
+            ),
+            (
+                usage("2026-07-27T00:00:02Z", 200, 300, 20),
+                "codex:turn-a@300:0:0:20:0:320",
+            ),
+        ] {
             let event = store
-                .parse_codex_line(line, &mut parent)
+                .parse_codex_line(&line, &mut parent)
                 .expect("parent usage counts");
-            assert_eq!(event.id, format!("codex:turn-a#{index}"));
+            assert_eq!(event.id, expected_id);
             store.index.insert(event.id.clone(), store.events.len());
             store.events.push(event);
         }
@@ -1768,8 +1916,8 @@ mod tests {
         store.parse_codex_line(&context("turn-own", "2026-07-27T01:00:00Z"), &mut child);
         store.parse_codex_line(&context("turn-a", "2026-07-27T01:00:00Z"), &mut child);
         for line in [
-            usage("turn-a", "2026-07-27T01:00:00Z", 100),
-            usage("turn-a", "2026-07-27T01:00:00Z", 200),
+            usage("2026-07-27T01:00:00Z", 100, 100, 10),
+            usage("2026-07-27T01:00:00Z", 200, 300, 20),
         ] {
             assert!(
                 store.parse_codex_line(&line, &mut child).is_none(),
@@ -1780,9 +1928,12 @@ mod tests {
         // A genuinely new turn in the child still counts.
         store.parse_codex_line(&context("turn-b", "2026-07-27T01:05:00Z"), &mut child);
         let fresh = store
-            .parse_codex_line(&usage("turn-b", "2026-07-27T01:05:01Z", 300), &mut child)
+            .parse_codex_line(
+                &usage("2026-07-27T01:05:01Z", 300, 600, 30),
+                &mut child,
+            )
             .expect("the child's own work counts");
-        assert_eq!(fresh.id, "codex:turn-b#0");
+        assert_eq!(fresh.id, "codex:turn-b@600:0:0:30:0:630");
         assert_eq!(fresh.in_tok, 300.0);
     }
 
@@ -1792,9 +1943,10 @@ mod tests {
     #[test]
     fn replayed_rate_limits_do_not_overwrite_the_current_quota() {
         let mut store = empty_store();
-        let line = |pct: f64, ts: &str| {
+        let line = |pct: f64, ts: &str, total_input: u64, total_output: u64| {
             format!(
-                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":5,"cached_input_tokens":0,"output_tokens":1}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":100}}}}}}}}"#
+                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":5,"cached_input_tokens":0,"output_tokens":1,"total_tokens":6}},"total_token_usage":{{"input_tokens":{total_input},"cached_input_tokens":0,"output_tokens":{total_output},"total_tokens":{total}}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":100}}}}}}}}"#,
+                total = total_input + total_output,
             )
         };
         let context = |turn: &str, ts: &str| {
@@ -1809,7 +1961,10 @@ mod tests {
         };
         store.parse_codex_line(&context("cap", "2026-07-23T00:00:00Z"), &mut parent);
         let capped = store
-            .parse_codex_line(&line(100.0, "2026-07-23T00:00:01Z"), &mut parent)
+            .parse_codex_line(
+                &line(100.0, "2026-07-23T00:00:01Z", 5, 1),
+                &mut parent,
+            )
             .expect("real reading");
         store.index.insert(capped.id.clone(), store.events.len());
         store.events.push(capped);
@@ -1818,7 +1973,10 @@ mod tests {
         // The window rolled over; a real later reading drops back to 9%.
         store.parse_codex_line(&context("now", "2026-07-29T00:00:00Z"), &mut parent);
         let fresh = store
-            .parse_codex_line(&line(9.0, "2026-07-29T00:00:01Z"), &mut parent)
+            .parse_codex_line(
+                &line(9.0, "2026-07-29T00:00:01Z", 10, 2),
+                &mut parent,
+            )
             .expect("real reading");
         store.index.insert(fresh.id.clone(), store.events.len());
         store.events.push(fresh);
@@ -1832,7 +1990,10 @@ mod tests {
         };
         store.parse_codex_line(&context("cap", "2026-07-29T00:05:00Z"), &mut child);
         assert!(store
-            .parse_codex_line(&line(100.0, "2026-07-29T00:05:00Z"), &mut child)
+            .parse_codex_line(
+                &line(100.0, "2026-07-29T00:05:00Z", 5, 1),
+                &mut child,
+            )
             .is_none());
         assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 9.0);
     }
@@ -2033,6 +2194,187 @@ mod tests {
         assert_eq!(
             store.parse_codex_line(call, &mut state).unwrap().mcp,
             vec!["chrome_devtools"]
+        );
+    }
+
+    /// Opt-in audit for one real, immutable rollout. Production Store output is
+    /// checked turn by turn against a small independent cumulative-snapshot
+    /// reducer. Only token metadata is printed.
+    #[test]
+    #[ignore = "set TOKENSCOPE_AUDIT_SESSION to a real Codex rollout path"]
+    fn audits_one_real_codex_session() {
+        #[derive(Clone, Default)]
+        struct TurnAudit {
+            responses: u64,
+            repeated: u64,
+            input: i64,
+            cache_write: i64,
+            cache_read: i64,
+            output: i64,
+        }
+
+        impl TurnAudit {
+            fn physical(&self) -> i64 {
+                self.input + self.cache_write + self.cache_read + self.output
+            }
+        }
+
+        let source = std::env::var("TOKENSCOPE_AUDIT_SESSION")
+            .expect("TOKENSCOPE_AUDIT_SESSION must name one rollout JSONL file");
+        let text = fs::read_to_string(&source).expect("read audit rollout");
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: source.clone(),
+            session: codex_session_from_filename(Path::new(&source)),
+            ..FileState::default()
+        };
+
+        // Exercise the exact production parser and outer event-indexing path.
+        for line in text.lines() {
+            let Some(mut event) = store.parse_codex_line(line, &mut state) else {
+                continue;
+            };
+            event.source = source.clone();
+            event.agent = AGENT_CODEX.to_string();
+            if !event.id.is_empty() {
+                if store.index.contains_key(&event.id) {
+                    continue;
+                }
+                store
+                    .index
+                    .insert(event.id.clone(), store.events.len());
+            }
+            store.events.push(event);
+        }
+
+        let number = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default()
+                .max(0)
+        };
+        let total_vec = |value: &serde_json::Value| {
+            [
+                number(value, "input_tokens"),
+                number(value, "cached_input_tokens"),
+                number(value, "cache_write_input_tokens"),
+                number(value, "output_tokens"),
+                number(value, "reasoning_output_tokens"),
+                number(value, "total_tokens"),
+            ]
+        };
+
+        // Independent oracle: the accumulated total decides whether the
+        // positive last usage belongs to a new upstream response.
+        let mut oracle: HashMap<String, TurnAudit> = HashMap::new();
+        let mut current_turn = String::new();
+        let mut previous_total: Option<[i64; 6]> = None;
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(payload) = value.get("payload") else {
+                continue;
+            };
+            let line_type = value.get("type").and_then(|item| item.as_str());
+            if line_type == Some("turn_context") {
+                if let Some(id) = payload.get("turn_id").and_then(|item| item.as_str()) {
+                    current_turn = id.to_string();
+                }
+                continue;
+            }
+            if line_type != Some("event_msg") {
+                continue;
+            }
+            if let Some(id) = payload.get("turn_id").and_then(|item| item.as_str()) {
+                current_turn = id.to_string();
+            }
+            if payload.get("type").and_then(|item| item.as_str()) != Some("token_count") {
+                continue;
+            }
+            let Some(info) = payload.get("info") else {
+                continue;
+            };
+            let total = info.get("total_token_usage").map(&total_vec);
+            let before = previous_total;
+            if let Some(total) = total {
+                previous_total = Some(total);
+            }
+            let Some(last) = info.get("last_token_usage") else {
+                continue;
+            };
+            let raw_input = number(last, "input_tokens");
+            let output = number(last, "output_tokens");
+            if raw_input + output <= 0 {
+                continue;
+            }
+
+            let turn = oracle.entry(current_turn.clone()).or_default();
+            if before.zip(total).is_some_and(|(left, right)| left == right) {
+                turn.repeated += 1;
+                continue;
+            }
+            let cache_read = number(last, "cached_input_tokens").clamp(0, raw_input);
+            let cache_write =
+                number(last, "cache_write_input_tokens").clamp(0, raw_input - cache_read);
+            turn.responses += 1;
+            turn.input += raw_input - cache_read - cache_write;
+            turn.cache_write += cache_write;
+            turn.cache_read += cache_read;
+            turn.output += output;
+        }
+
+        let actual_events = store
+            .events
+            .iter()
+            .filter(|event| event.in_tok + event.cc + event.cr + event.out_tok > 0.0)
+            .count() as u64;
+        let expected_events: u64 = oracle.values().map(|turn| turn.responses).sum();
+        assert_eq!(actual_events, expected_events);
+
+        let mut ordered: Vec<_> = oracle.into_iter().collect();
+        ordered.sort_by_key(|(turn_id, _)| {
+            store
+                .turns
+                .iter()
+                .find(|actual| actual.turn_id == *turn_id)
+                .map(|actual| actual.ts_ms)
+                .unwrap_or_default()
+        });
+        let total_physical: i64 = ordered.iter().map(|(_, turn)| turn.physical()).sum();
+        for (turn_id, expected) in &ordered {
+            let actual = store
+                .turns
+                .iter()
+                .find(|turn| turn.turn_id == *turn_id)
+                .expect("production telemetry for audited turn");
+            assert_eq!(actual.input_tokens as i64, expected.input);
+            assert_eq!(
+                actual.cache_creation_tokens as i64,
+                expected.cache_write
+            );
+            assert_eq!(actual.cache_read_tokens as i64, expected.cache_read);
+            assert_eq!(actual.output_tokens as i64, expected.output);
+            eprintln!(
+                "turn={} responses={} repeated={} input={} cache_write={} cache_read={} output={} physical={}",
+                &turn_id[..turn_id.len().min(8)],
+                expected.responses,
+                expected.repeated,
+                expected.input,
+                expected.cache_write,
+                expected.cache_read,
+                expected.output,
+                expected.physical(),
+            );
+        }
+
+        eprintln!(
+            "session audit passed: file={}, turns={}, responses={}, physical={}",
+            source,
+            ordered.len(),
+            expected_events,
+            total_physical,
         );
     }
 }
