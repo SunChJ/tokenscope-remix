@@ -805,7 +805,9 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   // / dismisses and never arms the hide-suppression guard.
   const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
-  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
+  // The menu-bar label is today's aggregate. Open on the same period so the
+  // number in the panel matches the number the user just clicked.
+  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Day");
   const today = localIso(new Date());
   const [rangeOpen, setRangeOpen] = useState(false);
   const [draftRange, setDraftRange] = useState<DateRange>(() => {

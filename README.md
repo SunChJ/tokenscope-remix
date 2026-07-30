@@ -19,7 +19,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 ## What it does
 
 - Shows today's token count (all agents combined) next to the menu-bar icon (e.g. `⬡ 14.00M`)
-- Click to open the panel: Day / Week / Month toggle plus an inclusive custom date-range filter
+- Click to open the panel: it starts on Day so its total matches the menu-bar count, with Week / Month toggles plus an inclusive custom date-range filter
 - **Multi-agent**: with more than one agent detected, filter chips (All / Claude / Codex) appear — the All view stacks usage **by agent**, and filtering to one agent re-tints the whole panel with its accent (Claude coral / Codex teal). With a single agent the classic UI is unchanged
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
 - Project settlement: groups usage by local Git repository / working directory and exports the selected period as CSV without exposing raw paths or conversation content

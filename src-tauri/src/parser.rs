@@ -206,8 +206,6 @@ pub fn build_dashboard() -> Dashboard {
         .map(|turn| compute_turn(turn, &pricing))
         .collect();
 
-    let today = now.date_naive();
-
     // Keep historical agents selectable even when their latest event is outside
     // the preset window; custom ranges can still contain their usage.
     let present_ids: HashSet<&str> = store
@@ -295,12 +293,13 @@ pub fn build_dashboard() -> Dashboard {
         v
     };
 
-    // today's displayed tokens (M) for the tray — across all agents
-    let today_tokens: f64 = events
-        .iter()
-        .filter(|e| e.ts.date_naive() == today)
-        .map(|e| (e.input + e.cache + e.output) / 1e6)
-        .sum();
+    // Keep the tray and the panel on one source of truth. The aggregate scope's
+    // Day report is the same all-agent, local-calendar-day value shown when the
+    // panel opens.
+    let today_tokens = scopes
+        .first()
+        .map(|scope| scope.day.metrics.total_tokens)
+        .unwrap_or_default();
 
     Dashboard {
         scopes,
