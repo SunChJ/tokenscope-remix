@@ -1,3 +1,4 @@
+mod codex_adapter;
 mod config;
 mod model;
 mod parser;
