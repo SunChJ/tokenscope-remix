@@ -19,7 +19,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 ## 它做什么
 
 - 菜单栏图标旁显示当日 Token 数（所有 Agent 合计，如 `⬡ 14.00M`）
-- 点击打开面板：Day / Week / Month 切换，以及按起止日期（含首尾日）的自定义区间筛选
+- 点击打开面板：默认显示 Day，与菜单栏 Token 数保持一致；可切换 Week / Month，也可按起止日期（含首尾日）筛选自定义区间
 - **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿）；只装一个 Agent 则界面与经典版完全一致
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 项目结算：按本地 Git 仓库 / 工作目录归集用量，可将当前时间段导出为 CSV，不暴露原始路径或对话正文
