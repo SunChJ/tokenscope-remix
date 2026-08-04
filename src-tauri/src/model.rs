@@ -14,7 +14,9 @@ pub struct SeriesPoint {
 pub struct ModelStat {
     pub name: String,
     pub vendor: String,
-    pub tokens: f64, // M tokens (input+output, weighted)
+    pub tokens: f64, // M tokens (input + cache + output)
+    #[serde(rename = "cacheTokens")]
+    pub cache_tokens: f64, // M tokens (cache creation + read)
     pub cost: f64,   // USD estimate
     pub color: String,
     pub priced: bool, // false = no pricing data in LiteLLM (cost is unknown, not $0)

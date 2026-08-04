@@ -1,7 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number }
-export interface ModelStat { name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean; agent: string }
+export interface ModelStat {
+  name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean; agent: string;
+  // Optional only for compatibility with older/static dashboard payloads.
+  cacheTokens?: number;
+}
 export interface NamedCount { name: string; count: number }
 export interface ProjectStat { id: string; name: string; tokens: number; cost: number; requests: number; sessions: number }
 export interface ReliabilityStats {

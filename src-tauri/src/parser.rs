@@ -719,6 +719,7 @@ struct Agg {
     mcp_calls: u64,
     skill_calls: u64,
     model_tok: HashMap<String, f64>,
+    model_cache_tok: HashMap<String, f64>,
     model_cost: HashMap<String, f64>,
     model_priced: HashMap<String, bool>,
     model_agent: HashMap<String, &'static str>,
@@ -752,6 +753,7 @@ impl Agg {
             self.requests += 1;
             // model totals keep all token types so shares sum to Total tokens
             *self.model_tok.entry(e.model.clone()).or_default() += e.input + e.cache + e.output;
+            *self.model_cache_tok.entry(e.model.clone()).or_default() += e.cache;
             *self.model_cost.entry(e.model.clone()).or_default() += e.cost;
             // a model is "priced" if any of its messages had a known price
             *self.model_priced.entry(e.model.clone()).or_default() |= e.priced;
@@ -793,6 +795,8 @@ impl Agg {
                 ModelStat {
                     vendor: vendor_of(&name).to_string(),
                     tokens: tok / 1e6,
+                    cache_tokens: self.model_cache_tok.get(&name).copied().unwrap_or_default()
+                        / 1e6,
                     cost: (cost * 1_000_000.0).round() / 1_000_000.0,
                     color: if i < palette.len() { palette[i] } else { OVERFLOW_GRAY }.to_string(),
                     priced,
@@ -1328,6 +1332,20 @@ mod tests {
         assert_eq!(report.series.len(), 2);
         assert_eq!(report.series[0].input, 1.0);
         assert_eq!(report.series[1].input, 2.0);
+    }
+
+    #[test]
+    fn model_stats_keep_cache_tokens_in_the_selected_model_total() {
+        let mut cached = event(2026, 7, 13, 12, 100.0);
+        cached.cache = 800.0;
+        cached.output = 100.0;
+        let day = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let report = report_range(&[cached], &[], day, day, PALETTE);
+
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].tokens, 0.001);
+        assert_eq!(report.models[0].cache_tokens, 0.0008);
+        assert_eq!(report.metrics.total_tokens, report.models[0].tokens);
     }
 
     #[test]
