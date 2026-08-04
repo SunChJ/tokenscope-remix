@@ -534,21 +534,22 @@ function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme })
 // Codex rate-limit card straight from the session logs. Keep collecting every
 // window for compatibility, but do not render the retired 5h limit or empty
 // windows omitted by newer Codex clients. Bars turn amber near the cap.
-function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; theme: Theme }) {
+function QuotaCard({ q, sparkQ, trend, theme }: { q?: Quota | null; sparkQ?: Quota | null; trend: QuotaTrendPoint[]; theme: Theme }) {
   const t = theme;
   const { locale, text } = useI18n();
   const now = Date.now();
-  const stale = now - q.asOfMs > 60 * 60 * 1000;
+  const stale = q ? now - q.asOfMs > 60 * 60 * 1000 : false;
   const winLabel = (min: number) =>
     min === 10080 ? text.weekly : min % 60 === 0 && min > 0 ? `${min / 60}h ${text.window}` : `${min}m ${text.window}`;
   const resetsIn = (unixS: number) => {
+    if (unixS <= 0) return "";
     const ms = unixS * 1000 - now;
     if (ms <= 0) return text.resetting;
     const h = Math.floor(ms / 3.6e6), m = Math.round((ms % 3.6e6) / 6e4);
     if (h >= 48) return `${text.resetsIn} ${Math.round(h / 24)}d`;
     return h > 0 ? `${text.resetsIn} ${h}h ${m}m` : `${text.resetsIn} ${m}m`;
   };
-  const asOf = new Date(q.asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" });
+  const asOf = q ? new Date(q.asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" }) : "";
   const quotaValues = trend.map((point) => point.usedPct);
   const first = trend[0], last = trend[trend.length - 1];
   const elapsedHours = first && last ? (last.tsMs - first.tsMs) / 3.6e6 : 0;
@@ -557,10 +558,12 @@ function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; th
   const horizon = hoursToCap > 0
     ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h ${text.toCap}` : `${(hoursToCap / 24).toFixed(1)}d ${text.toCap}`
     : text.stable;
-  const windows = [
-    { id: "primary", minutes: q.primaryMinutes, pct: q.primaryPct, resetsAt: q.primaryResetsAt },
-    { id: "secondary", minutes: q.secondaryMinutes, pct: q.secondaryPct, resetsAt: q.secondaryResetsAt },
-  ].filter((window) => window.minutes > 0 && window.minutes !== 5 * 60);
+  const quotaWindows = (quota?: Quota | null) => quota ? [
+    { id: "primary", minutes: quota.primaryMinutes, pct: quota.primaryPct, resetsAt: quota.primaryResetsAt },
+    { id: "secondary", minutes: quota.secondaryMinutes, pct: quota.secondaryPct, resetsAt: quota.secondaryResetsAt },
+  ] : [];
+  const windows = quotaWindows(q).filter((window) => window.minutes > 0 && window.minutes !== 5 * 60);
+  const sparkWeekly = quotaWindows(sparkQ).find((window) => window.minutes === 7 * 24 * 60);
   const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
     const p = Math.max(0, Math.min(100, pctUsed));
     const col = p >= 80 ? "#e0795f" : t.accent;
@@ -576,19 +579,30 @@ function QuotaCard({ q, trend, theme }: { q: Quota; trend: QuotaTrendPoint[]; th
     );
   };
   return (
-    <div style={{ opacity: stale ? 0.65 : 1 }}>
-      {windows.map((window) => (
-        <Bar key={window.id} label={winLabel(window.minutes)} pctUsed={window.pct} sub={resetsIn(window.resetsAt)} />
-      ))}
-      <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
-        <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
-        <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
-          {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%{text.perDay} · {horizon}</> : text.collectingWeeklyTrend}
-        </span>
+    <div>
+      <div style={{ opacity: stale ? 0.65 : 1 }}>
+        {windows.map((window) => (
+          <Bar key={window.id} label={winLabel(window.minutes)} pctUsed={window.pct} sub={resetsIn(window.resetsAt)} />
+        ))}
       </div>
-      <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
-        {q.plan && <>{text.plan}: {q.plan}</>}{stale && <span> · {text.asOf} {asOf}</span>}
-      </div>
+      {sparkWeekly && (
+        <div style={{ opacity: now - (sparkQ?.asOfMs ?? 0) > 60 * 60 * 1000 ? 0.65 : 1 }}>
+          <Bar label={`Spark ${text.weekly}`} pctUsed={sparkWeekly.pct} sub={resetsIn(sparkWeekly.resetsAt)} />
+        </div>
+      )}
+      {q && (
+        <div style={{ opacity: stale ? 0.65 : 1 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
+            <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
+            <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
+              {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%{text.perDay} · {horizon}</> : text.collectingWeeklyTrend}
+            </span>
+          </div>
+          <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
+            {q.plan && <>{text.plan}: {q.plan}</>}{stale && <span> · {text.asOf} {asOf}</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1203,11 +1217,11 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
           </div>
         )}
         {/* Codex quota — rate-limit windows read straight from the session logs */}
-        {scope.quota && (
+        {(scope.quota || scope.sparkQuota) && (
           <>
             <SectionRule t={t} />
             <div style={{ marginBottom: 4 }}><Label t={t}>{text.codexQuota}</Label></div>
-            <QuotaCard q={scope.quota} trend={scope.quotaTrend ?? []} theme={t} />
+            <QuotaCard q={scope.quota} sparkQ={scope.sparkQuota} trend={scope.quotaTrend ?? []} theme={t} />
           </>
         )}
         {projects.length > 0 && (
