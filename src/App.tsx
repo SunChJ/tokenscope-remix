@@ -780,13 +780,11 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void;
     onToggleLanguage: () => void; openGen: number; active: boolean; updater: UpdaterController }) {
   const { locale, text } = useI18n();
-  // Agent scope filter. scopes[0] is always the aggregate; a stale selection
-  // (e.g. a source disappeared after a rescan) falls back to it.
+  // The backend retains historical provider scopes so custom ranges can still
+  // query them. The selector below narrows that stable list to providers with
+  // usage in the period currently on screen.
   const scopes = dash.scopes;
   const [scopeId, setScopeId] = useState(scopes[0].id);
-  const scope = scopes.find((s) => s.id === scopeId) ?? scopes[0];
-  // Filtering to one agent re-tints the whole panel with its accent.
-  const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
   // In-app update lifecycle (checking/current → available → downloading → ready).
   const [updSt, updInstall, updDismiss] = updater;
   const [shortcutEditor, setShortcutEditor] = useState<string | null>(null);
@@ -820,6 +818,24 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   const [rangeError, setRangeError] = useState("");
   const rangeRequest = useRef(0);
   const rangeBaseGeneration = useRef("");
+
+  const reportForScope = (candidate: Scope): PeriodReport | undefined => {
+    if (activeRange) {
+      return rangeDash?.scopes.find((item) => item.id === candidate.id)?.report;
+    }
+    return period === "Day" ? candidate.day : period === "Month" ? candidate.month : candidate.week;
+  };
+  const visibleScopes = scopes.filter((candidate, index) =>
+    index === 0 || (reportForScope(candidate)?.metrics.totalTokens ?? 0) > 0
+  );
+  // A provider selected in one period may have no usage in the next. Fall back
+  // to the aggregate immediately, then keep the state in sync for later renders.
+  const scope = visibleScopes.find((candidate) => candidate.id === scopeId) ?? visibleScopes[0];
+  useEffect(() => {
+    if (scopeId !== scope.id) setScopeId(scope.id);
+  }, [scope.id, scopeId]);
+  // Filtering to one agent re-tints the whole panel with its accent.
+  const t = themeForScope(TH[dark ? "dark" : "light"], scope, dark);
 
   const clearDateRange = () => {
     rangeRequest.current += 1;
@@ -1116,9 +1132,9 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
             }}>✕</button>
           </div>
         )}
-        {/* agent filter — only when several sources have data */}
-        {scopes.length > 1 && (
-          <AgentChips scopes={scopes} value={scope.id} theme={t} onSelect={setScopeId} />
+        {/* provider filter — only providers with usage in this period */}
+        {visibleScopes.length > 1 && (
+          <AgentChips scopes={visibleScopes} value={scope.id} theme={t} onSelect={setScopeId} />
         )}
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
