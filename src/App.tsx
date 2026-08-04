@@ -892,12 +892,16 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   // The All scope can contain the same model once per agent. The selector is
   // model-based, so combine those rows before calculating its Total and cost.
   const modelTotals = Array.from(models.reduce((totals, model) => {
-    const prev = totals.get(model.name) ?? { name: model.name, tokens: 0, cost: 0 };
+    const prev = totals.get(model.name) ?? { name: model.name, tokens: 0, cacheTokens: 0, cost: 0 };
     prev.tokens += model.tokens;
+    // Live payloads carry the exact per-model cache split. The proportional
+    // fallback keeps old/static snapshots internally consistent.
+    prev.cacheTokens += model.cacheTokens
+      ?? (M.totalTokens > 0 ? model.tokens * M.cacheTokens / M.totalTokens : 0);
     prev.cost += model.cost;
     totals.set(model.name, prev);
     return totals;
-  }, new Map<string, { name: string; tokens: number; cost: number }>()).values())
+  }, new Map<string, { name: string; tokens: number; cacheTokens: number; cost: number }>()).values())
     .filter((model) => model.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens);
   const selectedModel = modelTotals.find((model) => model.name === totalModel);
@@ -906,15 +910,26 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   // Per-agent slices — non-empty only in the All scope with >=2 sources; they
   // switch the hero bar + chart from Cached/New to a by-agent breakdown.
   const slices = P.agents;
+  // Keep the hero's agent split on the same model scope as its Total. The
+  // historical chart below remains the complete period view.
+  const heroSlices = selectedModel && slices.length > 0
+    ? slices.map((slice) => ({
+        ...slice,
+        tokens: models
+          .filter((model) => model.name === selectedModel.name && model.agent === slice.id)
+          .reduce((sum, model) => sum + model.tokens, 0),
+      })).filter((slice) => slice.tokens > 0)
+    : slices;
   // animated Total tokens: counts up from 0 on each open / period / scope
   // / model switch; held at 0 while hidden so it never flashes.
   const animTotal = useCountUp(totalTokens, `${viewKey}:${scope.id}:${totalModel}:${openGen}`, active);
   const heroTotal = tokenAmount(animTotal, totalTokens, text.tokens);
   // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
-  const splitTot = M.inputTokens + M.cacheTokens + M.outputTokens;
-  const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
-  const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
-  const agentTotal = slices.reduce((sum, s) => sum + s.tokens, 0);
+  const displayCacheTokens = selectedModel?.cacheTokens ?? M.cacheTokens;
+  const displayRestTokens = Math.max(0, totalTokens - displayCacheTokens);
+  const cachePct = totalTokens > 0 ? (displayCacheTokens / totalTokens) * 100 : 0;
+  const restPct = totalTokens > 0 ? (displayRestTokens / totalTokens) * 100 : 0;
+  const heroAgentTotal = heroSlices.reduce((sum, s) => sum + s.tokens, 0);
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
   // that it'd render a meaningless "0.0%" (a negligible token share). Such a
@@ -1139,18 +1154,18 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
         </div>
         {/* All scope: one segment per agent. Single scope: cached vs new. */}
         <div style={{ display: "flex", height: 7, borderRadius: 4, overflow: "hidden", marginBottom: 5, background: t.gridLine }}>
-          {M.totalTokens > 0 && (slices.length > 0 ? (
-            slices.map((s) => (
-              <div key={s.id} style={{ width: `${agentTotal > 0 ? (s.tokens / agentTotal) * 100 : 0}%`, background: s.color }} />
+          {totalTokens > 0 && (heroSlices.length > 0 ? (
+            heroSlices.map((s) => (
+              <div key={s.id} style={{ width: `${heroAgentTotal > 0 ? (s.tokens / heroAgentTotal) * 100 : 0}%`, background: s.color }} />
             ))
           ) : <>
             <div style={{ width: `${cachePct}%`, background: t.accent }} />
             <div style={{ width: `${restPct}%`, background: t.accentSoft }} />
           </>)}
         </div>
-        {slices.length > 0
-          ? <AgentLegend t={t} slices={slices} cachedPct={pct(M.cacheTokens, M.totalTokens)} />
-          : <SplitLegend t={t} cacheM={M.cacheTokens} restM={M.inputTokens + M.outputTokens} cachedPct={pct(M.cacheTokens, M.totalTokens)} />}
+        {heroSlices.length > 0
+          ? <AgentLegend t={t} slices={heroSlices} cachedPct={pct(displayCacheTokens, totalTokens)} />
+          : <SplitLegend t={t} cacheM={displayCacheTokens} restM={displayRestTokens} cachedPct={pct(displayCacheTokens, totalTokens)} />}
         {/* bar chart — stacked by agent in the All scope */}
         <BarChart data={P.series} theme={t} height={84}
           segs={slices.length > 0 ? [...slices].reverse().map((s) => ({ color: s.color, values: s.values })) : undefined} />

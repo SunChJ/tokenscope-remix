@@ -1,6 +1,6 @@
 [package]
 name = "tokenscope"
-version = "1.4.3"
+version = "1.4.4"
 description = "Menu-bar dashboard for local AI coding agents (Claude Code, Codex) token usage"
 authors = ["you"]
 edition = "2021"
