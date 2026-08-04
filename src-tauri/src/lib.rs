@@ -228,14 +228,19 @@ fn apply_tray_language(menu: &TrayMenuState, language: AppLanguage, shortcut: &s
     let _ = menu.quit.set_text(copy.quit);
 }
 
-fn weekly_remaining_from_quota(quota: &model::Quota) -> Option<u8> {
-    let used = if quota.primary_minutes == 7 * 24 * 60 {
-        quota.primary_pct
+fn weekly_remaining_from_quota(quota: &model::Quota, now_s: i64) -> Option<u8> {
+    let (used, resets_at) = if quota.primary_minutes == 7 * 24 * 60 {
+        (quota.primary_pct, quota.primary_resets_at)
     } else if quota.secondary_minutes == 7 * 24 * 60 {
-        quota.secondary_pct
+        (quota.secondary_pct, quota.secondary_resets_at)
     } else {
         return None;
     };
+    // A dormant pool may not emit another snapshot after its window resets.
+    // Do not keep advertising that expired reading in the native tray.
+    if resets_at > 0 && resets_at <= now_s {
+        return None;
+    }
     Some((100.0 - used).clamp(0.0, 100.0).round() as u8)
 }
 
@@ -251,20 +256,29 @@ fn weekly_label_suffix(
     display: WeeklyQuotaDisplay,
     codex: Option<&model::Quota>,
     spark: Option<&model::Quota>,
+    now_s: i64,
 ) -> String {
     let mut suffix = String::new();
     match display {
         WeeklyQuotaDisplay::Off => {}
         WeeklyQuotaDisplay::Codex => {
-            if let Some(remaining) = codex.and_then(weekly_remaining_from_quota) {
-                suffix.push_str(&format!("-{remaining}%"));
+            if let Some(remaining) =
+                codex.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
+            {
+                // Keep the pool identity explicit even when only one quota is
+                // selected; an unlabeled percentage is easy to mistake for Spark.
+                suffix.push_str(&format!("-C{remaining}%"));
             }
         }
         WeeklyQuotaDisplay::CodexAndSpark => {
-            if let Some(remaining) = codex.and_then(weekly_remaining_from_quota) {
+            if let Some(remaining) =
+                codex.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
+            {
                 suffix.push_str(&format!("-C{remaining}%"));
             }
-            if let Some(remaining) = spark.and_then(weekly_remaining_from_quota) {
+            if let Some(remaining) =
+                spark.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
+            {
                 suffix.push_str(&format!("-S{remaining}%"));
             }
         }
@@ -275,7 +289,7 @@ fn weekly_label_suffix(
 fn tray_label(dash: &Dashboard, display: WeeklyQuotaDisplay, language: AppLanguage) -> String {
     let mut label = fmt_tokens_m(dash.today_tokens, language);
     let (codex, spark) = dashboard_quotas(dash);
-    label.push_str(&weekly_label_suffix(display, codex, spark));
+    label.push_str(&weekly_label_suffix(display, codex, spark, now_ms() / 1000));
     label
 }
 
@@ -1577,18 +1591,49 @@ mod tests {
             ..codex.clone()
         };
 
-        assert_eq!(weekly_remaining_from_quota(&codex), Some(81));
+        assert_eq!(weekly_remaining_from_quota(&codex, 1), Some(81));
         assert_eq!(
-            weekly_label_suffix(WeeklyQuotaDisplay::Codex, Some(&codex), Some(&spark)),
-            "-81%"
+            weekly_label_suffix(WeeklyQuotaDisplay::Codex, Some(&codex), Some(&spark), 1),
+            "-C81%"
         );
         assert_eq!(
             weekly_label_suffix(
                 WeeklyQuotaDisplay::CodexAndSpark,
                 Some(&codex),
-                Some(&spark)
+                Some(&spark),
+                1,
             ),
             "-C81%-S93%"
+        );
+    }
+
+    #[test]
+    fn weekly_label_hides_expired_pool_snapshots() {
+        let current = model::Quota {
+            plan: "pro".into(),
+            primary_pct: 20.0,
+            primary_minutes: 7 * 24 * 60,
+            primary_resets_at: 2_000,
+            secondary_pct: 0.0,
+            secondary_minutes: 0,
+            secondary_resets_at: 0,
+            as_of_ms: 0,
+        };
+        let expired = model::Quota {
+            primary_pct: 7.0,
+            primary_resets_at: 999,
+            ..current.clone()
+        };
+
+        assert_eq!(weekly_remaining_from_quota(&expired, 1_000), None);
+        assert_eq!(
+            weekly_label_suffix(
+                WeeklyQuotaDisplay::CodexAndSpark,
+                Some(&current),
+                Some(&expired),
+                1_000,
+            ),
+            "-C80%"
         );
     }
 
