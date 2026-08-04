@@ -201,7 +201,11 @@ const STORE_VERSION: u32 = 11;
 // v3: during the v2 migration, fully read source files that contain Spark
 // usage. A session can switch away from Spark after its last Spark snapshot,
 // leaving its model context outside the usual 64 KiB quota-file tail.
-const QUOTA_CACHE_VERSION: u32 = 3;
+// v4: an explicit `codex_bengalfox` limit id always identifies Spark. Real
+// concurrent sessions can report that id while the active model context still
+// says `gpt-5.6-sol`; trusting the model first temporarily put Spark's quota in
+// the standard Codex cache.
+const QUOTA_CACHE_VERSION: u32 = 4;
 const PROJECT_CACHE_VERSION: u32 = 1;
 const TELEMETRY_CACHE_VERSION: u32 = 1;
 // One-time quota migration: tail the 32 newest files, and fully read only
@@ -334,23 +338,23 @@ fn is_codex_spark_model(model: &str) -> bool {
     model == "gpt-5.3-codex-spark" || model.starts_with("gpt-5.3-codex-spark-")
 }
 
-/// Assign a quota snapshot to the pool consumed by its active model.
+/// Assign a quota snapshot to its independent rate-limit pool.
 ///
-/// Codex now emits `limit_id: "codex"` for Spark turns as well, so that raw
-/// id cannot distinguish the two independent pools. The old ids are retained
-/// only as a fallback for pre-model/legacy records.
+/// An explicit `codex_bengalfox` id is authoritative. The `codex` id is
+/// ambiguous because Codex also emits it for Spark turns, so model identity
+/// disambiguates that case.
 fn codex_quota_pool(model: &str, rl: &serde_json::Value) -> Option<&'static str> {
+    let limit_id = rl.get("limit_id").and_then(|value| value.as_str());
+    if limit_id == Some(SPARK_QUOTA_POOL) {
+        return Some(SPARK_QUOTA_POOL);
+    }
+    if !matches!(limit_id, None | Some(CODEX_QUOTA_POOL)) {
+        return None;
+    }
     if is_codex_spark_model(model) {
         return Some(SPARK_QUOTA_POOL);
     }
-    if !model.trim().is_empty() {
-        return Some(CODEX_QUOTA_POOL);
-    }
-    match rl.get("limit_id").and_then(|value| value.as_str()) {
-        None | Some(CODEX_QUOTA_POOL) => Some(CODEX_QUOTA_POOL),
-        Some(SPARK_QUOTA_POOL) => Some(SPARK_QUOTA_POOL),
-        _ => None,
-    }
+    Some(CODEX_QUOTA_POOL)
 }
 
 impl Store {
@@ -1279,9 +1283,9 @@ impl Store {
     }
 
     /// Keep the newest rate-limit snapshot. Spark and standard Codex models
-    /// consume separate pools, but recent JSONL snapshots no longer reflect
-    /// that in `rate_limits.limit_id`; classify known models before using the
-    /// legacy limit id as a fallback.
+    /// consume separate pools. Honor an explicit Spark pool id first, then use
+    /// the active model to disambiguate snapshots carrying the shared `codex`
+    /// id.
     fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64, model: &str) {
         let Some(limit_id) = codex_quota_pool(model, rl) else {
             return;
@@ -1675,22 +1679,22 @@ mod tests {
         // still put that weekly usage in Spark's independent pool.
         store.update_codex_quota(&snapshot("codex", 7.0), 100, "gpt-5.3-codex-spark");
         store.update_codex_quota(&snapshot("codex", 24.05), 200, "gpt-5.6-sol");
-        // Conversely, a stale legacy id cannot move a non-Spark model into
-        // Spark's pool.
+        // Explicit pool ids remain authoritative even when concurrent session
+        // context reports the same non-Spark model for both snapshots.
         store.update_codex_quota(
             &snapshot("codex_bengalfox", 24.1),
             300,
             "gpt-5.6-sol",
         );
 
-        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.1);
-        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 7.0);
-        assert_eq!(store.quota_history.len(), 2);
+        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.05);
+        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 24.1);
+        assert_eq!(store.quota_history.len(), 3);
     }
 
     #[test]
-    fn uses_legacy_limit_id_only_when_model_is_unavailable() {
-        let legacy_spark = serde_json::json!({
+    fn explicit_spark_limit_id_overrides_model_context() {
+        let explicit_spark = serde_json::json!({
             "limit_id": "codex_bengalfox",
             "primary": {
                 "used_percent": 7.0,
@@ -1700,16 +1704,16 @@ mod tests {
         });
 
         assert_eq!(
-            codex_quota_pool("", &legacy_spark),
+            codex_quota_pool("", &explicit_spark),
             Some(SPARK_QUOTA_POOL)
         );
         assert_eq!(
-            codex_quota_pool("chatgpt/gpt-5.3-codex-spark", &legacy_spark),
+            codex_quota_pool("chatgpt/gpt-5.3-codex-spark", &explicit_spark),
             Some(SPARK_QUOTA_POOL)
         );
         assert_eq!(
-            codex_quota_pool("gpt-5.6-sol", &legacy_spark),
-            Some(CODEX_QUOTA_POOL)
+            codex_quota_pool("gpt-5.6-sol", &explicit_spark),
+            Some(SPARK_QUOTA_POOL)
         );
     }
 
