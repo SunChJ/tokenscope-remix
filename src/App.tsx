@@ -370,7 +370,7 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
   );
 }
 
-// Agent filter chips (All / Claude / Codex …). Rendered only when several
+// Agent filter chips (All / Claude / Codex / Pi …). Rendered only when several
 // sources have data; a single-source install never sees them.
 function AgentChips({ scopes, value, theme, onSelect }:
   { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void }) {
@@ -525,7 +525,7 @@ function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme })
         {item(text.median, stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", text.context)}
         {item(text.peak, stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80)}
         {item(text.compacted, fmtInt(stats.compactions), text.times)}
-        {item(text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.codexOnly)}
+        {item(text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.whenReported)}
       </div>
     </div>
   );

@@ -3,6 +3,8 @@
 > 版本：v0.1 草案 · 2026-07-02
 > 目标：从「Claude 用量仪表盘」演进为「本地所有 AI Agent 的统一用量仪表盘」。
 > 第一步：支持 Codex CLI。
+>
+> 此文档保留 Codex Phase 1 的历史设计；后续 Pi 一等数据源设计见 [DESIGN-pi-adapter.md](DESIGN-pi-adapter.md)。
 
 ---
 

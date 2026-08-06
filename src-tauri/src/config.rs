@@ -9,6 +9,7 @@ pub struct UserConfig {
     pub codex_mcp_servers: HashSet<String>, // codex, from ~/.codex/config.toml
     pub claude_skills: HashSet<String>,
     pub codex_skills: HashSet<String>,
+    pub pi_skills: HashSet<String>,
 }
 
 fn home() -> Option<PathBuf> {
@@ -78,6 +79,12 @@ fn codex_home() -> Option<PathBuf> {
         .or_else(|| home().map(|h| h.join(".codex")))
 }
 
+fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".pi").join("agent")))
+}
+
 /// User Codex skills live in $CODEX_HOME/skills and ~/.agents/skills. Also
 /// include project `.agents/skills` directories from session working dirs.
 /// Hidden directories such as $CODEX_HOME/skills/.system are built-ins.
@@ -97,6 +104,177 @@ fn load_codex_skills(project_dirs: &[PathBuf]) -> HashSet<String> {
     }
     for dir in dirs {
         scan_skill_dir(&dir, &mut set, false);
+    }
+    set
+}
+
+fn pi_frontmatter_name(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(name) = line.strip_prefix("name:") {
+            let name = name.trim().trim_matches(['\'', '"']);
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn scan_pi_skill_path(path: &Path, set: &mut HashSet<String>) {
+    if path.is_file() {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            if let Some(name) = pi_frontmatter_name(path).or_else(|| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            }) {
+                set.insert(name);
+            }
+        }
+        return;
+    }
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_file() && entry.file_name() == "SKILL.md" {
+            if let Some(parent_name) = entry
+                .path()
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+            {
+                set.insert(parent_name.to_string());
+            }
+            if let Some(name) = pi_frontmatter_name(entry.path()) {
+                set.insert(name);
+            }
+        }
+    }
+}
+
+fn expand_pi_path(path: &str, base: &Path) -> Option<PathBuf> {
+    if path == "~" {
+        return home();
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return Some(home()?.join(rest));
+    }
+    let path = PathBuf::from(path);
+    Some(if path.is_absolute() { path } else { base.join(path) })
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+fn add_pi_settings_skills(settings: &Path, base: &Path, set: &mut HashSet<String>) {
+    let Some(json) = read_json(settings) else {
+        return;
+    };
+    let Some(skills) = json.get("skills").and_then(|value| value.as_array()) else {
+        return;
+    };
+    for skill in skills.iter().filter_map(|value| value.as_str()) {
+        if skill.starts_with(['!', '-', '+']) || skill.contains('*') {
+            continue;
+        }
+        if let Some(path) = expand_pi_path(skill, base) {
+            scan_pi_skill_path(&path, set);
+        }
+    }
+}
+
+fn npm_package_name(source: &str) -> &str {
+    let source = source.strip_prefix("npm:").unwrap_or(source);
+    if let Some(unscoped) = source.strip_prefix('@') {
+        unscoped
+            .find('@')
+            .map(|index| &source[..index + 1])
+            .unwrap_or(source)
+    } else {
+        source.split('@').next().unwrap_or(source)
+    }
+}
+
+fn pi_package_path(source: &str, base: &Path) -> Option<PathBuf> {
+    let source = source.split('#').next()?.trim();
+    if let Some(repo) = source.strip_prefix("git:") {
+        return Some(base.join("git").join(repo));
+    }
+    if let Some(repo) = source.strip_prefix("github:") {
+        return Some(base.join("git").join("github.com").join(repo));
+    }
+    if source.contains("://") {
+        return None;
+    }
+    let name = npm_package_name(source);
+    (!name.is_empty()).then(|| base.join("npm").join("node_modules").join(name))
+}
+
+fn add_pi_package_skills(settings: &Path, base: &Path, set: &mut HashSet<String>) {
+    let Some(json) = read_json(settings) else {
+        return;
+    };
+    let Some(packages) = json.get("packages").and_then(|value| value.as_array()) else {
+        return;
+    };
+    for package in packages {
+        let source = if let Some(source) = package.as_str() {
+            source
+        } else {
+            let skills_enabled = package
+                .get("skills")
+                .and_then(|value| value.as_array())
+                .is_none_or(|skills| !skills.is_empty());
+            if !skills_enabled {
+                continue;
+            }
+            let Some(source) = package.get("source").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            source
+        };
+        if let Some(path) = pi_package_path(source, base) {
+            scan_pi_skill_path(&path, set);
+        }
+    }
+}
+
+/// Pi discovers global, shared, project, package, and explicit settings skills.
+fn load_pi_skills(project_dirs: &[PathBuf]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(agent_dir) = pi_agent_dir() {
+        scan_pi_skill_path(&agent_dir.join("skills"), &mut set);
+        let settings = agent_dir.join("settings.json");
+        add_pi_settings_skills(&settings, &agent_dir, &mut set);
+        add_pi_package_skills(&settings, &agent_dir, &mut set);
+    }
+    if let Some(home) = home() {
+        scan_pi_skill_path(&home.join(".agents").join("skills"), &mut set);
+    }
+    for project in project_dirs {
+        for dir in project.ancestors() {
+            scan_pi_skill_path(&dir.join(".pi").join("skills"), &mut set);
+            scan_pi_skill_path(&dir.join(".agents").join("skills"), &mut set);
+            let settings_dir = dir.join(".pi");
+            let settings = settings_dir.join("settings.json");
+            add_pi_settings_skills(&settings, &settings_dir, &mut set);
+            add_pi_package_skills(&settings, &settings_dir, &mut set);
+            if dir.join(".git").exists() {
+                break;
+            }
+        }
     }
     set
 }
@@ -146,34 +324,37 @@ fn load_codex_mcps(project_dirs: &[PathBuf]) -> HashSet<String> {
 }
 
 impl UserConfig {
-    pub fn load(codex_project_dirs: &[PathBuf]) -> Self {
+    pub fn load(project_dirs: &[PathBuf]) -> Self {
         // Parse ~/.claude.json a single time and derive the MCP whitelist from it.
         let json = read_user_config();
         UserConfig {
             mcp_servers: mcps_from(json.as_ref()),
-            codex_mcp_servers: load_codex_mcps(codex_project_dirs),
+            codex_mcp_servers: load_codex_mcps(project_dirs),
             claude_skills: load_user_skills(),
-            codex_skills: load_codex_skills(codex_project_dirs),
+            codex_skills: load_codex_skills(project_dirs),
+            pi_skills: load_pi_skills(project_dirs),
         }
     }
 
     /// A tool name like "mcp__<server>__<tool>" → is server user-installed?
     /// Checked against the owning agent's own config.
     pub fn is_user_mcp(&self, agent: &str, server: &str) -> bool {
-        if agent == crate::store::AGENT_CODEX {
-            self.codex_mcp_servers.contains(&norm_mcp(server))
-        } else {
-            self.mcp_servers.contains(server)
+        match agent {
+            crate::store::AGENT_CODEX => self.codex_mcp_servers.contains(&norm_mcp(server)),
+            // Pi has no built-in MCP registry. A persisted mcp__ tool is supplied
+            // by a user extension, so the invocation itself is authoritative.
+            crate::store::AGENT_PI => !server.is_empty(),
+            _ => self.mcp_servers.contains(server),
         }
     }
 
     /// A skill id (may be "plugin:skill") → strip plugin prefix, check dir.
     pub fn is_user_skill(&self, agent: &str, skill: &str) -> bool {
         let key = skill.rsplit(':').next().unwrap_or(skill);
-        if agent == crate::store::AGENT_CODEX {
-            self.codex_skills.contains(key)
-        } else {
-            self.claude_skills.contains(key)
+        match agent {
+            crate::store::AGENT_CODEX => self.codex_skills.contains(key),
+            crate::store::AGENT_PI => self.pi_skills.contains(key),
+            _ => self.claude_skills.contains(key),
         }
     }
 }
@@ -181,6 +362,21 @@ impl UserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_pi_package_install_paths() {
+        let base = Path::new("/agent");
+        assert_eq!(npm_package_name("npm:toolkit@1.2.3"), "toolkit");
+        assert_eq!(npm_package_name("npm:@scope/toolkit@1.2.3"), "@scope/toolkit");
+        assert_eq!(
+            pi_package_path("npm:@scope/toolkit@1.2.3", base),
+            Some(base.join("npm/node_modules/@scope/toolkit"))
+        );
+        assert_eq!(
+            pi_package_path("git:github.com/org/toolkit#main", base),
+            Some(base.join("git/github.com/org/toolkit"))
+        );
+    }
 
     #[test]
     fn parses_and_normalizes_codex_mcp_server_names() {

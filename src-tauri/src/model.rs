@@ -20,7 +20,7 @@ pub struct ModelStat {
     pub cost: f64,   // USD estimate
     pub color: String,
     pub priced: bool, // false = no pricing data in LiteLLM (cost is unknown, not $0)
-    // Owning agent id ("claude" / "codex"). In the All scope the same model name
+    // Owning agent id ("claude" / "codex" / "pi"). In the All scope the same model name
     // can appear once per agent (e.g. gpt-5 via a router AND via Codex).
     pub agent: String,
 }
@@ -127,8 +127,8 @@ pub struct Metrics {
 /// hero split bar, `values` (aligned with `series`) drives the stacked chart.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSlice {
-    pub id: String,    // "claude" | "codex"
-    pub label: String, // "Claude" | "Codex"
+    pub id: String,    // "claude" | "codex" | "pi"
+    pub label: String, // "Claude" | "Codex" | "Pi"
     pub color: String, // base hex, same across charts
     pub tokens: f64,   // M tokens in the period
     pub values: Vec<f64>, // M tokens per series bucket
@@ -187,8 +187,8 @@ pub struct Quota {
 /// one scope per agent, and the UI shows filter chips.
 #[derive(Debug, Clone, Serialize)]
 pub struct Scope {
-    pub id: String,    // "all" | "claude" | "codex"
-    pub label: String, // "All" | "Claude" | "Codex"
+    pub id: String,    // "all" | "claude" | "codex" | "pi"
+    pub label: String, // "All" | "Claude" | "Codex" | "Pi"
     pub color: String, // agent accent hex; "" = default theme accent
     pub day: PeriodReport,
     pub week: PeriodReport,

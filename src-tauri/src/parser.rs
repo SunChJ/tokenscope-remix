@@ -1,4 +1,4 @@
-// Aggregate the store's normalized events (Claude + Codex) into per-scope
+// Aggregate the store's normalized events (Claude + Codex + Pi) into per-scope
 // Day / Week / Month reports + a daily heatmap. With one data source the
 // dashboard has a single scope and looks exactly like the classic single-agent
 // UI; with several, the first scope aggregates everything ("All") and is
@@ -6,7 +6,7 @@
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
-use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX};
+use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX, AGENT_PI};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -75,6 +75,12 @@ const AGENTS: &[AgentDef] = &[
         label: "Codex",
         color: "#10a37f", // OpenAI teal
         palette: ["#0f8a6c", "#10a37f", "#4dbf9f", "#93dcc5", "#4a5f57"],
+    },
+    AgentDef {
+        id: AGENT_PI,
+        label: "Pi",
+        color: "#a855f7", // distinct violet for the model-agnostic harness
+        palette: ["#8b3fd1", "#a855f7", "#c084fc", "#ddb7ff", "#594267"],
     },
 ];
 
@@ -185,7 +191,7 @@ pub fn build_dashboard() -> Dashboard {
     let telemetry_since_ms = store.telemetry_since_ms;
 
     // 2. Aggregate: apply current config + prices, slice by current time.
-    let cfg = UserConfig::load(&store.codex_project_dirs());
+    let cfg = UserConfig::load(&store.project_dirs());
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
@@ -322,7 +328,7 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
         store.save();
     }
 
-    let cfg = UserConfig::load(&store.codex_project_dirs());
+    let cfg = UserConfig::load(&store.project_dirs());
     let pricing = Pricing::shared();
     let days = (end - start).num_days() + 1;
     let previous_start = start
@@ -506,9 +512,11 @@ fn set_installed_counts(report: &mut PeriodReport, agent_scope: &str, cfg: &User
     let (servers, skills) = match agent_scope {
         AGENT_CODEX => (cfg.codex_mcp_servers.len(), cfg.codex_skills.len()),
         AGENT_CLAUDE => (cfg.mcp_servers.len(), cfg.claude_skills.len()),
+        AGENT_PI => (report.metrics.servers as usize, cfg.pi_skills.len()),
         _ => (
-            cfg.mcp_servers.len() + cfg.codex_mcp_servers.len(),
-            cfg.claude_skills.len() + cfg.codex_skills.len(),
+            (cfg.mcp_servers.len() + cfg.codex_mcp_servers.len())
+                .max(report.metrics.servers as usize),
+            cfg.claude_skills.len() + cfg.codex_skills.len() + cfg.pi_skills.len(),
         ),
     };
     report.metrics.servers = servers as u64;
@@ -529,9 +537,11 @@ fn compute_event(
         .with_timezone(&Local);
     let model = normalize_model(&r.model);
     // price lookup uses the raw (possibly dated) id, then the normalized one
-    let cost_opt = pricing
-        .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
-        .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr));
+    let cost_opt = r.reported_cost.or_else(|| {
+        pricing
+            .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
+            .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr))
+    });
     let mcp = r
         .mcp
         .iter()
@@ -567,24 +577,26 @@ fn compute_turn(turn: &crate::store::TurnTelemetry, pricing: &Pricing) -> TurnEv
     let ts = DateTime::from_timestamp_millis(turn.ts_ms)
         .unwrap_or_default()
         .with_timezone(&Local);
-    let cost = pricing
-        .cost(
-            &turn.model,
-            turn.input_tokens,
-            turn.output_tokens,
-            turn.cache_creation_tokens,
-            turn.cache_read_tokens,
-        )
-        .or_else(|| {
-            pricing.cost(
-                &normalize_model(&turn.model),
+    let cost = turn.reported_cost.unwrap_or_else(|| {
+        pricing
+            .cost(
+                &turn.model,
                 turn.input_tokens,
                 turn.output_tokens,
                 turn.cache_creation_tokens,
                 turn.cache_read_tokens,
             )
-        })
-        .unwrap_or(0.0);
+            .or_else(|| {
+                pricing.cost(
+                    &normalize_model(&turn.model),
+                    turn.input_tokens,
+                    turn.output_tokens,
+                    turn.cache_creation_tokens,
+                    turn.cache_read_tokens,
+                )
+            })
+            .unwrap_or(0.0)
+    });
     TurnEvent {
         ts,
         agent: agent_def(&turn.agent).id,
@@ -815,7 +827,12 @@ impl Agg {
                 count: *c,
             })
             .collect();
-        v.sort_by_key(|item| std::cmp::Reverse(item.count));
+        v.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         v
     }
 

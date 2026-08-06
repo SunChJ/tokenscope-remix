@@ -8,9 +8,10 @@
 // events — cheap, and recomputed per request because preset windows are
 // relative to "now" and custom date ranges are selected at runtime.
 //
-// Two sources are ingested, normalized to the same RawEvent shape:
+// Three sources are ingested, normalized to the same RawEvent shape:
 //   claude — ~/.claude/projects/**/*.jsonl   (assistant messages)
 //   codex  — ~/.codex/sessions/**/*.jsonl    (token_count turn deltas)
+//   pi     — ~/.pi/agent/sessions/**/*.jsonl (assistant messages)
 use crate::codex_adapter::{self, TokenCountOutcome};
 use crate::model::Quota;
 use chrono::DateTime;
@@ -23,6 +24,7 @@ use walkdir::WalkDir;
 
 pub const AGENT_CLAUDE: &str = "claude";
 pub const AGENT_CODEX: &str = "codex";
+pub const AGENT_PI: &str = "pi";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProjectRef {
@@ -53,6 +55,9 @@ pub struct TurnTelemetry {
     pub compactions: u64,
     pub context_tokens: f64,
     pub context_window: f64,
+    // Pi persists the model catalog's request cost alongside usage. Prefer it
+    // over a later public-price estimate when available (including $0 local models).
+    pub reported_cost: Option<f64>,
     // Claude can repeat one assistant message across several JSONL lines.
     // Persist ids so incremental restarts never count its usage twice.
     usage_ids: Vec<String>,
@@ -79,13 +84,17 @@ pub struct RawEvent {
     pub ts_ms: i64,
     pub session: String,
     pub model: String, // raw model id (price lookup), normalized later for grouping
-    pub in_tok: f64,   // uncached new input only (both agents)
+    pub in_tok: f64,   // uncached new input only (all agents)
     pub cc: f64,       // cache creation/write
     pub cr: f64,       // cache read (codex: cached_input_tokens, a subset of its raw input)
     pub out_tok: f64,
     pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
     pub skills: Vec<String>, // all detected Skill ids called (unfiltered)
     pub id: String,          // message id (dedup); "" = no cross-line dedup needed
+    // Pi records the effective request cost in the session. Other adapters leave
+    // this unset and pricing is derived from the current public model table.
+    #[serde(default)]
+    pub reported_cost: Option<f64>,
     // Source log file (manifest key). Lets a truncated/rewritten file purge its
     // own stale events before being re-read, so re-ingestion stays idempotent.
     #[serde(default)]
@@ -111,11 +120,15 @@ struct FileState {
     #[serde(default)]
     model: String,
     #[serde(default)]
+    provider: String,
+    #[serde(default)]
     session: String,
     #[serde(default)]
     cwd: String,
     #[serde(default)]
     turn_id: String,
+    #[serde(default)]
+    turn_started_ms: i64,
     #[serde(default)]
     skills_seen: Vec<String>,
     // Newer Codex logs emit tool_search_output groups, then call the selected
@@ -154,6 +167,10 @@ struct Manifest {
     // prevents a fork's restamped replay from mutating either usage or quota.
     #[serde(default)]
     codex_token_counts: HashMap<String, String>,
+    // Pi tree entry id -> original source file. Fork/clone files copy the
+    // active path verbatim, including ids, and must not replay usage/telemetry.
+    #[serde(default)]
+    pi_entries: HashMap<String, String>,
 }
 
 pub struct Store {
@@ -194,7 +211,11 @@ pub struct Store {
 //  v11: route Codex through its own cumulative-snapshot adapter. Stable
 //       (turn,total) ids replace position ids; unchanged totals are quota-only
 //       repeats; cache-write usage is split and priced independently.
-const STORE_VERSION: u32 = 11;
+//  v12: ingest Pi's tree-structured sessions, persisted four-way usage/cost,
+//       tool outcomes, reasoning, compactions, projects, and Skill reads.
+//  v13: persist every Pi tree entry id so copied fork/clone paths cannot replay
+//       either usage or reliability side effects across source files.
+const STORE_VERSION: u32 = 13;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -226,6 +247,46 @@ fn claude_dir() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".claude").join("projects"))
 }
 
+fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Some(dirs::home_dir()?.join(".pi").join("agent")))
+}
+
+fn expand_home_path(path: &str) -> Option<PathBuf> {
+    if path == "~" {
+        return dirs::home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return Some(dirs::home_dir()?.join(rest));
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Pi's default session root plus an explicit absolute override. Relative
+/// `sessionDir` values are cwd-relative in Pi and cannot identify one global
+/// directory for a background desktop app, so the default root remains active.
+fn pi_dirs() -> Vec<PathBuf> {
+    let Some(agent_dir) = pi_agent_dir() else {
+        return Vec::new();
+    };
+    let mut dirs = vec![agent_dir.join("sessions")];
+    let env_dir = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        .ok()
+        .and_then(|path| expand_home_path(&path));
+    let settings_dir = fs::read_to_string(agent_dir.join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| json.get("sessionDir")?.as_str().map(str::to_owned))
+        .and_then(|path| expand_home_path(&path));
+    if let Some(dir) = env_dir.or(settings_dir).filter(|path| path.is_absolute()) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
 /// ~/.codex/sessions, honoring the CODEX_HOME override the Codex CLI supports.
 fn codex_dir() -> Option<PathBuf> {
     let home = std::env::var_os("CODEX_HOME")
@@ -243,6 +304,9 @@ pub fn source_roots() -> Vec<(&'static str, PathBuf)> {
     }
     if let Some(d) = codex_dir() {
         v.push((AGENT_CODEX, d));
+    }
+    for d in pi_dirs() {
+        v.push((AGENT_PI, d));
     }
     v
 }
@@ -648,9 +712,9 @@ impl Store {
         }
     }
 
-    /// Working directories seen in Codex sessions. Config uses these to find
-    /// project-scoped `.agents/skills` without crawling the user's home dir.
-    pub fn codex_project_dirs(&self) -> Vec<PathBuf> {
+    /// Working directories seen in session headers. Config uses these to find
+    /// project-scoped agent resources without crawling the user's home dir.
+    pub fn project_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = self
             .manifest
             .files
@@ -787,6 +851,9 @@ impl Store {
         self.manifest
             .codex_token_counts
             .retain(|_, source| source != key);
+        self.manifest
+            .pi_entries
+            .retain(|_, source| source != key);
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files across
@@ -819,7 +886,18 @@ impl Store {
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
             .map(|e| e.into_path())
             .collect();
-        entries.sort();
+        if agent == AGENT_PI {
+            // Pi copies stable entry ids into a fork/clone. Ordering by the
+            // timestamp-prefixed filename makes the original session win global
+            // id dedup even when its encoded project directory sorts later.
+            entries.sort_by(|left, right| {
+                left.file_name()
+                    .cmp(&right.file_name())
+                    .then_with(|| left.cmp(right))
+            });
+        } else {
+            entries.sort();
+        }
         for path in entries {
             let path = path.as_path();
             let key = path.to_string_lossy().to_string();
@@ -867,7 +945,7 @@ impl Store {
             };
             // Codex session ids also live in the filename (rollout-<ts>-<uuid>);
             // seed from it so events parsed before/without session_meta still
-            // group into a session.
+            // group into a session. Pi gets its authoritative id from the header.
             if agent == AGENT_CODEX && state.session.is_empty() {
                 state.session = codex_session_from_filename(path);
             }
@@ -878,6 +956,7 @@ impl Store {
                 let Ok(s) = std::str::from_utf8(line) else { continue };
                 let parsed = match agent {
                     AGENT_CODEX => self.parse_codex_line(s, &mut state),
+                    AGENT_PI => self.parse_pi_line(s, &mut state),
                     _ => self.parse_claude_line(s, &mut state),
                 };
                 if let Some(mut ev) = parsed {
@@ -1106,6 +1185,7 @@ impl Store {
                     mcp: Vec::new(),
                     skills: Vec::new(),
                     id: usage.event_id,
+                    reported_cost: None,
                     source: String::new(),
                     agent: String::new(),
                 })
@@ -1162,9 +1242,202 @@ impl Store {
                     mcp: vec![server],
                     skills: Vec::new(),
                     id: String::new(),
+                    reported_cost: None,
                     source: String::new(),
                     agent: String::new(),
                 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse one Pi session entry. Pi persists one exact Usage object per
+    /// assistant response in a tree-structured JSONL file, so physical entries
+    /// represent real upstream work even when the active branch later changes.
+    /// Stable entry ids dedupe history copied by `/fork` or `/clone`.
+    fn parse_pi_line(&mut self, line: &str, state: &mut FileState) -> Option<RawEvent> {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let entry_type = value.get("type")?.as_str()?;
+        let ts_ms = parse_ts(&value).unwrap_or(0);
+        if entry_type != "session" && !state.source.is_empty() {
+            if let Some(entry_id) = value.get("id").and_then(|item| item.as_str()) {
+                if self.manifest.pi_entries.contains_key(entry_id) {
+                    return None;
+                }
+                self.manifest
+                    .pi_entries
+                    .insert(entry_id.to_string(), state.source.clone());
+            }
+        }
+
+        match entry_type {
+            "session" => {
+                if let Some(id) = value.get("id").and_then(|item| item.as_str()) {
+                    state.session = id.to_string();
+                }
+                if let Some(cwd) = value.get("cwd").and_then(|item| item.as_str()) {
+                    state.cwd = cwd.to_string();
+                }
+                None
+            }
+            "model_change" => {
+                if let Some(provider) = value.get("provider").and_then(|item| item.as_str()) {
+                    state.provider = provider.to_string();
+                }
+                if let Some(model) = value.get("modelId").and_then(|item| item.as_str()) {
+                    state.model = model.to_string();
+                }
+                None
+            }
+            "message" => {
+                let message = value.get("message")?;
+                match message.get("role").and_then(|item| item.as_str())? {
+                    "user" => {
+                        if let Some(id) = value.get("id").and_then(|item| item.as_str()) {
+                            state.turn_id = id.to_string();
+                            state.turn_started_ms = ts_ms;
+                            state.skills_seen.clear();
+                        }
+                        let skill = pi_skill_command(message)?;
+                        state.skills_seen.push(skill.clone());
+                        Some(pi_event(
+                            &value,
+                            state,
+                            "command",
+                            PiEventData {
+                                skills: vec![skill],
+                                ..PiEventData::default()
+                            },
+                        ))
+                    }
+                    "assistant" => {
+                        if let Some(provider) = message.get("provider").and_then(|item| item.as_str()) {
+                            state.provider = provider.to_string();
+                        }
+                        if let Some(model) = message.get("model").and_then(|item| item.as_str()) {
+                            state.model = model.to_string();
+                        }
+                        if state.turn_id.is_empty() {
+                            state.turn_id = value
+                                .get("id")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            state.turn_started_ms = ts_ms;
+                        }
+
+                        let usage = message.get("usage").unwrap_or(&serde_json::Value::Null);
+                        let number = |key: &str| {
+                            usage
+                                .get(key)
+                                .and_then(|item| item.as_f64())
+                                .unwrap_or(0.0)
+                        };
+                        let input = number("input");
+                        let cache_read = number("cacheRead");
+                        let cache_write = number("cacheWrite");
+                        let output = number("output");
+                        let reasoning = number("reasoning");
+                        let reported_cost = pi_usage_cost(usage);
+                        let (mcp, skills) = pi_tool_calls(message, state);
+                        let context_window = pi_context_window(&state.provider, &state.model);
+                        let started_ms = state.turn_started_ms;
+                        let stop_reason = message
+                            .get("stopReason")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or("");
+
+                        if let Some(turn) = self.turn_mut(state, AGENT_PI, ts_ms) {
+                            turn.input_tokens += input;
+                            turn.cache_creation_tokens += cache_write;
+                            turn.cache_read_tokens += cache_read;
+                            turn.output_tokens += output;
+                            turn.reasoning_tokens += reasoning;
+                            turn.context_tokens = turn.context_tokens.max(input + cache_write + cache_read);
+                            turn.context_window = turn.context_window.max(context_window);
+                            if let Some(cost) = reported_cost {
+                                turn.reported_cost = Some(turn.reported_cost.unwrap_or_default() + cost);
+                            }
+                            if turn.ttft_ms == 0 && started_ms > 0 && ts_ms >= started_ms {
+                                turn.ttft_ms = (ts_ms - started_ms) as u64;
+                            }
+                            match stop_reason {
+                                "stop" | "length" => {
+                                    turn.outcome = "completed".to_string();
+                                    if started_ms > 0 && ts_ms >= started_ms {
+                                        turn.duration_ms = (ts_ms - started_ms) as u64;
+                                    }
+                                }
+                                "aborted" | "error" => {
+                                    turn.outcome = "aborted".to_string();
+                                    turn.abort_reason = stop_reason.to_string();
+                                    if started_ms > 0 && ts_ms >= started_ms {
+                                        turn.duration_ms = (ts_ms - started_ms) as u64;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        Some(pi_event(
+                            &value,
+                            state,
+                            "assistant",
+                            PiEventData {
+                                model: state.model.clone(),
+                                input,
+                                cache_write,
+                                cache_read,
+                                output,
+                                reasoning,
+                                reported_cost,
+                                mcp,
+                                skills,
+                            },
+                        ))
+                    }
+                    "toolResult" => {
+                        let is_error = message.get("isError").and_then(|item| item.as_bool())
+                            == Some(true);
+                        let usage = message.get("usage");
+                        let data = usage.map(|usage| pi_event_data(usage, state.model.clone()));
+                        if is_error || data.is_some() {
+                            if let Some(turn) = self.turn_mut(state, AGENT_PI, ts_ms) {
+                                turn.tool_errors += u64::from(is_error);
+                                if let Some(data) = data.as_ref() {
+                                    turn.input_tokens += data.input;
+                                    turn.cache_creation_tokens += data.cache_write;
+                                    turn.cache_read_tokens += data.cache_read;
+                                    turn.output_tokens += data.output;
+                                    turn.reasoning_tokens += data.reasoning;
+                                    turn.context_tokens = turn
+                                        .context_tokens
+                                        .max(data.input + data.cache_write + data.cache_read);
+                                    if let Some(cost) = data.reported_cost {
+                                        turn.reported_cost =
+                                            Some(turn.reported_cost.unwrap_or_default() + cost);
+                                    }
+                                }
+                            }
+                        }
+                        Some(pi_event(&value, state, "tool-usage", data?))
+                    }
+                    _ => None,
+                }
+            }
+            "compaction" | "branch_summary" => {
+                if entry_type == "compaction" {
+                    if let Some(turn) = self.turn_mut(state, AGENT_PI, ts_ms) {
+                        turn.compactions += 1;
+                    }
+                }
+                let usage = value.get("usage")?;
+                Some(pi_event(
+                    &value,
+                    state,
+                    entry_type,
+                    pi_event_data(usage, state.model.clone()),
+                ))
             }
             _ => None,
         }
@@ -1368,6 +1641,195 @@ impl Store {
     }
 }
 
+fn pi_usage_cost(usage: &serde_json::Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(|cost| cost.get("total"))
+        .and_then(|total| total.as_f64())
+}
+
+#[derive(Default)]
+struct PiEventData {
+    model: String,
+    input: f64,
+    cache_write: f64,
+    cache_read: f64,
+    output: f64,
+    reasoning: f64,
+    reported_cost: Option<f64>,
+    mcp: Vec<String>,
+    skills: Vec<String>,
+}
+
+fn pi_event_data(usage: &serde_json::Value, model: String) -> PiEventData {
+    let number = |key: &str| {
+        usage
+            .get(key)
+            .and_then(|item| item.as_f64())
+            .unwrap_or(0.0)
+    };
+    PiEventData {
+        model,
+        input: number("input"),
+        cache_write: number("cacheWrite"),
+        cache_read: number("cacheRead"),
+        output: number("output"),
+        reasoning: number("reasoning"),
+        reported_cost: pi_usage_cost(usage),
+        ..PiEventData::default()
+    }
+}
+
+fn pi_event(
+    entry: &serde_json::Value,
+    state: &FileState,
+    kind: &str,
+    data: PiEventData,
+) -> RawEvent {
+    let entry_id = entry.get("id").and_then(|item| item.as_str()).unwrap_or("");
+    RawEvent {
+        ts_ms: parse_ts(entry).unwrap_or(0),
+        session: state.session.clone(),
+        model: data.model,
+        in_tok: data.input,
+        cc: data.cache_write,
+        cr: data.cache_read,
+        out_tok: data.output,
+        mcp: data.mcp,
+        skills: data.skills,
+        id: if entry_id.is_empty() {
+            String::new()
+        } else {
+            format!("pi:{entry_id}:{kind}")
+        },
+        reported_cost: data.reported_cost,
+        source: String::new(),
+        agent: String::new(),
+    }
+}
+
+fn pi_skill_command(message: &serde_json::Value) -> Option<String> {
+    let content = message.get("content")?;
+    let text = if let Some(text) = content.as_str() {
+        text.to_string()
+    } else {
+        content
+            .as_array()?
+            .iter()
+            .filter(|block| block.get("type").and_then(|item| item.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|item| item.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let command = text.split_whitespace().next()?;
+    let skill = command.strip_prefix("/skill:")?.trim();
+    (!skill.is_empty()).then(|| skill.to_string())
+}
+
+fn pi_skill_from_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+    {
+        return None;
+    }
+    path.parent()?
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn pi_tool_calls(message: &serde_json::Value, state: &mut FileState) -> (Vec<String>, Vec<String>) {
+    let mut mcp = Vec::new();
+    let mut skills = Vec::new();
+    let Some(content) = message.get("content").and_then(|item| item.as_array()) else {
+        return (mcp, skills);
+    };
+    for block in content {
+        if block.get("type").and_then(|item| item.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let name = block.get("name").and_then(|item| item.as_str()).unwrap_or("");
+        if let Some(server) = name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split("__").next())
+            .filter(|server| !server.is_empty())
+        {
+            mcp.push(server.to_string());
+        }
+        if name != "read" {
+            continue;
+        }
+        let Some(path) = block
+            .get("arguments")
+            .and_then(|arguments| arguments.get("path"))
+            .and_then(|path| path.as_str())
+        else {
+            continue;
+        };
+        let Some(skill) = pi_skill_from_path(path) else {
+            continue;
+        };
+        if !state.skills_seen.contains(&skill) {
+            state.skills_seen.push(skill.clone());
+            skills.push(skill);
+        }
+    }
+    (mcp, skills)
+}
+
+fn pi_context_window(provider: &str, model: &str) -> f64 {
+    static WINDOWS: std::sync::OnceLock<HashMap<String, f64>> = std::sync::OnceLock::new();
+    let windows = WINDOWS.get_or_init(|| {
+        let mut windows = HashMap::new();
+        let Some(agent_dir) = pi_agent_dir() else {
+            return windows;
+        };
+        for (path, nested_providers) in [
+            (agent_dir.join("models-store.json"), false),
+            (agent_dir.join("models.json"), true),
+        ] {
+            let Ok(text) = fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let root = if nested_providers {
+                json.get("providers").and_then(|item| item.as_object())
+            } else {
+                json.as_object()
+            };
+            let Some(root) = root else { continue };
+            for (provider_id, config) in root {
+                let Some(models) = config.get("models").and_then(|item| item.as_array()) else {
+                    continue;
+                };
+                for model in models {
+                    let Some(id) = model.get("id").and_then(|item| item.as_str()) else {
+                        continue;
+                    };
+                    let Some(window) = model.get("contextWindow").and_then(|item| item.as_f64()) else {
+                        continue;
+                    };
+                    windows.insert(format!("{provider_id}\0{id}"), window);
+                    windows.entry(id.to_string()).or_insert(window);
+                }
+            }
+        }
+        windows
+    });
+    windows
+        .get(&format!("{provider}\0{model}"))
+        .or_else(|| windows.get(model))
+        .copied()
+        .unwrap_or(0.0)
+}
+
 /// RFC3339 top-level `timestamp` → epoch ms.
 fn parse_ts(v: &serde_json::Value) -> Option<i64> {
     let ts = v.get("timestamp")?.as_str()?;
@@ -1500,6 +1962,7 @@ fn codex_exec_event(
         mcp,
         skills,
         id: String::new(),
+        reported_cost: None,
         source: String::new(),
         agent: String::new(),
     })
@@ -1571,6 +2034,7 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         mcp: Vec::new(),
         skills: vec![skill],
         id,
+        reported_cost: None,
         source: String::new(),
         agent: String::new(),
     })
@@ -1637,6 +2101,7 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         mcp,
         skills,
         id,
+        reported_cost: None,
         source: String::new(),
         agent: String::new(),
     })
@@ -2199,6 +2664,111 @@ mod tests {
             store.parse_codex_line(call, &mut state).unwrap().mcp,
             vec!["chrome_devtools"]
         );
+    }
+
+    #[test]
+    fn parses_pi_usage_tools_cost_and_turn_telemetry() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/pi-session.jsonl".to_string(),
+            ..FileState::default()
+        };
+        let header = r#"{"type":"session","version":3,"id":"session-pi","timestamp":"2026-08-01T10:00:00Z","cwd":"/work/project"}"#;
+        let user = r#"{"type":"message","id":"user0001","parentId":null,"timestamp":"2026-08-01T10:00:01Z","message":{"role":"user","content":"Build it","timestamp":1785578401000}}"#;
+        let assistant = r#"{"type":"message","id":"assist01","parentId":"user0001","timestamp":"2026-08-01T10:00:04Z","message":{"role":"assistant","provider":"test-provider","model":"test-model","content":[{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"/Users/me/.agents/skills/archify/SKILL.md"}},{"type":"toolCall","id":"call-2","name":"mcp__browser__open","arguments":{}}],"usage":{"input":100,"cacheRead":800,"cacheWrite":50,"output":25,"reasoning":10,"totalTokens":975,"cost":{"input":0.1,"cacheRead":0.08,"cacheWrite":0.05,"output":0.05,"total":0.28}},"stopReason":"stop","timestamp":1785578404000}}"#;
+
+        assert!(store.parse_pi_line(header, &mut state).is_none());
+        assert!(store.parse_pi_line(user, &mut state).is_none());
+        let event = store
+            .parse_pi_line(assistant, &mut state)
+            .expect("assistant usage event");
+
+        assert_eq!(state.session, "session-pi");
+        assert_eq!(state.cwd, "/work/project");
+        assert_eq!(event.id, "pi:assist01:assistant");
+        assert_eq!(event.model, "test-model");
+        assert_eq!((event.in_tok, event.cc, event.cr, event.out_tok), (100.0, 50.0, 800.0, 25.0));
+        assert_eq!(event.reported_cost, Some(0.28));
+        assert_eq!(event.skills, vec!["archify"]);
+        assert_eq!(event.mcp, vec!["browser"]);
+
+        let turn = store.turns.first().expect("Pi turn telemetry");
+        assert_eq!(turn.agent, AGENT_PI);
+        assert_eq!(turn.session, "session-pi");
+        assert_eq!(turn.outcome, "completed");
+        assert_eq!(turn.reasoning_tokens, 10.0);
+        assert_eq!(turn.context_tokens, 950.0);
+        assert_eq!(turn.reported_cost, Some(0.28));
+        assert_eq!(turn.duration_ms, 3_000);
+        assert_eq!(turn.ttft_ms, 3_000);
+
+        // A fork/clone copies the active path into another file with the same
+        // entry ids. Neither usage nor telemetry may be replayed there.
+        let mut copied = FileState {
+            source: "/tmp/pi-copy.jsonl".to_string(),
+            ..FileState::default()
+        };
+        store.parse_pi_line(header, &mut copied);
+        assert!(store.parse_pi_line(user, &mut copied).is_none());
+        assert!(store.parse_pi_line(assistant, &mut copied).is_none());
+        assert_eq!(store.turns.len(), 1);
+    }
+
+    #[test]
+    fn dedupes_pi_skill_reads_within_a_turn_and_tracks_failures() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/pi-failure.jsonl".to_string(),
+            session: "session-pi".to_string(),
+            ..FileState::default()
+        };
+        let user = r#"{"type":"message","id":"user0002","parentId":null,"timestamp":"2026-08-01T11:00:00Z","message":{"role":"user","content":"Run skill"}}"#;
+        let response = |id: &str, stop: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":"user0002","timestamp":"2026-08-01T11:00:01Z","message":{{"role":"assistant","provider":"test","model":"test","content":[{{"type":"toolCall","id":"call","name":"read","arguments":{{"path":"/tmp/demo/SKILL.md"}}}}],"usage":{{"input":1,"cacheRead":2,"cacheWrite":3,"output":4,"reasoning":2,"totalTokens":10,"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"stopReason":"{stop}"}}}}"#
+            )
+        };
+        let tool_error = r#"{"type":"message","id":"tool0001","parentId":"assist02","timestamp":"2026-08-01T11:00:02Z","message":{"role":"toolResult","toolCallId":"call","toolName":"read","content":[],"isError":true}}"#;
+
+        store.parse_pi_line(user, &mut state);
+        let first = store.parse_pi_line(&response("assist02", "toolUse"), &mut state).unwrap();
+        let second = store.parse_pi_line(&response("assist03", "aborted"), &mut state).unwrap();
+        assert_eq!(first.skills, vec!["demo"]);
+        assert!(second.skills.is_empty());
+        assert!(store.parse_pi_line(tool_error, &mut state).is_none());
+
+        let turn = store.turns.first().unwrap();
+        assert_eq!(turn.outcome, "aborted");
+        assert_eq!(turn.abort_reason, "aborted");
+        assert_eq!(turn.tool_errors, 1);
+        assert_eq!(turn.input_tokens, 2.0);
+        assert_eq!(turn.cache_creation_tokens, 6.0);
+        assert_eq!(turn.cache_read_tokens, 4.0);
+        assert_eq!(turn.output_tokens, 8.0);
+        assert_eq!(turn.reported_cost, Some(0.0));
+    }
+
+    #[test]
+    fn parses_pi_skill_slash_command_and_summary_usage() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/pi-summary.jsonl".to_string(),
+            session: "session-pi".to_string(),
+            model: "summary-model".to_string(),
+            ..FileState::default()
+        };
+        let command = r#"{"type":"message","id":"user0003","parentId":null,"timestamp":"2026-08-01T12:00:00Z","message":{"role":"user","content":"/skill:archify workflow"}}"#;
+        let compaction = r#"{"type":"compaction","id":"compact1","parentId":"user0003","timestamp":"2026-08-01T12:00:01Z","summary":"...","tokensBefore":1000,"usage":{"input":20,"cacheRead":30,"cacheWrite":0,"output":10,"totalTokens":60,"cost":{"total":0.02}}}"#;
+
+        let skill = store.parse_pi_line(command, &mut state).unwrap();
+        assert_eq!(skill.skills, vec!["archify"]);
+        assert!(skill.model.is_empty());
+        let summary = store.parse_pi_line(compaction, &mut state).unwrap();
+        assert_eq!(summary.id, "pi:compact1:compaction");
+        assert_eq!(summary.model, "summary-model");
+        assert_eq!((summary.in_tok, summary.cr, summary.out_tok), (20.0, 30.0, 10.0));
+        assert_eq!(summary.reported_cost, Some(0.02));
+        assert_eq!(store.turns.first().unwrap().compactions, 1);
     }
 
     /// Opt-in audit for one real, immutable rollout. Production Store output is

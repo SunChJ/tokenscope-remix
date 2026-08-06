@@ -43,7 +43,7 @@ export interface Quota {
   secondaryPct: number; secondaryMinutes: number; secondaryResetsAt: number;
   asOfMs: number;
 }
-// One selectable dashboard view. A single data source yields exactly one scope
+// One selectable dashboard view (Claude, Codex, Pi, …). A single data source yields exactly one scope
 // (id "all", empty color → classic UI, no chips); several sources yield
 // [All, agent, agent, …] and the header shows filter chips.
 export interface Scope {
@@ -65,6 +65,7 @@ export interface RangeDashboard extends DateRange { scopes: RangeScope[] }
 export const AGENT_ACCENTS: Record<string, { dark: [string, string]; light: [string, string] }> = {
   claude: { dark: ["#d97757", "#eda380"], light: ["#c05b39", "#e8a184"] },
   codex: { dark: ["#10a37f", "#5ec9a8"], light: ["#0c8465", "#6fcdb0"] },
+  pi: { dark: ["#a855f7", "#c084fc"], light: ["#8436c7", "#a855f7"] },
 };
 
 /// Theme with the scope's agent accent applied (identity for the All scope).
