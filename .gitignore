@@ -14,3 +14,5 @@ public/dev-dashboard.json
 .history/
 *.log
 claude-design-files/
+
+src-tauri/bin/hu

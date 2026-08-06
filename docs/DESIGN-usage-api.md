@@ -19,9 +19,10 @@ keeps one credential implementation instead of duplicating it in Rust.
 ```
 refresh thread (every 5 min)
   └─ quota_api::reload()
-       ├─ hu usage claude --json   → claude ProviderLimit
+       ├─ bundled hu (Resources/bin/hu) → `hu usage claude --json` → claude ProviderLimit
        │    └─ on failure: ~/.claude.json cachedUsageUtilization (local fallback)
-       └─ hu usage codex --json    → codex ProviderLimit
+       ├─ bundled hu → `hu usage codex --json` → codex ProviderLimit
+       │    └─ on failure: native wham/usage call (Pi / Codex CLI OAuth)
        └─ persist ProviderCache → provider_limits.json (no credentials)
 parser::build_dashboard()
   └─ quota_api::shared() → provider_limits (dashboard + tray)
@@ -31,6 +32,16 @@ parser::build_dashboard()
 `provider_limits.json` caches the last successful snapshot per provider so a
 later offline refresh (or a missing `hu`) still has data. The cache holds
 quota metadata only — never tokens.
+
+## Bundling
+
+`src-tauri/bin/build-hu.sh` downloads the matching `hu` release asset for the
+current OS/arch before `tauri build`; `bundle.resources` ships it as
+`Resources/bin/hu`. At runtime `lib.rs` injects `resource_dir()` into
+`quota_api`, which prefers the bundled binary, then system installs. If no
+`hu` exists at all, `ensure_hu()` attempts a one-per-24h auto-install
+(Homebrew tap → official install script → `go install`) before the native
+Codex fallback.
 
 ## Normalization
 
@@ -62,8 +73,11 @@ quota metadata only — never tokens.
 
 ## Fallback chain
 
-1. `hu usage <provider> --json`
-2. Last successful `provider_limits.json` snapshot
-3. Claude-only: `~/.claude.json` `cachedUsageUtilization` (updated by Claude
+1. Bundled `hu` → `hu usage <provider> --json`
+2. System `hu` (user-installed, may be newer)
+3. One-per-24h auto-install of `hu` (Homebrew → install script → `go install`)
+4. Native wham/usage call for Codex (Pi `openai-codex` OAuth → Codex CLI OAuth)
+5. Last successful `provider_limits.json` snapshot
+6. Claude-only: `~/.claude.json` `cachedUsageUtilization` (updated by Claude
    Code when it runs)
-4. Codex trend: session-log `rate_limits` history merged into the live window
+7. Codex trend: session-log `rate_limits` history merged into the live window

@@ -37,19 +37,19 @@ brew install --cask sunchj/tokenscope/tokenscope
 |---------|------|
 | Claude session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
 | Codex session logs (tokens + offline quota fallback) | `~/.codex/sessions/**/*.jsonl` (honors `CODEX_HOME`) |
-| Provider quota (Claude + Codex) | HappyUsage `hu usage <provider> --json` (credential + OAuth + API owned by `hu`; Claude fallback: `~/.claude.json` `cachedUsageUtilization`) |
+| Provider quota (Claude + Codex) | HappyUsage `hu` CLI bundled inside the app (`Resources/bin/hu`); Claude fallback: `~/.claude.json` `cachedUsageUtilization`, Codex fallback: native usage API with Pi / Codex CLI OAuth |
 | Pi session logs (tokens / model / tools / telemetry) | `~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, and absolute `settings.sessionDir`) |
 | Claude user MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
 | Codex user MCP whitelist | Global and trusted-project `config.toml` → `[mcp_servers.*]` (`$CODEX_HOME/config.toml`, project `.codex/config.toml`) |
 | User Skill whitelist | Claude: `~/.claude/skills/`; Codex: `$CODEX_HOME/skills/`, `~/.agents/skills/`, and project `.agents/skills/`; Pi: global/shared/project Pi skill locations plus explicit settings paths |
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching the CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 
-Quota requests go through the HappyUsage `hu` CLI, which owns credential discovery, OAuth refresh, and provider calls. Tokenscope caches only quota metadata, never credentials.
+Quota requests go through the HappyUsage `hu` CLI, which owns credential discovery, OAuth refresh, and provider calls. The binary ships inside the app bundle, so no system install is needed; if it is missing (e.g. development builds), Tokenscope falls back to a native Codex usage call. Tokenscope caches only quota metadata, never credentials.
 
 ### Key processing
 - Claude: deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
 - Codex: a dedicated adapter cross-checks exact per-response `last_token_usage` against the accumulated `total_token_usage` snapshot, so quota-only repeats and fork replays are not counted as new work; stable `(turn, total snapshot)` ids deduplicate persisted replays, while `cached_input_tokens` and `cache_write_input_tokens` are split out of Codex's inclusive `input_tokens` for comparable four-category accounting
-- Provider quota: refreshed every 5 minutes outside the dashboard build lock via `hu usage claude --json` + `hu usage codex --json`; last successful snapshot is cached (`provider_limits.json`) and shown when `hu` or the network fails. Claude `session`→5-hour / `weekly`→7d; Codex primary→Weekly / Spark→Spark
+- Provider quota: refreshed every 5 minutes outside the dashboard build lock via the bundled `hu usage claude --json` + `hu usage codex --json`; last successful snapshot is cached (`provider_limits.json`) and shown when `hu` or the network fails. Claude `session`→5-hour / `weekly`→7d; Codex primary→Weekly / Spark→Spark
 - Pi: each persisted assistant response contributes its exact four-way `usage`; stable tree-entry ids deduplicate history copied by `/fork` or `/clone`, while the session header supplies the session/project identity. Persisted request cost, reasoning, stop reason, tool errors, compactions, and model context windows feed the matching dashboard telemetry
 - Token split: `input` (uncached) / `cache` (creation+read) / `output`; the UI folds cache into "In" by default and shows a separate "cached %"
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins

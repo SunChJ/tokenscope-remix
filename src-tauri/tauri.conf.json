@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && bash src-tauri/bin/build-hu.sh",
     "frontendDist": "../dist"
   },
   "app": {
@@ -45,6 +45,7 @@
     "active": true,
     "targets": ["app", "dmg", "nsis"],
     "createUpdaterArtifacts": true,
+    "resources": ["bin/hu"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
