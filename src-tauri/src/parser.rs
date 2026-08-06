@@ -1,4 +1,4 @@
-// Aggregate the store's normalized events (Claude + Codex) into per-scope
+// Aggregate the store's normalized events (Claude + Codex + Pi) into per-scope
 // Day / Week / Month reports + a daily heatmap. With one data source the
 // dashboard has a single scope and looks exactly like the classic single-agent
 // UI; with several, the first scope aggregates everything ("All") and is
@@ -6,7 +6,8 @@
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::Pricing;
-use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX};
+use crate::quota_api;
+use crate::store::{RawEvent, Store, AGENT_CLAUDE, AGENT_CODEX, AGENT_PI};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -76,6 +77,12 @@ const AGENTS: &[AgentDef] = &[
         color: "#10a37f", // OpenAI teal
         palette: ["#0f8a6c", "#10a37f", "#4dbf9f", "#93dcc5", "#4a5f57"],
     },
+    AgentDef {
+        id: AGENT_PI,
+        label: "Pi",
+        color: "#a855f7", // distinct violet for the model-agnostic harness
+        palette: ["#8b3fd1", "#a855f7", "#c084fc", "#ddb7ff", "#594267"],
+    },
 ];
 
 fn agent_def(id: &str) -> &'static AgentDef {
@@ -122,36 +129,39 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
-fn quota_trend(
+fn window_trend(
     history: &[crate::store::QuotaHistoryPoint],
     limit_id: &str,
-    current: Option<&Quota>,
+    used_pct: f64,
+    resets_at: i64,
+    as_of_ms: i64,
+    live_points: &[QuotaTrendPoint],
 ) -> Vec<QuotaTrendPoint> {
-    let Some(current) = current else {
-        return Vec::new();
-    };
-    let (used_pct, resets_at) = if current.primary_minutes == 7 * 24 * 60 {
-        (current.primary_pct, current.primary_resets_at)
-    } else if current.secondary_minutes == 7 * 24 * 60 {
-        (current.secondary_pct, current.secondary_resets_at)
-    } else {
-        return Vec::new();
-    };
+    // API reset timestamps can drift by a few seconds between calls. Merge
+    // same-cycle log history with the live points instead of starting a
+    // trend from scratch, otherwise the dashboard lingers in "Collecting".
     let mut points: Vec<QuotaTrendPoint> = history
         .iter()
-        .filter(|point| point.limit_id == limit_id && point.resets_at == resets_at)
+        .filter(|point| point.limit_id == limit_id && same_reset_cycle(point.resets_at, resets_at))
         .map(|point| QuotaTrendPoint {
             ts_ms: point.ts_ms,
             used_pct: point.used_pct,
         })
+        .chain(live_points.iter().cloned())
         .collect();
+    points.push(QuotaTrendPoint {
+        ts_ms: as_of_ms,
+        used_pct,
+    });
     points.sort_by_key(|point| point.ts_ms);
-    if points.last().map(|point| point.ts_ms) != Some(current.as_of_ms) {
-        points.push(QuotaTrendPoint {
-            ts_ms: current.as_of_ms,
-            used_pct,
-        });
-    }
+    points.dedup_by(|right, left| {
+        if right.ts_ms == left.ts_ms {
+            left.used_pct = right.used_pct;
+            true
+        } else {
+            false
+        }
+    });
     const MAX_POINTS: usize = 48;
     if points.len() <= MAX_POINTS {
         return points;
@@ -164,6 +174,28 @@ fn quota_trend(
         .collect()
 }
 
+/// Attach session-log Codex quota history to the matching provider windows so
+/// the trend has depth even before the next `hu` refresh.
+fn merge_log_trends(limits: &mut [ProviderLimit], store: &crate::store::Store) {
+    for limit in limits.iter_mut().filter(|limit| limit.provider == "codex") {
+        for window in &mut limit.windows {
+            let limit_id = if window.id == "spark" {
+                "codex_bengalfox"
+            } else {
+                "codex"
+            };
+            window.trend = window_trend(
+                &store.quota_history,
+                limit_id,
+                window.used_pct,
+                window.resets_at,
+                window.as_of_ms,
+                &window.trend,
+            );
+        }
+    }
+}
+
 pub fn build_dashboard() -> Dashboard {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -174,18 +206,15 @@ pub fn build_dashboard() -> Dashboard {
     if store.ingest() {
         store.save();
     }
-    let codex_quota = store.codex_quota.clone();
-    let codex_spark_quota = store.codex_spark_quota.clone();
-    let codex_quota_trend = quota_trend(&store.quota_history, "codex", codex_quota.as_ref());
-    let codex_spark_quota_trend = quota_trend(
-        &store.quota_history,
-        "codex_bengalfox",
-        codex_spark_quota.as_ref(),
-    );
+    // Provider subscription limits (Claude / Codex) come from the `hu` CLI via
+    // quota_api; session-log Codex rate limits add trend depth. Provider limits
+    // are global — they never attach to a token-usage scope.
+    let mut provider_limits = quota_api::shared();
+    merge_log_trends(&mut provider_limits, &store);
     let telemetry_since_ms = store.telemetry_since_ms;
 
     // 2. Aggregate: apply current config + prices, slice by current time.
-    let cfg = UserConfig::load(&store.codex_project_dirs());
+    let cfg = UserConfig::load(&store.project_dirs());
     // Memoized price table (cheap clone); loaded/refreshed off-thread elsewhere
     // so neither parsing nor the network runs while we hold BUILD_LOCK.
     let pricing = Pricing::shared();
@@ -218,16 +247,9 @@ pub fn build_dashboard() -> Dashboard {
     let scopes = if present.len() <= 1 {
         // Single (or no) source → one scope, classic green UI, no chips.
         let agent = present.first().map(|a| a.id).unwrap_or(AGENT_CLAUDE);
-        let mut scope = build_scope(
+        vec![build_scope(
             "all", "All", "", &events, &turns, PALETTE, agent, &cfg, now,
-        );
-        if agent == AGENT_CODEX {
-            scope.quota = codex_quota;
-            scope.spark_quota = codex_spark_quota;
-            scope.quota_trend = codex_quota_trend;
-            scope.spark_quota_trend = codex_spark_quota_trend;
-        }
-        vec![scope]
+        )]
     } else {
         // Aggregate scope first (default palette; models/slices merged below),
         // then one accent-colored scope per agent.
@@ -239,7 +261,7 @@ pub fn build_dashboard() -> Dashboard {
                 .filter(|turn| turn.agent == a.id)
                 .cloned()
                 .collect();
-            let mut s = build_scope(
+            let s = build_scope(
                 a.id,
                 a.label,
                 a.color,
@@ -250,12 +272,6 @@ pub fn build_dashboard() -> Dashboard {
                 &cfg,
                 now,
             );
-            if a.id == AGENT_CODEX {
-                s.quota = codex_quota.clone();
-                s.spark_quota = codex_spark_quota.clone();
-                s.quota_trend = codex_quota_trend.clone();
-                s.spark_quota_trend = codex_spark_quota_trend.clone();
-            }
             per_agent.push(s);
         }
         let mut all = build_scope("all", "All", "", &events, &turns, PALETTE, "", &cfg, now);
@@ -306,6 +322,7 @@ pub fn build_dashboard() -> Dashboard {
         today_tokens,
         generated_at: now.to_rfc3339(),
         telemetry_since_ms,
+        provider_limits,
     }
 }
 
@@ -322,7 +339,7 @@ pub fn build_range_dashboard(start: NaiveDate, end: NaiveDate) -> Result<RangeDa
         store.save();
     }
 
-    let cfg = UserConfig::load(&store.codex_project_dirs());
+    let cfg = UserConfig::load(&store.project_dirs());
     let pricing = Pricing::shared();
     let days = (end - start).num_days() + 1;
     let previous_start = start
@@ -506,9 +523,11 @@ fn set_installed_counts(report: &mut PeriodReport, agent_scope: &str, cfg: &User
     let (servers, skills) = match agent_scope {
         AGENT_CODEX => (cfg.codex_mcp_servers.len(), cfg.codex_skills.len()),
         AGENT_CLAUDE => (cfg.mcp_servers.len(), cfg.claude_skills.len()),
+        AGENT_PI => (report.metrics.servers as usize, cfg.pi_skills.len()),
         _ => (
-            cfg.mcp_servers.len() + cfg.codex_mcp_servers.len(),
-            cfg.claude_skills.len() + cfg.codex_skills.len(),
+            (cfg.mcp_servers.len() + cfg.codex_mcp_servers.len())
+                .max(report.metrics.servers as usize),
+            cfg.claude_skills.len() + cfg.codex_skills.len() + cfg.pi_skills.len(),
         ),
     };
     report.metrics.servers = servers as u64;
@@ -529,9 +548,11 @@ fn compute_event(
         .with_timezone(&Local);
     let model = normalize_model(&r.model);
     // price lookup uses the raw (possibly dated) id, then the normalized one
-    let cost_opt = pricing
-        .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
-        .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr));
+    let cost_opt = r.reported_cost.or_else(|| {
+        pricing
+            .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cr)
+            .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cr))
+    });
     let mcp = r
         .mcp
         .iter()
@@ -567,24 +588,26 @@ fn compute_turn(turn: &crate::store::TurnTelemetry, pricing: &Pricing) -> TurnEv
     let ts = DateTime::from_timestamp_millis(turn.ts_ms)
         .unwrap_or_default()
         .with_timezone(&Local);
-    let cost = pricing
-        .cost(
-            &turn.model,
-            turn.input_tokens,
-            turn.output_tokens,
-            turn.cache_creation_tokens,
-            turn.cache_read_tokens,
-        )
-        .or_else(|| {
-            pricing.cost(
-                &normalize_model(&turn.model),
+    let cost = turn.reported_cost.unwrap_or_else(|| {
+        pricing
+            .cost(
+                &turn.model,
                 turn.input_tokens,
                 turn.output_tokens,
                 turn.cache_creation_tokens,
                 turn.cache_read_tokens,
             )
-        })
-        .unwrap_or(0.0);
+            .or_else(|| {
+                pricing.cost(
+                    &normalize_model(&turn.model),
+                    turn.input_tokens,
+                    turn.output_tokens,
+                    turn.cache_creation_tokens,
+                    turn.cache_read_tokens,
+                )
+            })
+            .unwrap_or(0.0)
+    });
     TurnEvent {
         ts,
         agent: agent_def(&turn.agent).id,
@@ -815,7 +838,12 @@ impl Agg {
                 count: *c,
             })
             .collect();
-        v.sort_by_key(|item| std::cmp::Reverse(item.count));
+        v.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         v
     }
 
@@ -865,10 +893,12 @@ impl Agg {
 }
 
 /// Percentage change of `cur` vs `prev`, e.g. +20.0 for a 20% increase,
-/// rounded to 2 decimals. Returns 0 when there's no baseline to compare.
+/// rounded to 2 decimals. When the baseline is zero the change is undefined
+/// mathematically; a move from nothing to something is defined as +100%,
+/// while staying at zero stays 0%.
 fn pct_delta(cur: f64, prev: f64) -> f64 {
     if prev <= 0.0 {
-        return 0.0;
+        return if cur > 0.0 { 100.0 } else { 0.0 };
     }
     ((cur - prev) / prev * 10000.0).round() / 100.0
 }
@@ -1304,6 +1334,52 @@ mod tests {
             mcp: Vec::new(),
             skills: Vec::new(),
         }
+    }
+
+    #[test]
+    fn zero_baseline_delta_is_defined_as_100_percent() {
+        // Nothing → something: defined as +100%.
+        assert_eq!(pct_delta(5.0, 0.0), 100.0);
+        assert_eq!(pct_delta(1.0, -2.0), 100.0);
+        // Nothing → nothing: stays 0%.
+        assert_eq!(pct_delta(0.0, 0.0), 0.0);
+        // Normal relative change is unchanged.
+        assert_eq!(pct_delta(120.0, 100.0), 20.0);
+        assert_eq!(pct_delta(0.0, 100.0), -100.0);
+    }
+
+    #[test]
+    fn quota_trend_merges_api_points_with_same_cycle_log_history() {
+        let history = vec![
+            crate::store::QuotaHistoryPoint {
+                ts_ms: 1_000,
+                limit_id: "codex".to_string(),
+                used_pct: 10.0,
+                resets_at: 20_000,
+            },
+            crate::store::QuotaHistoryPoint {
+                ts_ms: 2_000,
+                limit_id: "codex".to_string(),
+                used_pct: 20.0,
+                resets_at: 20_010,
+            },
+            crate::store::QuotaHistoryPoint {
+                ts_ms: 3_000,
+                limit_id: "codex".to_string(),
+                used_pct: 99.0,
+                resets_at: 30_000,
+            },
+        ];
+        let live = vec![QuotaTrendPoint {
+            ts_ms: 3_500,
+            used_pct: 25.0,
+        }];
+
+        let trend = window_trend(&history, "codex", 30.0, 20_020, 4_000, &live);
+        assert_eq!(trend.len(), 4);
+        assert_eq!(trend[0].used_pct, 10.0);
+        assert_eq!(trend[2].used_pct, 25.0);
+        assert_eq!(trend[3].used_pct, 30.0);
     }
 
     #[test]

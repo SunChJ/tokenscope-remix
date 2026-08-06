@@ -36,14 +36,24 @@ export interface PeriodReport {
   agents: AgentSlice[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
-// Codex rate-limit snapshot (from the newest token_count event).
+// Codex provider quota (authenticated usage API; token_count log fallback).
 export interface Quota {
   plan: string;
   primaryPct: number; primaryMinutes: number; primaryResetsAt: number;
   secondaryPct: number; secondaryMinutes: number; secondaryResetsAt: number;
   asOfMs: number;
 }
-// One selectable dashboard view. A single data source yields exactly one scope
+// Provider subscription limits (Claude / Codex), independent of usage scopes.
+export interface LimitWindow {
+  id: string; label: string; durationMinutes: number;
+  usedPct: number; resetsAt: number; asOfMs: number;
+  trend: QuotaTrendPoint[];
+}
+export interface ProviderLimit {
+  provider: string; label: string; plan: string;
+  windows: LimitWindow[];
+}
+// One selectable dashboard view (Claude, Codex, Pi, …). A single data source yields exactly one scope
 // (id "all", empty color → classic UI, no chips); several sources yield
 // [All, agent, agent, …] and the header shows filter chips.
 export interface Scope {
@@ -54,6 +64,7 @@ export interface Scope {
 }
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string; telemetrySinceMs?: number;
+  providerLimits: ProviderLimit[];
 }
 export interface DateRange { startDate: string; endDate: string }
 export interface RangeScope { id: string; report: PeriodReport }
@@ -65,6 +76,7 @@ export interface RangeDashboard extends DateRange { scopes: RangeScope[] }
 export const AGENT_ACCENTS: Record<string, { dark: [string, string]; light: [string, string] }> = {
   claude: { dark: ["#d97757", "#eda380"], light: ["#c05b39", "#e8a184"] },
   codex: { dark: ["#10a37f", "#5ec9a8"], light: ["#0c8465", "#6fcdb0"] },
+  pi: { dark: ["#a855f7", "#c084fc"], light: ["#8436c7", "#a855f7"] },
 };
 
 /// Theme with the scope's agent accent applied (identity for the All scope).

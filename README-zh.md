@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-**macOS 菜单栏 / Windows 系统托盘工具**，统一展示本机 **AI 编码 Agent**（Claude Code **与 Codex CLI**）的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**——所有 Agent 一个仪表盘。
+**macOS 菜单栏 / Windows 系统托盘工具**，统一展示本机 **AI 编码 Agent**（Pi、Claude Code 与 Codex CLI）的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**——所有 Agent 一个仪表盘。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -20,36 +20,42 @@ brew install --cask sunchj/tokenscope/tokenscope
 
 - 菜单栏图标旁显示当日 Token 数（所有 Agent 合计，如 `⬡ 14.00M`）
 - 点击打开面板：默认显示 Day，与菜单栏 Token 数保持一致；可切换 Week / Month，也可按起止日期（含首尾日）筛选自定义区间
-- **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿）；只装一个 Agent 则界面与经典版完全一致
+- **多 Agent**：检测到 ≥2 个 Agent 时出现过滤 chips（All / Claude / Codex / Pi）——All 视图**按 Agent** 堆叠用量，切到单 Agent 时整个面板换成该 Agent 的品牌色（Claude 珊瑚橙 / Codex 青绿 / Pi 紫）；只装一个 Agent 则界面与经典版完全一致
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
 - 项目结算：按本地 Git 仓库 / 工作目录归集用量，可将当前时间段导出为 CSV，不暴露原始路径或对话正文
 - 可靠性遥测：统计完成/中止 Turn、工具错误/拒绝，以及中止任务消耗的 Token 与估算成本；从本版本开始增量采集
-- Context 健康度：上下文窗口中位/峰值压力、≥80% 提醒、压缩次数与 Codex reasoning Token 占比
+- Context 健康度：上下文窗口中位/峰值压力、≥80% 提醒、压缩次数，以及 Agent 可提供时的 reasoning Token 占比
 - 周额度趋势：对 Codex 快照下采样，展示当前重置周期的每日消耗速度与预计触顶时间
 - 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
-- **Codex 配额卡**：直接从 Codex 自己的日志读取当前周额度的已用百分比、plan 与重置倒计时
+- **额度详情卡**：实时订阅额度，**Claude**（5 小时 + 每周）与 **Codex**（每周 + Spark），经由 HappyUsage `hu` CLI 获取，采用 Codex status 风格（`29% left (resets 05:01 on 9 Aug)`）；session 日志快照作为离线回退
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
 - **只统计用户自己安装的 MCP / Skill**，过滤所有内置工具与自带 MCP
 
-## 数据来源（零侵入，只读）
+## 数据来源（本地优先；session 日志只读）
 
 | 用途 | 路径 |
 |------|------|
 | Claude 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
-| Codex 会话日志（Token / 模型 / 配额） | `~/.codex/sessions/**/*.jsonl`（支持 `CODEX_HOME`） |
+| Codex 会话日志（Token + 离线配额回退） | `~/.codex/sessions/**/*.jsonl`（支持 `CODEX_HOME`） |
+| Provider 额度（Claude + Codex） | HappyUsage `hu usage <provider> --json`（凭据/OAuth/API 均由 `hu` 负责；Claude 回退：`~/.claude.json` 的 `cachedUsageUtilization`） |
+| Pi 会话日志（Token / 模型 / 工具 / 遥测） | `~/.pi/agent/sessions/**/*.jsonl`（支持 `PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 与绝对路径 `settings.sessionDir`） |
 | Claude 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
 | Codex 用户 MCP 白名单 | 全局及受信任项目 `config.toml` → `[mcp_servers.*]`（`$CODEX_HOME/config.toml`、项目 `.codex/config.toml`） |
-| 用户 Skill 白名单 | Claude：`~/.claude/skills/`；Codex：`$CODEX_HOME/skills/`、`~/.agents/skills/` 与项目 `.agents/skills/` |
+| 用户 Skill 白名单 | Claude：`~/.claude/skills/`；Codex：`$CODEX_HOME/skills/`、`~/.agents/skills/` 与项目 `.agents/skills/`；Pi：全局、共享、项目级 Pi Skill 目录及 settings 显式路径 |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+
+配额请求统一走 HappyUsage `hu` CLI，由它负责凭据发现、OAuth 刷新与 provider 调用；Tokenscope 只缓存额度元数据，从不缓存凭据。
 
 ### 关键处理
 - Claude：按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
 - Codex：由独立 adapter 将单次响应的精确 `last_token_usage` 与累计 `total_token_usage` 快照交叉校验，quota-only 重复事件和 fork 回放不会被当成新用量；持久化回放使用稳定的 `(turn, 累计快照)` ID 去重，并从包含缓存的 `input_tokens` 中分别拆出 `cached_input_tokens` 与 `cache_write_input_tokens`，形成可与 Claude 对比的四类统计口径
+- Provider 额度：每 5 分钟在 dashboard build lock 外通过 `hu usage claude --json` + `hu usage codex --json` 刷新；最近一次成功快照落盘 `provider_limits.json`，`hu` 或网络失败时仍可展示。Claude `session`→5 小时 / `weekly`→7 天；Codex 主池→Weekly / Spark→Spark
+- Pi：每条持久化 assistant response 按其精确四类 `usage` 计入；用稳定的树 entry id 去重 `/fork` 或 `/clone` 复制的历史，session header 提供会话与项目归属；日志中的请求成本、reasoning、stop reason、工具错误、compaction 与模型 context window 会进入对应遥测
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
-- 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**
+- 成本按四类 token 分别计价；Pi 有持久化请求成本时优先采用。模型带 `priced` 标记，**所有价格源都查不到的模型只计 Token、UI 标注「暂无定价」**
 - 日志只有裸模型名、无厂商信息 → 第三方模型默认取官方厂商价（估算）
-- 工具分类：MCP 调用从直接的 `mcp__<server>__*` 名称、Codex tool-search 映射或 Codex App 自定义调用中归属 server，再按**所属 Agent**配置过滤；Claude 的 Skill 工具/斜杠命令及 Codex 对 `SKILL.md` 的读取，会按所属 Agent 的用户/项目 skills 目录匹配；其余忽略
+- 工具分类：MCP 调用从直接的 `mcp__<server>__*` 名称、Codex tool-search 映射或 Codex App 自定义调用中归属 server，再按**所属 Agent**配置过滤；Claude 的 Skill 工具/斜杠命令，以及 Codex 与 Pi 对 `SKILL.md` 的读取，会按所属 Agent 的用户/项目 skills 目录匹配；其余忽略
 
 > 花费为按公开价格的**估算**；订阅用户应理解为「等效消费价值」。
 
@@ -63,6 +69,8 @@ brew install --cask sunchj/tokenscope/tokenscope
 | **Cache 写入** | `cache_creation_input_tokens` | 写入提示缓存的上下文 | 约 1.25× |
 | **Cache 命中**(读) | `cache_read_input_tokens` | 从缓存重放的上下文 | 约 0.1×(便宜很多) |
 | **Output** | `output_tokens` | 模型生成的 token | 约 5× |
+
+Pi 以 `usage.input`、`usage.cacheWrite`、`usage.cacheRead`、`usage.output` 持久化相同四类口径；可选的 `usage.reasoning` 已是 output 的子集，不会重复相加。
 
 **Tokens**(按周期对消息求和):
 
@@ -135,7 +143,7 @@ App 会在启动时及此后每小时检测新版本。当前版本和更新操�
 - **macOS**：菜单栏出现图标 + 当日 Token 数（如 `⬡ 12.40M`）
 - **Windows**：系统托盘出现图标。Windows 任务栏托盘 API 不支持在图标旁显示文字，**鼠标悬停托盘图标**即可看到当日 Token 数（提示气泡形如 `Tokenscope · today 12.40M`）
 - 左键点击图标开/关面板，右键出菜单（Open / Refresh / Check for Updates / 显示偏好 / Quit）
-- **Weekly Remaining** 可配置菜单栏 Token 数后的周剩余额度：**Off**、仅 **Codex**（如 `12.40M-C76%`），或 **Codex + Spark**（`codex_bengalfox`，显示为 `12.40M-C76%-S93%`）；已过重置时间的额度快照不会继续显示，默认关闭，选择会被记住
+- **菜单栏显示** 控制菜单栏 Token 数后展示多少额度信息：**关闭**（`52.8M`）、**紧凑**（`52.8M · Cl79% · Cx29%`，各 provider 最紧张窗口）、**详细**（`52.8M · Cl 5h0/W79 · Cx W29/S31`）。百分比与 dashboard（`29% left (resets 05:01 on 9 Aug)`）采用相同的四舍五入**剩余值**。已过重置时间的窗口不会显示，默认关闭，选择会被记住
 - **Dashboard Shortcut** 可用全局快捷键切换面板的显示/隐藏（默认 macOS 为 `⌥⌘T`，Windows/Linux 为 `Ctrl+Alt+T`）；通过 **Change Dashboard Shortcut…** 可直接录入自定义组合键。默认关闭，选择会被记住
 - 已自动设置**登录自启**，无需手动配置
 
@@ -187,10 +195,11 @@ src/                  React 前端
   charts.tsx          图表原语（柱状/甜甜圈/sparkline/热力图/分段控件）
   App.tsx             主面板
 src-tauri/src/
-  store.rs            多源 JSONL 增量摄取（Claude + Codex 适配器）
+  store.rs            多源 JSONL 增量摄取（Claude + Codex + Pi 适配器）
   parser.rs           按 Scope 聚合（All / 单 Agent；预设周期 + 自定义区间 + 热力图）
   pricing.rs          models.dev / LiteLLM 价格加载与计价
-  config.rs           用户 MCP / Skill 白名单（Claude + Codex）
+  quota_api.rs        已认证 provider 配额 + 安全凭据刷新/缓存
+  config.rs           用户 MCP / Skill 白名单（Claude + Codex + Pi）
   model.rs            返回给前端的数据结构
   lib.rs              Tauri 命令 + 菜单栏托盘
 ```

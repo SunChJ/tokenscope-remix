@@ -20,7 +20,7 @@ pub struct ModelStat {
     pub cost: f64,   // USD estimate
     pub color: String,
     pub priced: bool, // false = no pricing data in LiteLLM (cost is unknown, not $0)
-    // Owning agent id ("claude" / "codex"). In the All scope the same model name
+    // Owning agent id ("claude" / "codex" / "pi"). In the All scope the same model name
     // can appear once per agent (e.g. gpt-5 via a router AND via Codex).
     pub agent: String,
 }
@@ -90,7 +90,7 @@ pub struct ContextStats {
     pub reasoning_pct: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct QuotaTrendPoint {
     #[serde(rename = "tsMs")]
     pub ts_ms: i64,
@@ -127,8 +127,8 @@ pub struct Metrics {
 /// hero split bar, `values` (aligned with `series`) drives the stacked chart.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSlice {
-    pub id: String,    // "claude" | "codex"
-    pub label: String, // "Claude" | "Codex"
+    pub id: String,    // "claude" | "codex" | "pi"
+    pub label: String, // "Claude" | "Codex" | "Pi"
     pub color: String, // base hex, same across charts
     pub tokens: f64,   // M tokens in the period
     pub values: Vec<f64>, // M tokens per series bucket
@@ -160,8 +160,11 @@ pub struct HeatDay {
     pub level: u8,    // 0..4
 }
 
-/// Codex rate-limit snapshot, straight from the newest token_count event's
-/// rate_limits. `as_of_ms` lets the UI flag a stale reading.
+/// Codex provider rate-limit snapshot. The authenticated usage API is primary;
+/// session-log rate_limits are the offline fallback. `as_of_ms` flags staleness.
+pub const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
+pub const RESET_CYCLE_TOLERANCE_SECONDS: i64 = 5 * 60;
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Quota {
     pub plan: String,
@@ -181,20 +184,67 @@ pub struct Quota {
     pub as_of_ms: i64,
 }
 
+impl Quota {
+    pub fn weekly_window(&self) -> Option<(f64, i64)> {
+        if self.primary_minutes == WEEKLY_WINDOW_MINUTES {
+            Some((self.primary_pct, self.primary_resets_at))
+        } else if self.secondary_minutes == WEEKLY_WINDOW_MINUTES {
+            Some((self.secondary_pct, self.secondary_resets_at))
+        } else {
+            None
+        }
+    }
+}
+
+pub fn same_reset_cycle(left: i64, right: i64) -> bool {
+    left == right
+        || (left > 0
+            && right > 0
+            && left.abs_diff(right) <= RESET_CYCLE_TOLERANCE_SECONDS as u64)
+}
+
+/// One window of a provider quota (Claude 5-hour / weekly, Codex weekly / Spark).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LimitWindow {
+    pub id: String, // "5h" | "weekly" | "spark"
+    pub label: String,
+    pub duration_minutes: u64,
+    #[serde(rename = "usedPct")]
+    pub used_pct: f64,
+    #[serde(rename = "resetsAt")]
+    pub resets_at: i64, // unix seconds
+    #[serde(rename = "asOfMs")]
+    pub as_of_ms: i64,
+    pub trend: Vec<QuotaTrendPoint>,
+}
+
+/// Provider subscription limits, independent of the token-usage source scopes.
+/// Providers are the paid subscription names (Claude / Codex); sources remain
+/// the CLI harnesses (Claude Code / Codex CLI / Pi) that produced the logs.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ProviderLimit {
+    pub provider: String, // "claude" | "codex"
+    pub label: String,    // "Claude" | "Codex"
+    pub plan: String,
+    pub windows: Vec<LimitWindow>,
+}
+
+impl ProviderLimit {}
+
 /// One selectable view of the dashboard. With a single data source there is
 /// exactly one scope (id "all", empty color → default theme, UI unchanged);
 /// with several sources the first scope is the aggregate ("all") followed by
 /// one scope per agent, and the UI shows filter chips.
 #[derive(Debug, Clone, Serialize)]
 pub struct Scope {
-    pub id: String,    // "all" | "claude" | "codex"
-    pub label: String, // "All" | "Claude" | "Codex"
+    pub id: String,    // "all" | "claude" | "codex" | "pi"
+    pub label: String, // "All" | "Claude" | "Codex" | "Pi"
     pub color: String, // agent accent hex; "" = default theme accent
     pub day: PeriodReport,
     pub week: PeriodReport,
     pub month: PeriodReport,
     pub heatmap: Vec<HeatDay>,
-    pub quota: Option<Quota>, // Codex only
+    pub quota: Option<Quota>, // Codex provider quota; may be owned by Pi scope
     #[serde(rename = "sparkQuota")]
     pub spark_quota: Option<Quota>, // codex_bengalfox only
     #[serde(rename = "quotaTrend")]
@@ -212,6 +262,11 @@ pub struct Dashboard {
     pub generated_at: String,
     #[serde(rename = "telemetrySinceMs")]
     pub telemetry_since_ms: i64,
+    // Provider subscription limits (Claude / Codex), global and independent of
+    // the selected scope. Populated by build_dashboard; empty when no provider
+    // has a usable snapshot.
+    #[serde(rename = "providerLimits")]
+    pub provider_limits: Vec<ProviderLimit>,
 }
 
 /// One scope's aggregation for an inclusive, user-selected date range.

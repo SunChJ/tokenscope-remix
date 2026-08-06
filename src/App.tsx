@@ -8,6 +8,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
   ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
+  ProviderLimit, LimitWindow,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
 import {
@@ -370,7 +371,7 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
   );
 }
 
-// Agent filter chips (All / Claude / Codex …). Rendered only when several
+// Agent filter chips (All / Claude / Codex / Pi …). Rendered only when several
 // sources have data; a single-source install never sees them.
 function AgentChips({ scopes, value, theme, onSelect }:
   { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void }) {
@@ -525,84 +526,100 @@ function ContextSection({ stats, theme }: { stats: ContextStats; theme: Theme })
         {item(text.median, stats.trackedTurns ? `${stats.medianPct.toFixed(1)}%` : "—", text.context)}
         {item(text.peak, stats.trackedTurns ? `${stats.peakPct.toFixed(1)}%` : "—", `${fmtInt(stats.nearLimitTurns)} ≥80%`, stats.peakPct >= 80)}
         {item(text.compacted, fmtInt(stats.compactions), text.times)}
-        {item(text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.codexOnly)}
+        {item(text.reasoning, stats.reasoningTokens > 0 ? `${stats.reasoningPct.toFixed(1)}%` : "—", stats.reasoningTokens > 0 ? fmtTokens(stats.reasoningTokens) : text.whenReported)}
       </div>
     </div>
   );
 }
 
-// Codex rate-limit card straight from the session logs. Keep collecting every
-// window for compatibility, but do not render the retired 5h limit or empty
-// windows omitted by newer Codex clients. Bars turn amber near the cap.
-function QuotaCard({ q, sparkQ, trend, theme }: { q?: Quota | null; sparkQ?: Quota | null; trend: QuotaTrendPoint[]; theme: Theme }) {
+// Provider subscription limits (Claude / Codex), independent of the usage
+// source scopes. Two-column layout: one column per provider, one bar per
+// window with remaining capacity and the reset date. No windows → no card.
+function ProviderMark({ provider, color }: { provider: string; color: string }) {
+  if (provider === "claude") {
+    // Anthropic official glyph (Simple Icons path).
+    return (
+      <svg width="15" height="15" viewBox="0 0 24 24" fill={color} aria-hidden="true">
+        <path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z" />
+      </svg>
+    );
+  }
+  // ChatGPT official knot glyph (Simple Icons path).
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill={color} aria-hidden="true">
+      <path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z" />
+    </svg>
+  );
+}
+
+function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme: Theme }) {
   const t = theme;
   const { locale, text } = useI18n();
   const now = Date.now();
-  const stale = q ? now - q.asOfMs > 60 * 60 * 1000 : false;
-  const winLabel = (min: number) =>
-    min === 10080 ? text.weekly : min % 60 === 0 && min > 0 ? `${min / 60}h ${text.window}` : `${min}m ${text.window}`;
-  const resetsIn = (unixS: number) => {
-    if (unixS <= 0) return "";
-    const ms = unixS * 1000 - now;
-    if (ms <= 0) return text.resetting;
-    const h = Math.floor(ms / 3.6e6), m = Math.round((ms % 3.6e6) / 6e4);
-    if (h >= 48) return `${text.resetsIn} ${Math.round(h / 24)}d`;
-    return h > 0 ? `${text.resetsIn} ${h}h ${m}m` : `${text.resetsIn} ${m}m`;
+  if (limits.length === 0) return null;
+
+  const status = (w: LimitWindow) => {
+    const left = Math.round(Math.max(0, Math.min(100, 100 - w.usedPct)));
+    if (w.resetsAt <= 0) return `${left}% ${text.left}`;
+    const reset = new Date(w.resetsAt * 1000);
+    if (reset.getTime() <= now) return `${left}% ${text.left} (${text.resetting})`;
+    const time = reset.toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+    const date = reset.toLocaleDateString(locale === "zh" ? "zh-CN" : "en-GB", { day: "numeric", month: "short" });
+    return locale === "zh"
+      ? `${left}% ${text.left}（${date} ${time} ${text.resets}）`
+      : `${left}% ${text.left} (${text.resets} ${time} ${text.on} ${date})`;
   };
-  const asOf = q ? new Date(q.asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" }) : "";
-  const quotaValues = trend.map((point) => point.usedPct);
-  const first = trend[0], last = trend[trend.length - 1];
-  const elapsedHours = first && last ? (last.tsMs - first.tsMs) / 3.6e6 : 0;
-  const burnPerDay = elapsedHours > 0 ? ((last.usedPct - first.usedPct) / elapsedHours) * 24 : 0;
-  const hoursToCap = burnPerDay > 0 && last ? ((100 - last.usedPct) / burnPerDay) * 24 : 0;
-  const horizon = hoursToCap > 0
-    ? hoursToCap < 24 ? `${Math.round(hoursToCap)}h ${text.toCap}` : `${(hoursToCap / 24).toFixed(1)}d ${text.toCap}`
-    : text.stable;
-  const quotaWindows = (quota?: Quota | null) => quota ? [
-    { id: "primary", minutes: quota.primaryMinutes, pct: quota.primaryPct, resetsAt: quota.primaryResetsAt },
-    { id: "secondary", minutes: quota.secondaryMinutes, pct: quota.secondaryPct, resetsAt: quota.secondaryResetsAt },
-  ] : [];
-  const windows = quotaWindows(q).filter((window) => window.minutes > 0 && window.minutes !== 5 * 60);
-  const sparkWeekly = quotaWindows(sparkQ).find((window) => window.minutes === 7 * 24 * 60);
-  const Bar = ({ label, pctUsed, sub }: { label: string; pctUsed: number; sub: string }) => {
-    const p = Math.max(0, Math.min(100, pctUsed));
-    const col = p >= 80 ? "#e0795f" : t.accent;
-    return (
-      <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "4px 0" }}>
-        <span style={{ font: `500 10.5px ${t.mono}`, color: t.text, flex: "0 0 84px" }}>{label}</span>
-        <div style={{ flex: 1, height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
-          <div style={{ width: `${p}%`, height: "100%", background: col, borderRadius: 3 }} />
-        </div>
-        <span style={{ font: `600 10.5px ${t.mono}`, color: p >= 80 ? col : t.text, flex: "0 0 34px", textAlign: "right" }}>{Math.round(p)}%</span>
-        <span style={{ font: `500 9px ${t.mono}`, color: t.faint, flex: "0 0 92px", textAlign: "right", whiteSpace: "nowrap" }}>{sub}</span>
-      </div>
-    );
+  const trendNote = (w: LimitWindow) => {
+    if (w.trend.length < 2) return null;
+    const first = w.trend[0], last = w.trend[w.trend.length - 1];
+    const elapsedHours = (last.tsMs - first.tsMs) / 3.6e6;
+    if (elapsedHours <= 0) return null;
+    const burnPerDay = ((last.usedPct - first.usedPct) / elapsedHours) * 24;
+    const hoursToCap = burnPerDay > 0 ? ((100 - last.usedPct) / burnPerDay) * 24 : 0;
+    if (hoursToCap <= 0) return null;
+    const horizon = hoursToCap < 24 ? `${Math.round(hoursToCap)}h` : `${(hoursToCap / 24).toFixed(1)}d`;
+    return `${burnPerDay >= 0 ? "+" : ""}${burnPerDay.toFixed(1)}%${text.perDay} · ${horizon} ${text.toCap}`;
   };
+
   return (
-    <div>
-      <div style={{ opacity: stale ? 0.65 : 1 }}>
-        {windows.map((window) => (
-          <Bar key={window.id} label={winLabel(window.minutes)} pctUsed={window.pct} sub={resetsIn(window.resetsAt)} />
-        ))}
-      </div>
-      {sparkWeekly && (
-        <div style={{ opacity: now - (sparkQ?.asOfMs ?? 0) > 60 * 60 * 1000 ? 0.65 : 1 }}>
-          <Bar label={`Spark ${text.weekly}`} pctUsed={sparkWeekly.pct} sub={resetsIn(sparkWeekly.resetsAt)} />
-        </div>
-      )}
-      {q && (
-        <div style={{ opacity: stale ? 0.65 : 1 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 9, marginTop: 5 }}>
-            <Sparkline values={quotaValues.length ? quotaValues : [0, 0]} theme={t} width={72} height={20} accent={t.accent} />
-            <span style={{ font: `500 8.5px/1.35 ${t.mono}`, color: t.faint }}>
-              {trend.length >= 2 && elapsedHours > 0 ? <>{burnPerDay >= 0 ? "+" : ""}{burnPerDay.toFixed(1)}%{text.perDay} · {horizon}</> : text.collectingWeeklyTrend}
-            </span>
+    <div style={{ display: "grid", gridTemplateColumns: limits.length >= 2 ? "1fr 1fr" : "1fr", gap: 16 }}>
+      {limits.map((limit) => {
+        const stale = now - limit.windows[0].asOfMs > 60 * 60 * 1000;
+        const asOf = new Date(limit.windows[0].asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" });
+        return (
+          <div key={limit.provider} style={{ minWidth: 0, opacity: stale ? 0.65 : 1 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
+              <ProviderMark provider={limit.provider} color={t.dim} />
+              <span style={{ font: `600 10px ${t.ui}`, color: t.text, letterSpacing: ".05em", textTransform: "uppercase" }}>{limit.label}</span>
+              {limit.plan && <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{limit.plan}</span>}
+            </div>
+            {limit.windows.map((w) => {
+              const left = Math.max(0, Math.min(100, 100 - w.usedPct));
+              const col = left <= 20 ? "#e0795f" : t.accent;
+              const note = trendNote(w);
+              return (
+                <div key={w.id} style={{ padding: "4px 0" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ font: `500 9.5px ${t.mono}`, color: t.dim, flex: "0 0 48px" }}>{w.label}</span>
+                    <div style={{ flex: 1, height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
+                      <div style={{ width: `${left}%`, height: "100%", background: col, borderRadius: 3 }} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
+                    <span style={{ font: `500 9.5px ${t.mono}`, color: left <= 20 ? col : t.text }}>{status(w)}</span>
+                    {note && <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{note}</span>}
+                  </div>
+                </div>
+              );
+            })}
+            {stale && (
+              <div style={{ font: `500 8.5px ${t.mono}`, color: t.faint, marginTop: 2 }}>
+                {text.asOf} {asOf}
+              </div>
+            )}
           </div>
-          <div style={{ font: `500 9px ${t.mono}`, color: t.faint, marginTop: 3 }}>
-            {q.plan && <>{text.plan}: {q.plan}</>}{stale && <span> · {text.asOf} {asOf}</span>}
-          </div>
-        </div>
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -1216,12 +1233,12 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
             <span style={{ color: t.dim }}>{unpricedModels.map((m) => m.name).join(", ")}</span>
           </div>
         )}
-        {/* Codex quota — rate-limit windows read straight from the session logs */}
-        {(scope.quota || scope.sparkQuota) && (
+        {/* Provider subscription limits (Claude / Codex) — global, not scope-owned */}
+        {dash.providerLimits.length > 0 && (
           <>
             <SectionRule t={t} />
-            <div style={{ marginBottom: 4 }}><Label t={t}>{text.codexQuota}</Label></div>
-            <QuotaCard q={scope.quota} sparkQ={scope.sparkQuota} trend={scope.quotaTrend ?? []} theme={t} />
+            <div style={{ marginBottom: 4 }}><Label t={t}>{text.providerLimits}</Label></div>
+            <ProviderLimitsCard limits={dash.providerLimits} theme={t} />
           </>
         )}
         {projects.length > 0 && (
