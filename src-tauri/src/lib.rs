@@ -3,6 +3,7 @@ mod config;
 mod model;
 mod parser;
 mod pricing;
+mod quota_api;
 mod store;
 
 use model::{Dashboard, RangeDashboard};
@@ -38,13 +39,32 @@ fn now_ms() -> i64 {
 
 const DASHBOARD_SHORTCUT: &str = "CommandOrControl+Alt+T";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+/// What the menu-bar title shows next to today's token count. Compact shows
+/// the tightest window per provider; Detailed lists every window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-enum WeeklyQuotaDisplay {
+enum MenuBarQuotaDisplay {
     #[default]
     Off,
-    Codex,
-    CodexAndSpark,
+    Compact,
+    Detailed,
+}
+
+impl<'de> serde::Deserialize<'de> for MenuBarQuotaDisplay {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "off" => Self::Off,
+            // Legacy weekly-remaining values map to the compact summary.
+            "codex" | "codex_and_spark" => Self::Compact,
+            "compact" => Self::Compact,
+            "detailed" => Self::Detailed,
+            _ => Self::Off,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -75,7 +95,9 @@ impl AppLanguage {
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 struct TrayPreferences {
-    weekly_quota_display: WeeklyQuotaDisplay,
+    // Persisted key stays `weekly_quota_display` for forward compatibility;
+    // the semantics are now Menu Bar Display (off / compact / detailed).
+    weekly_quota_display: MenuBarQuotaDisplay,
     dashboard_shortcut: bool,
     dashboard_shortcut_key: String,
     language: AppLanguage,
@@ -84,7 +106,7 @@ struct TrayPreferences {
 impl Default for TrayPreferences {
     fn default() -> Self {
         Self {
-            weekly_quota_display: WeeklyQuotaDisplay::Off,
+            weekly_quota_display: MenuBarQuotaDisplay::Off,
             dashboard_shortcut: false,
             dashboard_shortcut_key: DASHBOARD_SHORTCUT.to_string(),
             language: AppLanguage::En,
@@ -97,8 +119,13 @@ struct TrayMenuState {
     open: MenuItem<tauri::Wry>,
     refresh: MenuItem<tauri::Wry>,
     check_updates: MenuItem<tauri::Wry>,
-    weekly: Submenu<tauri::Wry>,
-    weekly_off: CheckMenuItem<tauri::Wry>,
+    provider_limits: Submenu<tauri::Wry>,
+    provider_claude: MenuItem<tauri::Wry>,
+    provider_codex: MenuItem<tauri::Wry>,
+    menu_bar_display: Submenu<tauri::Wry>,
+    display_off: CheckMenuItem<tauri::Wry>,
+    display_compact: CheckMenuItem<tauri::Wry>,
+    display_detailed: CheckMenuItem<tauri::Wry>,
     dashboard_shortcut: CheckMenuItem<tauri::Wry>,
     change_dashboard_shortcut: MenuItem<tauri::Wry>,
     autostart: CheckMenuItem<tauri::Wry>,
@@ -112,8 +139,11 @@ struct TrayCopy {
     open: &'static str,
     refresh: &'static str,
     check_updates: &'static str,
-    weekly: &'static str,
+    provider_limits: &'static str,
+    menu_bar_display: &'static str,
     off: &'static str,
+    compact: &'static str,
+    detailed: &'static str,
     dashboard_shortcut: &'static str,
     change_dashboard_shortcut: &'static str,
     autostart: &'static str,
@@ -130,8 +160,11 @@ fn tray_copy(language: AppLanguage) -> &'static TrayCopy {
         open: "Open Tokenscope",
         refresh: "Refresh",
         check_updates: "Check for Updates…",
-        weekly: "Weekly Remaining",
+        provider_limits: "Provider Limits",
+        menu_bar_display: "Menu Bar Display",
         off: "Off",
+        compact: "Compact",
+        detailed: "Detailed",
         dashboard_shortcut: "Dashboard Shortcut",
         change_dashboard_shortcut: "Change Dashboard Shortcut…",
         autostart: "Launch at Login",
@@ -146,8 +179,11 @@ fn tray_copy(language: AppLanguage) -> &'static TrayCopy {
         open: "打开 Tokenscope",
         refresh: "刷新",
         check_updates: "检查更新…",
-        weekly: "周剩余额度",
+        provider_limits: "额度详情",
+        menu_bar_display: "菜单栏显示",
         off: "关闭",
+        compact: "紧凑",
+        detailed: "详细",
         dashboard_shortcut: "Dashboard 快捷键",
         change_dashboard_shortcut: "修改 Dashboard 快捷键…",
         autostart: "登录时启动",
@@ -211,8 +247,11 @@ fn apply_tray_language(menu: &TrayMenuState, language: AppLanguage, shortcut: &s
     let _ = menu.open.set_text(copy.open);
     let _ = menu.refresh.set_text(copy.refresh);
     let _ = menu.check_updates.set_text(copy.check_updates);
-    let _ = menu.weekly.set_text(copy.weekly);
-    let _ = menu.weekly_off.set_text(copy.off);
+    let _ = menu.provider_limits.set_text(copy.provider_limits);
+    let _ = menu.menu_bar_display.set_text(copy.menu_bar_display);
+    let _ = menu.display_off.set_text(copy.off);
+    let _ = menu.display_compact.set_text(copy.compact);
+    let _ = menu.display_detailed.set_text(copy.detailed);
     let _ = menu
         .dashboard_shortcut
         .set_text(dashboard_shortcut_menu_label(shortcut, language));
@@ -228,69 +267,135 @@ fn apply_tray_language(menu: &TrayMenuState, language: AppLanguage, shortcut: &s
     let _ = menu.quit.set_text(copy.quit);
 }
 
-fn weekly_remaining_from_quota(quota: &model::Quota, now_s: i64) -> Option<u8> {
-    let (used, resets_at) = if quota.primary_minutes == 7 * 24 * 60 {
-        (quota.primary_pct, quota.primary_resets_at)
-    } else if quota.secondary_minutes == 7 * 24 * 60 {
-        (quota.secondary_pct, quota.secondary_resets_at)
-    } else {
-        return None;
-    };
-    // A dormant pool may not emit another snapshot after its window resets.
-    // Do not keep advertising that expired reading in the native tray.
-    if resets_at > 0 && resets_at <= now_s {
+/// Percentage left for a window, hidden once its reset timestamp has passed
+/// (a dormant pool may stop emitting snapshots after the window rolls over).
+fn window_left(window: &model::LimitWindow, now_s: i64) -> Option<u8> {
+    if window.resets_at > 0 && window.resets_at <= now_s {
         return None;
     }
-    Some((100.0 - used).clamp(0.0, 100.0).round() as u8)
+    Some((100.0 - window.used_pct).clamp(0.0, 100.0).round() as u8)
 }
 
-fn dashboard_quotas(dash: &Dashboard) -> (Option<&model::Quota>, Option<&model::Quota>) {
-    dash.scopes
+/// Provider prefix + window token used in menu-bar summaries.
+/// Claude → Cl, Codex → Cx; windows: 5h / W / S.
+fn provider_prefix(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "Cl",
+        "codex" => "Cx",
+        _ => "",
+    }
+}
+
+fn window_token(window: &model::LimitWindow) -> &'static str {
+    match window.id.as_str() {
+        "5h" => "5h",
+        "spark" => "S",
+        _ => "W",
+    }
+}
+
+/// One provider's menu-bar segment: compact shows only the tightest window,
+/// detailed lists every active window (`Cl 5h64/W82`).
+fn provider_summary(limit: &model::ProviderLimit, detailed: bool, now_s: i64) -> String {
+    let prefix = provider_prefix(&limit.provider);
+    let active: Vec<&model::LimitWindow> = limit
+        .windows
         .iter()
-        .find(|scope| scope.quota.is_some() || scope.spark_quota.is_some())
-        .map(|scope| (scope.quota.as_ref(), scope.spark_quota.as_ref()))
-        .unwrap_or((None, None))
+        .filter(|window| window_left(window, now_s).is_some())
+        .collect();
+    if active.is_empty() {
+        return String::new();
+    }
+    if !detailed {
+        let tightest = limit
+            .windows
+            .iter()
+            .filter(|window| window_left(window, now_s).is_some())
+            .max_by(|a, b| {
+                a.used_pct
+                    .partial_cmp(&b.used_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("non-empty");
+        let left = window_left(tightest, now_s).expect("filtered");
+        return format!("{prefix}{left}%");
+    }
+    let mut sorted = active;
+    sorted.sort_by_key(|window| match window.id.as_str() {
+        "5h" => 0,
+        "weekly" => 1,
+        _ => 2,
+    });
+    let parts: Vec<String> = sorted
+        .iter()
+        .filter_map(|window| {
+            window_left(window, now_s).map(|left| {
+                format!("{}{}%", window_token(window), left)
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix} {}", parts.join("/"))
+    }
 }
 
-fn weekly_label_suffix(
-    display: WeeklyQuotaDisplay,
-    codex: Option<&model::Quota>,
-    spark: Option<&model::Quota>,
-    now_s: i64,
-) -> String {
-    let mut suffix = String::new();
+fn tray_label(dash: &Dashboard, display: MenuBarQuotaDisplay, language: AppLanguage) -> String {
+    let mut label = fmt_tokens_m(dash.today_tokens, language);
+    let now_s = now_ms() / 1000;
     match display {
-        WeeklyQuotaDisplay::Off => {}
-        WeeklyQuotaDisplay::Codex => {
-            if let Some(remaining) =
-                codex.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
-            {
-                // Keep the pool identity explicit even when only one quota is
-                // selected; an unlabeled percentage is easy to mistake for Spark.
-                suffix.push_str(&format!("-C{remaining}%"));
-            }
-        }
-        WeeklyQuotaDisplay::CodexAndSpark => {
-            if let Some(remaining) =
-                codex.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
-            {
-                suffix.push_str(&format!("-C{remaining}%"));
-            }
-            if let Some(remaining) =
-                spark.and_then(|quota| weekly_remaining_from_quota(quota, now_s))
-            {
-                suffix.push_str(&format!("-S{remaining}%"));
+        MenuBarQuotaDisplay::Off => {}
+        MenuBarQuotaDisplay::Compact | MenuBarQuotaDisplay::Detailed => {
+            let detailed = display == MenuBarQuotaDisplay::Detailed;
+            let mut segments: Vec<String> = dash
+                .provider_limits
+                .iter()
+                .map(|limit| provider_summary(limit, detailed, now_s))
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if !segments.is_empty() {
+                segments.insert(0, label);
+                label = segments.join(" · ");
             }
         }
     }
-    suffix
+    label
 }
 
-fn tray_label(dash: &Dashboard, display: WeeklyQuotaDisplay, language: AppLanguage) -> String {
-    let mut label = fmt_tokens_m(dash.today_tokens, language);
-    let (codex, spark) = dashboard_quotas(dash);
-    label.push_str(&weekly_label_suffix(display, codex, spark, now_ms() / 1000));
-    label
+/// Menu-bar text for each provider row under Provider Limits, e.g.
+/// "Claude — 5h 64% · W 82%" (Claude) or "Codex — W 29% · S 31%" (Codex).
+fn provider_menu_row(limit: Option<&model::ProviderLimit>, now_s: i64) -> String {
+    let Some(limit) = limit else {
+        return String::new();
+    };
+    let mut sorted: Vec<&model::LimitWindow> = limit
+        .windows
+        .iter()
+        .filter(|window| window_left(window, now_s).is_some())
+        .collect();
+    sorted.sort_by_key(|window| match window.id.as_str() {
+        "5h" => 0,
+        "weekly" => 1,
+        _ => 2,
+    });
+    let parts: Vec<String> = sorted
+        .iter()
+        .filter_map(|window| {
+            window_left(window, now_s).map(|left| {
+                let label = match window.id.as_str() {
+                    "5h" => "5h".to_string(),
+                    "weekly" => "W".to_string(),
+                    _ => "S".to_string(),
+                };
+                format!("{label} {left}%")
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        return format!("{} — —", limit.label);
+    }
+    format!("{} — {}", limit.label, parts.join(" · "))
 }
 
 fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
@@ -319,12 +424,47 @@ fn update_tray_label(app: &tauri::AppHandle, dash: &Dashboard) {
     });
 }
 
-/// Rebuild the dashboard (incremental), update the tray's token count, and push
-/// the fresh data to the UI so an open popover updates live.
+/// Rebuild the dashboard (incremental), update the tray's token count and the
+/// Provider Limits menu rows, then push the fresh data to the UI so an open
+/// popover updates live.
 fn refresh(app: &tauri::AppHandle) {
     let dash = parser::build_dashboard();
     update_tray_label(app, &dash);
+    update_provider_rows(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
+}
+
+/// Keep the two Provider Limits menu rows in sync with the latest snapshot.
+fn update_provider_rows(app: &tauri::AppHandle, dash: &Dashboard) {
+    let Some(state) = app.try_state::<TrayMenuState>() else {
+        return;
+    };
+    let now_s = now_ms() / 1000;
+    let (claude, codex) = provider_rows(&dash.provider_limits);
+    let claude_text = provider_menu_row(claude, now_s);
+    let codex_text = provider_menu_row(codex, now_s);
+    let provider_claude = state.provider_claude.clone();
+    let provider_codex = state.provider_codex.clone();
+    let handle = app.clone();
+    let _ = handle.run_on_main_thread(move || {
+        let _ = provider_claude.set_text(claude_text);
+        let _ = provider_codex.set_text(codex_text);
+    });
+}
+
+fn provider_rows(
+    limits: &[model::ProviderLimit],
+) -> (Option<&model::ProviderLimit>, Option<&model::ProviderLimit>) {
+    let mut claude = None;
+    let mut codex = None;
+    for limit in limits {
+        match limit.provider.as_str() {
+            "claude" => claude = Some(limit),
+            "codex" => codex = Some(limit),
+            _ => {}
+        }
+    }
+    (claude, codex)
 }
 
 /// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
@@ -412,7 +552,7 @@ fn parse_tray_preferences(text: &str) -> TrayPreferences {
         .and_then(|value| value.get("show_weekly_remaining")?.as_bool())
         .unwrap_or(false);
     if legacy_weekly_on {
-        preferences.weekly_quota_display = WeeklyQuotaDisplay::Codex;
+        preferences.weekly_quota_display = MenuBarQuotaDisplay::Compact;
     }
     preferences
 }
@@ -1014,6 +1154,9 @@ fn save_project_export(csv: String, label: String) -> Result<String, String> {
 
 /// For CLI/example validation against real logs.
 pub fn dashboard_json() -> String {
+    // CLI/example dumps are explicit diagnostics, so fetch synchronously instead
+    // of relying on the desktop app's background quota refresh loop.
+    quota_api::reload();
     serde_json::to_string_pretty(&parser::build_dashboard()).unwrap_or_default()
 }
 
@@ -1223,6 +1366,8 @@ pub fn run() {
             let dash = parser::build_dashboard();
             let label = tray_label(&dash, weekly_quota_display, language);
             let copy = tray_copy(language);
+            let now_s = now_ms() / 1000;
+            let (claude_limit, codex_limit) = provider_rows(&dash.provider_limits);
 
             let open_i = MenuItem::with_id(app, "open", copy.open, true, None::<&str>)?;
             let refresh_i = MenuItem::with_id(app, "refresh", copy.refresh, true, None::<&str>)?;
@@ -1233,35 +1378,58 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let weekly_off_i = CheckMenuItem::with_id(
+            // Provider Limits: one read-only row per provider, refreshed with
+            // every dashboard build. Clicking a row opens the dashboard.
+            let provider_claude_i = MenuItem::with_id(
                 app,
-                "weekly-off",
+                "provider-claude",
+                provider_menu_row(claude_limit, now_s),
+                true,
+                None::<&str>,
+            )?;
+            let provider_codex_i = MenuItem::with_id(
+                app,
+                "provider-codex",
+                provider_menu_row(codex_limit, now_s),
+                true,
+                None::<&str>,
+            )?;
+            let provider_limits_menu = Submenu::with_items(
+                app,
+                copy.provider_limits,
+                true,
+                &[&provider_claude_i, &provider_codex_i],
+            )?;
+            // Menu Bar Display: how much quota detail the title shows.
+            let display_off_i = CheckMenuItem::with_id(
+                app,
+                "display-off",
                 copy.off,
                 true,
-                weekly_quota_display == WeeklyQuotaDisplay::Off,
+                weekly_quota_display == MenuBarQuotaDisplay::Off,
                 None::<&str>,
             )?;
-            let weekly_codex_i = CheckMenuItem::with_id(
+            let display_compact_i = CheckMenuItem::with_id(
                 app,
-                "weekly-codex",
-                "Codex",
+                "display-compact",
+                copy.compact,
                 true,
-                weekly_quota_display == WeeklyQuotaDisplay::Codex,
+                weekly_quota_display == MenuBarQuotaDisplay::Compact,
                 None::<&str>,
             )?;
-            let weekly_codex_spark_i = CheckMenuItem::with_id(
+            let display_detailed_i = CheckMenuItem::with_id(
                 app,
-                "weekly-codex-spark",
-                "Codex + Spark",
+                "display-detailed",
+                copy.detailed,
                 true,
-                weekly_quota_display == WeeklyQuotaDisplay::CodexAndSpark,
+                weekly_quota_display == MenuBarQuotaDisplay::Detailed,
                 None::<&str>,
             )?;
-            let weekly_menu = Submenu::with_items(
+            let display_menu = Submenu::with_items(
                 app,
-                copy.weekly,
+                copy.menu_bar_display,
                 true,
-                &[&weekly_off_i, &weekly_codex_i, &weekly_codex_spark_i],
+                &[&display_off_i, &display_compact_i, &display_detailed_i],
             )?;
             let dashboard_shortcut_i = CheckMenuItem::with_id(
                 app,
@@ -1318,7 +1486,8 @@ pub fn run() {
                     &refresh_i,
                     &check_updates_i,
                     &PredefinedMenuItem::separator(app)?,
-                    &weekly_menu,
+                    &provider_limits_menu,
+                    &display_menu,
                     &dashboard_shortcut_i,
                     &change_dashboard_shortcut_i,
                     &autostart_i,
@@ -1331,8 +1500,13 @@ pub fn run() {
                 open: open_i.clone(),
                 refresh: refresh_i.clone(),
                 check_updates: check_updates_i.clone(),
-                weekly: weekly_menu.clone(),
-                weekly_off: weekly_off_i.clone(),
+                provider_limits: provider_limits_menu.clone(),
+                provider_claude: provider_claude_i.clone(),
+                provider_codex: provider_codex_i.clone(),
+                menu_bar_display: display_menu.clone(),
+                display_off: display_off_i.clone(),
+                display_compact: display_compact_i.clone(),
+                display_detailed: display_detailed_i.clone(),
                 dashboard_shortcut: dashboard_shortcut_i.clone(),
                 change_dashboard_shortcut: change_dashboard_shortcut_i.clone(),
                 autostart: autostart_i.clone(),
@@ -1412,11 +1586,15 @@ pub fn run() {
                         show_popover(app);
                         let _ = app.emit("check-for-updates", ());
                     }
-                    "weekly-off" | "weekly-codex" | "weekly-codex-spark" => {
+                    "provider-claude" | "provider-codex" => {
+                        // Rows are read-only summaries; clicking opens the panel.
+                        show_popover(app);
+                    }
+                    "display-off" | "display-compact" | "display-detailed" => {
                         let display = match event.id.as_ref() {
-                            "weekly-codex" => WeeklyQuotaDisplay::Codex,
-                            "weekly-codex-spark" => WeeklyQuotaDisplay::CodexAndSpark,
-                            _ => WeeklyQuotaDisplay::Off,
+                            "display-compact" => MenuBarQuotaDisplay::Compact,
+                            "display-detailed" => MenuBarQuotaDisplay::Detailed,
+                            _ => MenuBarQuotaDisplay::Off,
                         };
                         if let Some(state) = app.try_state::<TrayPreferencesState>() {
                             let Some(preferences) = state.0.lock().ok().map(|mut prefs| {
@@ -1425,10 +1603,11 @@ pub fn run() {
                             }) else {
                                 return;
                             };
-                            let _ = weekly_off_i.set_checked(display == WeeklyQuotaDisplay::Off);
-                            let _ = weekly_codex_i.set_checked(display == WeeklyQuotaDisplay::Codex);
-                            let _ = weekly_codex_spark_i
-                                .set_checked(display == WeeklyQuotaDisplay::CodexAndSpark);
+                            let _ = display_off_i.set_checked(display == MenuBarQuotaDisplay::Off);
+                            let _ = display_compact_i
+                                .set_checked(display == MenuBarQuotaDisplay::Compact);
+                            let _ = display_detailed_i
+                                .set_checked(display == MenuBarQuotaDisplay::Detailed);
                             save_tray_preferences(&preferences);
                             refresh(app);
                         }
@@ -1511,6 +1690,17 @@ pub fn run() {
                 std::thread::sleep(Duration::from_secs(24 * 60 * 60));
             });
 
+            // Provider quotas are network-backed and independent from session
+            // ingest. Refresh them off the dashboard build lock; a failed request
+            // keeps the last successful API cache/log snapshot fallback intact.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                if quota_api::reload() {
+                    refresh(&handle);
+                }
+                std::thread::sleep(Duration::from_secs(5 * 60));
+            });
+
             // Background refresh: keep the tray's token count current and push
             // live updates to an open popover. Cheap thanks to incremental ingest.
             let handle = app.handle().clone();
@@ -1574,67 +1764,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weekly_remaining_uses_seven_day_quota() {
-        let codex = model::Quota {
-            plan: "pro".into(),
-            primary_pct: 20.0,
-            primary_minutes: 300,
-            primary_resets_at: 0,
-            secondary_pct: 19.4,
-            secondary_minutes: 7 * 24 * 60,
-            secondary_resets_at: 0,
-            as_of_ms: 0,
+    fn provider_summaries_use_left_percentages() {
+        let limit = model::ProviderLimit {
+            provider: "codex".to_string(),
+            label: "Codex".to_string(),
+            plan: "Pro 5x".to_string(),
+            windows: vec![
+                model::LimitWindow {
+                    id: "weekly".to_string(),
+                    label: "Weekly".to_string(),
+                    duration_minutes: 7 * 24 * 60,
+                    used_pct: 71.0,
+                    resets_at: 0,
+                    as_of_ms: 0,
+                    trend: Vec::new(),
+                },
+                model::LimitWindow {
+                    id: "spark".to_string(),
+                    label: "Spark".to_string(),
+                    duration_minutes: 7 * 24 * 60,
+                    used_pct: 69.0,
+                    resets_at: 0,
+                    as_of_ms: 0,
+                    trend: Vec::new(),
+                },
+            ],
         };
-        let spark = model::Quota {
-            primary_pct: 7.0,
-            primary_minutes: 7 * 24 * 60,
-            ..codex.clone()
-        };
-
-        assert_eq!(weekly_remaining_from_quota(&codex, 1), Some(81));
+        assert_eq!(provider_summary(&limit, false, 1), "Cx29%");
+        assert_eq!(provider_summary(&limit, true, 1), "Cx W29%/S31%");
         assert_eq!(
-            weekly_label_suffix(WeeklyQuotaDisplay::Codex, Some(&codex), Some(&spark), 1),
-            "-C81%"
-        );
-        assert_eq!(
-            weekly_label_suffix(
-                WeeklyQuotaDisplay::CodexAndSpark,
-                Some(&codex),
-                Some(&spark),
-                1,
-            ),
-            "-C81%-S93%"
+            provider_menu_row(Some(&limit), 1),
+            "Codex — W 29% · S 31%"
         );
     }
 
     #[test]
-    fn weekly_label_hides_expired_pool_snapshots() {
-        let current = model::Quota {
-            plan: "pro".into(),
-            primary_pct: 20.0,
-            primary_minutes: 7 * 24 * 60,
-            primary_resets_at: 2_000,
-            secondary_pct: 0.0,
-            secondary_minutes: 0,
-            secondary_resets_at: 0,
-            as_of_ms: 0,
+    fn provider_summary_hides_expired_windows() {
+        let limit = model::ProviderLimit {
+            provider: "claude".to_string(),
+            label: "Claude".to_string(),
+            plan: String::new(),
+            windows: vec![
+                model::LimitWindow {
+                    id: "weekly".to_string(),
+                    label: "Weekly".to_string(),
+                    duration_minutes: 7 * 24 * 60,
+                    used_pct: 20.0,
+                    resets_at: 999,
+                    as_of_ms: 0,
+                    trend: Vec::new(),
+                },
+                model::LimitWindow {
+                    id: "5h".to_string(),
+                    label: "5-hour".to_string(),
+                    duration_minutes: 300,
+                    used_pct: 36.0,
+                    resets_at: 2_000,
+                    as_of_ms: 0,
+                    trend: Vec::new(),
+                },
+            ],
         };
-        let expired = model::Quota {
-            primary_pct: 7.0,
-            primary_resets_at: 999,
-            ..current.clone()
-        };
-
-        assert_eq!(weekly_remaining_from_quota(&expired, 1_000), None);
-        assert_eq!(
-            weekly_label_suffix(
-                WeeklyQuotaDisplay::CodexAndSpark,
-                Some(&current),
-                Some(&expired),
-                1_000,
-            ),
-            "-C80%"
-        );
+        // The expired weekly window drops out; only the 5h window remains.
+        assert_eq!(provider_summary(&limit, true, 1_000), "Cl 5h64%");
+        assert_eq!(provider_menu_row(Some(&limit), 1_000), "Claude — 5h 64%");
+        // Once every window is expired the provider disappears entirely.
+        assert_eq!(provider_summary(&limit, false, 2_001), "");
     }
 
     #[test]
@@ -1643,7 +1838,7 @@ mod tests {
             r#"{"show_weekly_remaining":true,"dashboard_shortcut":true}"#,
         );
 
-        assert_eq!(preferences.weekly_quota_display, WeeklyQuotaDisplay::Codex);
+        assert_eq!(preferences.weekly_quota_display, MenuBarQuotaDisplay::Compact);
         assert_eq!(preferences.dashboard_shortcut_key, DASHBOARD_SHORTCUT);
         assert_eq!(preferences.language, AppLanguage::En);
         assert!(DASHBOARD_SHORTCUT.parse::<Shortcut>().is_ok());
@@ -1656,5 +1851,18 @@ mod tests {
                 "Ctrl+Alt+T"
             }
         );
+    }
+
+    #[test]
+    fn legacy_weekly_display_values_map_to_compact() {
+        let off: MenuBarQuotaDisplay = serde_json::from_str(r#""off""#).unwrap();
+        let compact: MenuBarQuotaDisplay = serde_json::from_str(r#""codex""#).unwrap();
+        let compact_spark: MenuBarQuotaDisplay =
+            serde_json::from_str(r#""codex_and_spark""#).unwrap();
+        let detailed: MenuBarQuotaDisplay = serde_json::from_str(r#""detailed""#).unwrap();
+        assert_eq!(off, MenuBarQuotaDisplay::Off);
+        assert_eq!(compact, MenuBarQuotaDisplay::Compact);
+        assert_eq!(compact_spark, MenuBarQuotaDisplay::Compact);
+        assert_eq!(detailed, MenuBarQuotaDisplay::Detailed);
     }
 }

@@ -27,25 +27,29 @@ brew install --cask sunchj/tokenscope/tokenscope
 - Context health: median/peak context-window pressure, ≥80% warnings, compaction count, and reasoning-token share when reported by the agent
 - Weekly quota trend: downsampled Codex snapshots with daily burn rate and time-to-cap projection for the current reset cycle
 - Three breakdowns: **by model** / **by MCP call** / **by Skill call**
-- **Codex quota card**: the active weekly rate-limit window (used %, plan, reset countdown) read straight from Codex's own logs
+- **Provider limits card**: live subscription quota for **Claude** (5-hour + weekly) and **Codex** (weekly + Spark), sourced from the HappyUsage `hu` CLI and shown Codex-status style (`29% left (resets 05:01 on 9 Aug)`); session-log snapshots remain the offline fallback
 - Cost donut (hover for a single model), year-long activity heatmap
 - **Counts only the MCP servers / Skills you installed yourself** — all built-in tools and bundled MCP servers are filtered out
 
-## Data sources (zero-intrusion, read-only)
+## Data sources (local-first; session logs are read-only)
 
 | Purpose | Path |
 |---------|------|
 | Claude session logs (tokens / model / tool calls) | `~/.claude/projects/**/*.jsonl` |
-| Codex session logs (tokens / model / rate limits) | `~/.codex/sessions/**/*.jsonl` (honors `CODEX_HOME`) |
+| Codex session logs (tokens + offline quota fallback) | `~/.codex/sessions/**/*.jsonl` (honors `CODEX_HOME`) |
+| Provider quota (Claude + Codex) | HappyUsage `hu usage <provider> --json` (credential + OAuth + API owned by `hu`; Claude fallback: `~/.claude.json` `cachedUsageUtilization`) |
 | Pi session logs (tokens / model / tools / telemetry) | `~/.pi/agent/sessions/**/*.jsonl` (honors `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`, and absolute `settings.sessionDir`) |
 | Claude user MCP whitelist | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
 | Codex user MCP whitelist | Global and trusted-project `config.toml` → `[mcp_servers.*]` (`$CODEX_HOME/config.toml`, project `.codex/config.toml`) |
 | User Skill whitelist | Claude: `~/.claude/skills/`; Codex: `$CODEX_HOME/skills/`, `~/.agents/skills/`, and project `.agents/skills/`; Pi: global/shared/project Pi skill locations plus explicit settings paths |
 | Model prices | **Primary**: [models.dev](https://models.dev/api.json) (bare model names, matching the CLI logs) → **Fallback**: [LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → built-in snapshot. Cached in `~/Library/Caches/tokenscope/`, refreshed every 24h, with offline fallback |
 
+Quota requests go through the HappyUsage `hu` CLI, which owns credential discovery, OAuth refresh, and provider calls. Tokenscope caches only quota metadata, never credentials.
+
 ### Key processing
 - Claude: deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
 - Codex: a dedicated adapter cross-checks exact per-response `last_token_usage` against the accumulated `total_token_usage` snapshot, so quota-only repeats and fork replays are not counted as new work; stable `(turn, total snapshot)` ids deduplicate persisted replays, while `cached_input_tokens` and `cache_write_input_tokens` are split out of Codex's inclusive `input_tokens` for comparable four-category accounting
+- Provider quota: refreshed every 5 minutes outside the dashboard build lock via `hu usage claude --json` + `hu usage codex --json`; last successful snapshot is cached (`provider_limits.json`) and shown when `hu` or the network fails. Claude `session`→5-hour / `weekly`→7d; Codex primary→Weekly / Spark→Spark
 - Pi: each persisted assistant response contributes its exact four-way `usage`; stable tree-entry ids deduplicate history copied by `/fork` or `/clone`, while the session header supplies the session/project identity. Persisted request cost, reasoning, stop reason, tool errors, compactions, and model context windows feed the matching dashboard telemetry
 - Token split: `input` (uncached) / `cache` (creation+read) / `output`; the UI folds cache into "In" by default and shows a separate "cached %"
 - Price matching: exact id → normalized id (strip vendor prefix + `.`↔`p`, e.g. `glm-5.1`⇄`glm-5p1`); models.dev's official bare-name price wins
@@ -141,7 +145,7 @@ right-click menu to check immediately.
 - **macOS**: an icon plus today's token count appears in the menu bar (e.g. `⬡ 12.40M`)
 - **Windows**: the tray icon appears in the notification area. The Windows tray API doesn't show a label beside the icon — **hover the tray icon** to see today's token count in the tooltip (e.g. `Tokenscope · today 12.40M`)
 - Left-click the icon to toggle the panel; right-click for the menu (Open / Refresh / Check for Updates / display preferences / Quit)
-- **Weekly Remaining** controls the quota shown beside the menu-bar token count: **Off**, **Codex** (for example `12.40M-C76%`), or **Codex + Spark** (`codex_bengalfox`, shown as `12.40M-C76%-S93%`). Expired quota snapshots are hidden; the setting is off by default and remembers your choice
+- **Menu Bar Display** controls how much quota the menu-bar title shows next to the token count: **Off** (`52.8M`), **Compact** (`52.8M · Cl79% · Cx29%` — the tightest window per provider), or **Detailed** (`52.8M · Cl 5h0/W79 · Cx W29/S31`). Percentages use the same rounded **left** values as the dashboard (`29% left (resets 05:01 on 9 Aug)`). Expired windows are hidden; the setting is off by default and remembers your choice
 - **Dashboard Shortcut** toggles the panel with a global hotkey (`⌥⌘T` on macOS, `Ctrl+Alt+T` on Windows/Linux by default); use **Change Dashboard Shortcut…** to record your own combination. It is off by default and remembers your choice
 - **Launch-at-login is set up automatically** — no manual configuration needed
 
@@ -196,6 +200,7 @@ src-tauri/src/
   store.rs            incremental multi-source JSONL ingest (Claude + Codex + Pi adapters)
   parser.rs           aggregation into scopes (All / per-agent; presets + custom ranges + heatmap)
   pricing.rs          models.dev / LiteLLM price loading and costing
+  quota_api.rs        authenticated provider quota + credential-safe refresh/cache
   config.rs           user MCP / Skill whitelists (Claude + Codex + Pi)
   model.rs            data structures returned to the frontend
   lib.rs              Tauri commands + menu-bar tray

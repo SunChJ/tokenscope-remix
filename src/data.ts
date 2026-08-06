@@ -36,12 +36,22 @@ export interface PeriodReport {
   agents: AgentSlice[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
-// Codex rate-limit snapshot (from the newest token_count event).
+// Codex provider quota (authenticated usage API; token_count log fallback).
 export interface Quota {
   plan: string;
   primaryPct: number; primaryMinutes: number; primaryResetsAt: number;
   secondaryPct: number; secondaryMinutes: number; secondaryResetsAt: number;
   asOfMs: number;
+}
+// Provider subscription limits (Claude / Codex), independent of usage scopes.
+export interface LimitWindow {
+  id: string; label: string; durationMinutes: number;
+  usedPct: number; resetsAt: number; asOfMs: number;
+  trend: QuotaTrendPoint[];
+}
+export interface ProviderLimit {
+  provider: string; label: string; plan: string;
+  windows: LimitWindow[];
 }
 // One selectable dashboard view (Claude, Codex, Pi, …). A single data source yields exactly one scope
 // (id "all", empty color → classic UI, no chips); several sources yield
@@ -54,6 +64,7 @@ export interface Scope {
 }
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string; telemetrySinceMs?: number;
+  providerLimits: ProviderLimit[];
 }
 export interface DateRange { startDate: string; endDate: string }
 export interface RangeScope { id: string; report: PeriodReport }

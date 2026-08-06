@@ -44,8 +44,11 @@ All physical assistant entries in one tree file represent real upstream requests
 - `/skill:<name>` user commands are recognized when persisted directly.
 - Skill whitelists include Pi's global/shared/project locations and explicit non-glob settings paths.
 
+## Provider quota
+
+Pi sessions do not persist Codex rate limits, so quota is intentionally separate from session ingestion. Tokenscope queries provider quota through the HappyUsage `hu` CLI (see [DESIGN-usage-api.md](DESIGN-usage-api.md)); the resulting Claude / Codex limits are global and never attached to the Pi scope.
+
 ## Non-goals
 
-- Pi sessions do not persist Codex rate-limit snapshots, so the Pi scope does not synthesize a quota card.
 - Relative custom `sessionDir` values cannot be globally discovered outside their originating project cwd.
 - Generic extension tools are not classified as MCP unless their persisted name uses the `mcp__` convention.

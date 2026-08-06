@@ -1603,14 +1603,7 @@ impl Store {
     }
 
     fn record_quota_history(&mut self, limit_id: &str, quota: &Quota) {
-        let weekly = if quota.primary_minutes == 7 * 24 * 60 {
-            Some((quota.primary_pct, quota.primary_resets_at))
-        } else if quota.secondary_minutes == 7 * 24 * 60 {
-            Some((quota.secondary_pct, quota.secondary_resets_at))
-        } else {
-            None
-        };
-        let Some((used_pct, resets_at)) = weekly else {
+        let Some((used_pct, resets_at)) = quota.weekly_window() else {
             return;
         };
         let last = self
