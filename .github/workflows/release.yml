@@ -176,7 +176,7 @@ jobs:
             echo "RELEASE_BODY"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish release
+      - name: Build and upload release (draft)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,14 +184,35 @@ jobs:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: "Tokenscope ${{ env.RELEASE_TAG }}"
           releaseBody: ${{ steps.release_notes.outputs.body }}
-          releaseDraft: false
+          # Draft until every platform has uploaded: a failed job must not
+          # leave a partial public release (only its Windows assets once).
+          releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
 
+  publish:
+    needs: [prepare, release]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Every platform uploaded its draft assets; flip the release public.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false
+          echo "Published $RELEASE_TAG"
+
       - name: Update Homebrew Cask
-        if: matrix.os == 'macos-latest'
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
