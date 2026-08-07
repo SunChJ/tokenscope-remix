@@ -86,6 +86,23 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # Create the release once, here, before the platform jobs run. Two
+      # concurrent "create release" calls for the same tag race (one gets a
+      # 403 "Resource not accessible by integration"); pre-creating a draft
+      # lets every platform job find it and upload its assets, and the
+      # publish job flips it public only after all of them succeeded.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --draft \
+              --title "Tokenscope $TAG" \
+              --notes "Work in progress — assets are uploaded by the platform build jobs; the release becomes public once every platform succeeds." \
+              --repo "${{ github.repository }}"
+          fi
+
   release:
     needs: prepare
     if: needs.prepare.outputs.publish == 'true'
