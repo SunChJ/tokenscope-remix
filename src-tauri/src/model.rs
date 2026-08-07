@@ -160,41 +160,11 @@ pub struct HeatDay {
     pub level: u8,    // 0..4
 }
 
-/// Codex provider rate-limit snapshot. The authenticated usage API is primary;
-/// session-log rate_limits are the offline fallback. `as_of_ms` flags staleness.
+/// Provider limit windows are rolling weekly (Claude also has a 5-hour
+/// window). Same-cycle reset timestamps may drift a few seconds between `hu`
+/// calls, so trend continuity allows a small tolerance.
 pub const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 pub const RESET_CYCLE_TOLERANCE_SECONDS: i64 = 5 * 60;
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct Quota {
-    pub plan: String,
-    #[serde(rename = "primaryPct")]
-    pub primary_pct: f64,
-    #[serde(rename = "primaryMinutes")]
-    pub primary_minutes: u64,
-    #[serde(rename = "primaryResetsAt")]
-    pub primary_resets_at: i64, // unix seconds
-    #[serde(rename = "secondaryPct")]
-    pub secondary_pct: f64,
-    #[serde(rename = "secondaryMinutes")]
-    pub secondary_minutes: u64,
-    #[serde(rename = "secondaryResetsAt")]
-    pub secondary_resets_at: i64, // unix seconds
-    #[serde(rename = "asOfMs")]
-    pub as_of_ms: i64,
-}
-
-impl Quota {
-    pub fn weekly_window(&self) -> Option<(f64, i64)> {
-        if self.primary_minutes == WEEKLY_WINDOW_MINUTES {
-            Some((self.primary_pct, self.primary_resets_at))
-        } else if self.secondary_minutes == WEEKLY_WINDOW_MINUTES {
-            Some((self.secondary_pct, self.secondary_resets_at))
-        } else {
-            None
-        }
-    }
-}
 
 pub fn same_reset_cycle(left: i64, right: i64) -> bool {
     left == right
@@ -244,13 +214,6 @@ pub struct Scope {
     pub week: PeriodReport,
     pub month: PeriodReport,
     pub heatmap: Vec<HeatDay>,
-    pub quota: Option<Quota>, // Codex provider quota; may be owned by Pi scope
-    #[serde(rename = "sparkQuota")]
-    pub spark_quota: Option<Quota>, // codex_bengalfox only
-    #[serde(rename = "quotaTrend")]
-    pub quota_trend: Vec<QuotaTrendPoint>,
-    #[serde(rename = "sparkQuotaTrend")]
-    pub spark_quota_trend: Vec<QuotaTrendPoint>,
 }
 
 #[derive(Debug, Clone, Serialize)]
