@@ -37,19 +37,19 @@ brew install --cask sunchj/tokenscope/tokenscope
 |------|------|
 | Claude 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
 | Codex 会话日志（Token + 离线配额回退） | `~/.codex/sessions/**/*.jsonl`（支持 `CODEX_HOME`） |
-| Provider 额度（Claude + Codex） | HappyUsage `hu usage <provider> --json`（凭据/OAuth/API 均由 `hu` 负责；Claude 回退：`~/.claude.json` 的 `cachedUsageUtilization`） |
+| Provider 额度（Claude + Codex） | HappyUsage `hu` CLI，随应用 bundle 分发（`Resources/bin/hu`）；Claude 回退：`~/.claude.json` 的 `cachedUsageUtilization`，Codex 回退：基于 Pi / Codex CLI OAuth 的原生 usage API |
 | Pi 会话日志（Token / 模型 / 工具 / 遥测） | `~/.pi/agent/sessions/**/*.jsonl`（支持 `PI_CODING_AGENT_DIR`、`PI_CODING_AGENT_SESSION_DIR` 与绝对路径 `settings.sessionDir`） |
 | Claude 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
 | Codex 用户 MCP 白名单 | 全局及受信任项目 `config.toml` → `[mcp_servers.*]`（`$CODEX_HOME/config.toml`、项目 `.codex/config.toml`） |
 | 用户 Skill 白名单 | Claude：`~/.claude/skills/`；Codex：`$CODEX_HOME/skills/`、`~/.agents/skills/` 与项目 `.agents/skills/`；Pi：全局、共享、项目级 Pi Skill 目录及 settings 显式路径 |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
 
-配额请求统一走 HappyUsage `hu` CLI，由它负责凭据发现、OAuth 刷新与 provider 调用；Tokenscope 只缓存额度元数据，从不缓存凭据。
+配额请求统一走 HappyUsage `hu` CLI，由它负责凭据发现、OAuth 刷新与 provider 调用。二进制随应用包内置，无需系统安装；缺失时（如开发构建）回退到原生 Codex usage 调用。Tokenscope 只缓存额度元数据，从不缓存凭据。
 
 ### 关键处理
 - Claude：按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
 - Codex：由独立 adapter 将单次响应的精确 `last_token_usage` 与累计 `total_token_usage` 快照交叉校验，quota-only 重复事件和 fork 回放不会被当成新用量；持久化回放使用稳定的 `(turn, 累计快照)` ID 去重，并从包含缓存的 `input_tokens` 中分别拆出 `cached_input_tokens` 与 `cache_write_input_tokens`，形成可与 Claude 对比的四类统计口径
-- Provider 额度：每 5 分钟在 dashboard build lock 外通过 `hu usage claude --json` + `hu usage codex --json` 刷新；最近一次成功快照落盘 `provider_limits.json`，`hu` 或网络失败时仍可展示。Claude `session`→5 小时 / `weekly`→7 天；Codex 主池→Weekly / Spark→Spark
+- Provider 额度：每 5 分钟在 dashboard build lock 外通过内置 `hu usage claude --json` + `hu usage codex --json` 刷新；最近一次成功快照落盘 `provider_limits.json`，`hu` 或网络失败时仍可展示。Claude `session`→5 小时 / `weekly`→7 天；Codex 主池→Weekly / Spark→Spark
 - Pi：每条持久化 assistant response 按其精确四类 `usage` 计入；用稳定的树 entry id 去重 `/fork` 或 `/clone` 复制的历史，session header 提供会话与项目归属；日志中的请求成本、reasoning、stop reason、工具错误、compaction 与模型 context window 会进入对应遥测
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价

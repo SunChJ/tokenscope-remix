@@ -1,20 +1,25 @@
 //! Provider subscription quota, sourced from the HappyUsage `hu` CLI.
 //!
-//! `hu` already owns credential discovery, OAuth refresh, and provider API
-//! calls (Claude via the Anthropic OAuth usage API, Codex via the ChatGPT
-//! usage API). Tokenscope only invokes `hu usage <provider> --json`, parses
-//! the envelope, and caches the result so a later offline refresh still has
-//! the last successful reading. Codex session-log rate limits remain a
-//! fallback in the parser.
+//! `hu` owns credential discovery, OAuth refresh, and provider API calls.
+//! Tokenscope invokes `hu usage <provider> --json`, parses the envelope, and
+//! caches the result. When `hu` is missing or fails, Codex falls back to the
+//! native wham/usage call (Pi / Codex CLI OAuth) so users without HappyUsage
+//! still get quota; Claude falls back to Claude Code's local usage cache.
+//! Codex session-log rate limits remain a parser-level fallback.
 
 use crate::model::{same_reset_cycle, LimitWindow, ProviderLimit, QuotaTrendPoint, WEEKLY_WINDOW_MINUTES};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
+use std::time::Duration;
 
+const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CACHE_FILE: &str = "provider_limits.json";
 const CACHE_VERSION: u32 = 2;
 
@@ -93,20 +98,146 @@ fn save_cache(cache: &ProviderCache) {
 
 fn hu_executables() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    // 1. Bundled copy (app Resources/bin/hu) — the primary source so the app
+    //    is self-contained and the hu version ships with Tokenscope.
+    if let Some(path) = bundled_hu() {
+        candidates.push(path);
+    }
+    // 2. System installs (PATH + common locations; install.sh drops `hu` into
+    //    ~/.local/bin, which may not be on the app's PATH at launch).
     if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join(if cfg!(windows) { "hu.exe" } else { "hu" }))
             .find(|path| path.is_file())
     }) {
-        candidates.push(path);
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
     }
-    for path in ["/opt/homebrew/bin/hu", "/usr/local/bin/hu"] {
-        let path = PathBuf::from(path);
+    let mut extras = vec![
+        PathBuf::from("/opt/homebrew/bin/hu"),
+        PathBuf::from("/usr/local/bin/hu"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        extras.push(home.join(".local").join("bin").join("hu"));
+        extras.push(home.join("bin").join("hu"));
+        extras.push(home.join("go").join("bin").join("hu"));
+    }
+    for path in extras {
         if path.is_file() && !candidates.contains(&path) {
             candidates.push(path);
         }
     }
     candidates
+}
+
+/// Directory injected by lib.rs at startup: `app.path().resource_dir()`.
+static BUNDLE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+pub fn set_bundle_dir(dir: Option<PathBuf>) {
+    let _ = BUNDLE_DIR.set(dir);
+}
+
+fn bundled_hu() -> Option<PathBuf> {
+    let dir = BUNDLE_DIR.get()?;
+    let base = dir.as_ref()?;
+    let path = base
+        .join("bin")
+        .join(if cfg!(windows) { "hu.exe" } else { "hu" });
+    path.is_file().then_some(path)
+}
+
+const HAPPYUSAGE_INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh";
+const INSTALL_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
+static LAST_INSTALL_ATTEMPT_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Make sure `hu` exists, installing it once per 24h when missing. Returns
+/// true when a usable executable is present afterwards. Runs on the
+/// background refresh thread; a slow brew install only delays this refresh.
+fn ensure_hu() -> bool {
+    if !hu_executables().is_empty() {
+        return true;
+    }
+    let now = now_ms();
+    let last = LAST_INSTALL_ATTEMPT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < INSTALL_RETRY_MS {
+        return false;
+    }
+    let installed = try_install_hu();
+    LAST_INSTALL_ATTEMPT_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+    installed
+}
+
+fn try_install_hu() -> bool {
+    // 1. Homebrew: tap + install (covers macOS and Linux with brew).
+    if let Some(brew) = find_on_path("brew") {
+        let tap_ok = Command::new(&brew)
+            .args(["tap", "SunChJ/happyusage"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if tap_ok
+            && Command::new(&brew)
+                .args(["install", "hu"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+            && !hu_executables().is_empty()
+        {
+            return true;
+        }
+    }
+    // 2. Official install script (needs curl + sh): fetch, run, then re-scan.
+    if let Some(curl) = find_on_path("curl") {
+        if let Ok(script) = Command::new(&curl).args(["-fsSL", HAPPYUSAGE_INSTALL_URL]).output() {
+            if script.status.success() {
+                let tmp = std::env::temp_dir().join(format!(
+                    "happyusage-install-{}.sh",
+                    std::process::id()
+                ));
+                if fs::write(&tmp, &script.stdout).is_ok() {
+                    let ok = Command::new("sh")
+                        .arg(&tmp)
+                        .status()
+                        .map(|status| status.success())
+                        .unwrap_or(false);
+                    let _ = fs::remove_file(tmp);
+                    if ok && !hu_executables().is_empty() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // 3. Go toolchain as a last resort.
+    if let Some(go) = find_on_path("go") {
+        if Command::new(&go)
+            .args(["install", "github.com/SunChJ/happyusage/cmd/hu@latest"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+            && !hu_executables().is_empty()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }))
+        .find(|path| path.is_file())
 }
 
 /// Run `hu usage <provider> --json` and return the provider envelope
@@ -333,14 +464,19 @@ fn merge_trend(
     }
 }
 
-/// Refresh provider limits through `hu`. Each provider is independent: a
-/// failure keeps the previous successful snapshot for that provider.
+/// Refresh provider limits, installing `hu` first when missing. Each provider
+/// is independent: a failure keeps the previous successful snapshot. When `hu`
+/// is absent or its Codex call fails, the native wham/usage call is the next
+/// fallback, and Claude falls back to Claude Code's local usage cache.
 pub fn reload() -> bool {
     let previous = cache_lock()
         .read()
         .map(|cache| cache.clone())
         .unwrap_or_default();
     let mut next = previous.clone();
+
+    // First reload attempt: make sure `hu` exists (auto-install when missing).
+    ensure_hu();
 
     if let Some(claude) = run_hu("claude").and_then(|envelope| claude_from_hu(&envelope)) {
         next.claude = Some(claude);
@@ -351,6 +487,10 @@ pub fn reload() -> bool {
     }
     if let Some(codex) = run_hu("codex").and_then(|envelope| codex_from_hu(&envelope)) {
         next.codex = Some(codex);
+    } else if next.codex.is_none() {
+        // No `hu` (or its Codex call failed): try the native usage API using
+        // the Pi / Codex CLI OAuth credentials.
+        next.codex = codex_from_native();
     }
 
     let changed = next.claude.is_some() || next.codex.is_some();
@@ -365,6 +505,404 @@ pub fn reload() -> bool {
     } else {
         false
     }
+}
+
+// ── Native Codex fallback (no HappyUsage) ────────────────────────────
+
+#[derive(Clone)]
+struct Credential {
+    access: String,
+    account_id: String,
+    refresh: String,
+}
+
+fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Some(dirs::home_dir()?.join(".pi").join("agent")))
+}
+
+fn jwt_account_id(token: &str) -> String {
+    let Some(payload) = token.split('.').nth(1) else {
+        return String::new();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return String::new();
+    };
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|json| {
+            json.get("https://api.openai.com/auth")?
+                .get("chatgpt_account_id")?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// Pi's own `openai-codex` OAuth credential (~/.pi/agent/auth.json).
+fn read_pi_credential() -> Option<Credential> {
+    let path = pi_agent_dir()?.join("auth.json");
+    let json: Value = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    let auth = json.get("openai-codex")?;
+    if auth.get("type").and_then(Value::as_str) != Some("oauth") {
+        return None;
+    }
+    let access = auth.get("access")?.as_str()?.to_string();
+    if access.is_empty() {
+        return None;
+    }
+    let account_id = auth
+        .get("accountId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| jwt_account_id(&access));
+    Some(Credential {
+        access,
+        account_id,
+        refresh: auth
+            .get("refresh")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    if text.is_empty() || !text.is_ascii() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn parse_json_or_hex(text: &str) -> Option<Value> {
+    let text = text.trim();
+    serde_json::from_str(text).ok().or_else(|| {
+        let bytes = decode_hex(text)?;
+        serde_json::from_slice(&bytes).ok()
+    })
+}
+
+fn codex_auth_paths() -> Vec<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME") {
+        return vec![PathBuf::from(home).join("auth.json")];
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    vec![
+        home.join(".config").join("codex").join("auth.json"),
+        home.join(".codex").join("auth.json"),
+    ]
+}
+
+fn read_codex_credential() -> Option<Credential> {
+    codex_auth_paths()
+        .into_iter()
+        .filter_map(|path| {
+            let json = parse_json_or_hex(&fs::read_to_string(&path).ok()?)?;
+            let tokens = json.get("tokens")?;
+            let access = tokens.get("access_token")?.as_str()?.to_string();
+            if access.is_empty() {
+                return None;
+            }
+            let account_id = tokens
+                .get("account_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| jwt_account_id(&access));
+            Some(Credential {
+                access,
+                account_id,
+                refresh: tokens
+                    .get("refresh_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .next()
+}
+
+fn pi_executables() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(if cfg!(windows) { "pi.exe" } else { "pi" }))
+            .find(|path| path.is_file())
+    }) {
+        candidates.push(path);
+    }
+    for path in ["/opt/homebrew/bin/pi", "/usr/local/bin/pi"] {
+        let path = PathBuf::from(path);
+        if path.is_file() && !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
+/// Ask Pi itself for a fresh token so its credential lock and persistence
+/// stay authoritative; Tokenscope never rewrites Pi's auth.json.
+fn refreshed_pi_credential(_previous: &Credential) -> Option<Credential> {
+    for executable in pi_executables() {
+        let output = Command::new(executable)
+            .args([
+                "auth",
+                "print-bearer-token",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.5",
+                "--min-expiry",
+                "30m",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(stdout) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let access = stdout.trim().to_string();
+        if access.is_empty() {
+            continue;
+        }
+        let stored = read_pi_credential();
+        let account_id = stored
+            .as_ref()
+            .map(|credential| credential.account_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| jwt_account_id(&access));
+        return Some(Credential {
+            access,
+            account_id,
+            refresh: stored
+                .map(|credential| credential.refresh)
+                .unwrap_or_else(|| _previous.refresh.clone()),
+        });
+    }
+    None
+}
+
+fn persist_codex_credential(
+    path: &PathBuf,
+    previous_refresh: &str,
+    access: &str,
+    refresh: &str,
+) -> bool {
+    let Some(mut json) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| parse_json_or_hex(&text))
+    else {
+        return false;
+    };
+    let Some(tokens) = json.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if tokens
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        != previous_refresh
+    {
+        return false;
+    }
+    tokens.insert("access_token".to_string(), Value::String(access.to_string()));
+    tokens.insert("refresh_token".to_string(), Value::String(refresh.to_string()));
+    let account_id = jwt_account_id(access);
+    if !account_id.is_empty() {
+        tokens.insert("account_id".to_string(), Value::String(account_id));
+    }
+    let Ok(bytes) = serde_json::to_vec_pretty(&json) else {
+        return false;
+    };
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    if fs::write(&tmp, bytes).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(tmp);
+        return false;
+    }
+    true
+}
+
+fn refreshed_codex_credential(previous: &Credential) -> Option<Credential> {
+    if previous.refresh.is_empty() {
+        return None;
+    }
+    let response = ureq::post(CODEX_TOKEN_URL)
+        .timeout(Duration::from_secs(15))
+        .set("Content-Type", "application/x-www-form-urlencoded")
+        .send_form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+            ("refresh_token", previous.refresh.as_str()),
+        ])
+        .ok()?;
+    let json: Value = response.into_json().ok()?;
+    let access = json.get("access_token")?.as_str()?.to_string();
+    let refresh = json
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or(&previous.refresh)
+        .to_string();
+    let path = codex_auth_paths().into_iter().find(|path| path.is_file())?;
+    if !persist_codex_credential(&path, &previous.refresh, &access, &refresh) {
+        return None;
+    }
+    Some(Credential {
+        account_id: jwt_account_id(&access),
+        access,
+        refresh,
+    })
+}
+
+fn refresh_credential(previous: &Credential) -> Option<Credential> {
+    // Try the Pi CLI refresh first (most likely to have a working session),
+    // then the Codex CLI OAuth refresh.
+    refreshed_pi_credential(previous).or_else(|| refreshed_codex_credential(previous))
+}
+
+fn request_usage(credential: &Credential) -> Result<(Value, Option<f64>, Option<f64>), u16> {
+    let mut request = ureq::get(CODEX_USAGE_URL)
+        .timeout(Duration::from_secs(15))
+        .set("Authorization", &format!("Bearer {}", credential.access))
+        .set("Accept", "application/json")
+        .set("User-Agent", "Tokenscope");
+    if !credential.account_id.is_empty() {
+        request = request.set("ChatGPT-Account-Id", &credential.account_id);
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, _)) => return Err(status),
+        Err(_) => return Err(0),
+    };
+    let primary = response
+        .header("X-Codex-Primary-Used-Percent")
+        .and_then(|value| value.parse().ok());
+    let secondary = response
+        .header("X-Codex-Secondary-Used-Percent")
+        .and_then(|value| value.parse().ok());
+    response
+        .into_json::<Value>()
+        .map(|body| (body, primary, secondary))
+        .map_err(|_| 0)
+}
+
+fn native_number(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(number) => number.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Native wham/usage decoding → the same ProviderLimit shape as `hu`'s Codex
+/// envelope: primary pool becomes Weekly, `codex_bengalfox` becomes Spark.
+fn codex_from_native() -> Option<ProviderLimit> {
+    let credential = read_pi_credential().or_else(read_codex_credential)?;
+    let (body, primary_header, _) = request_usage(&credential)
+        .or_else(|status| {
+            if status != 401 {
+                return Err(status);
+            }
+            let refreshed = refresh_credential(&credential).ok_or(status)?;
+            request_usage(&refreshed)
+        })
+        .ok()?;
+    let plan = body.get("plan_type").and_then(Value::as_str).unwrap_or("");
+    let now_ms = now_ms();
+    let mut windows = Vec::new();
+    if let Some(rate_limit) = body.get("rate_limit") {
+        if let Some(primary) = rate_limit.get("primary_window") {
+            let used = primary_header
+                .or_else(|| native_number(primary.get("used_percent")))
+                .unwrap_or(0.0);
+            let resets_at = primary
+                .get("reset_at")
+                .and_then(|value| value.as_i64())
+                .or_else(|| {
+                    native_number(primary.get("reset_after_seconds"))
+                        .map(|seconds| now_ms / 1000 + seconds as i64)
+                })
+                .unwrap_or(0);
+            windows.push(LimitWindow {
+                id: "weekly".to_string(),
+                label: "Weekly".to_string(),
+                duration_minutes: WEEKLY_WINDOW_MINUTES,
+                used_pct: used,
+                resets_at,
+                as_of_ms: now_ms,
+                trend: Vec::new(),
+            });
+        }
+    }
+    if let Some(limits) = body
+        .get("additional_rate_limits")
+        .and_then(Value::as_array)
+    {
+        for entry in limits {
+            let is_spark = entry
+                .get("metered_feature")
+                .and_then(Value::as_str)
+                == Some("codex_bengalfox")
+                || entry
+                    .get("limit_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.to_ascii_lowercase().contains("spark"));
+            if !is_spark {
+                continue;
+            }
+            if let Some(rate_limit) = entry.get("rate_limit") {
+                if let Some(primary) = rate_limit.get("primary_window") {
+                    let used = native_number(primary.get("used_percent")).unwrap_or(0.0);
+                    let resets_at = primary
+                        .get("reset_at")
+                        .and_then(|value| value.as_i64())
+                        .or_else(|| {
+                            native_number(primary.get("reset_after_seconds"))
+                                .map(|seconds| now_ms / 1000 + seconds as i64)
+                        })
+                        .unwrap_or(0);
+                    windows.push(LimitWindow {
+                        id: "spark".to_string(),
+                        label: "Spark".to_string(),
+                        duration_minutes: WEEKLY_WINDOW_MINUTES,
+                        used_pct: used,
+                        resets_at,
+                        as_of_ms: now_ms,
+                        trend: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    Some(ProviderLimit {
+        provider: "codex".to_string(),
+        label: "Codex".to_string(),
+        plan: plan.to_string(),
+        windows,
+    })
 }
 
 #[cfg(test)]

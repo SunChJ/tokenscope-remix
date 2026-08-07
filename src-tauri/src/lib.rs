@@ -1228,6 +1228,10 @@ pub fn run() {
             refresh_pricing
         ])
         .setup(move |app| {
+            // Point quota_api at the bundled `hu` binary (app Resources/bin/hu)
+            // so provider quota works without any system install.
+            quota_api::set_bundle_dir(app.path().resource_dir().ok());
+
             // Menu-bar–only app: no Dock icon, runs in the background.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
