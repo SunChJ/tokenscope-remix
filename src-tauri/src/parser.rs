@@ -129,73 +129,6 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
-fn window_trend(
-    history: &[crate::store::QuotaHistoryPoint],
-    limit_id: &str,
-    used_pct: f64,
-    resets_at: i64,
-    as_of_ms: i64,
-    live_points: &[QuotaTrendPoint],
-) -> Vec<QuotaTrendPoint> {
-    // API reset timestamps can drift by a few seconds between calls. Merge
-    // same-cycle log history with the live points instead of starting a
-    // trend from scratch, otherwise the dashboard lingers in "Collecting".
-    let mut points: Vec<QuotaTrendPoint> = history
-        .iter()
-        .filter(|point| point.limit_id == limit_id && same_reset_cycle(point.resets_at, resets_at))
-        .map(|point| QuotaTrendPoint {
-            ts_ms: point.ts_ms,
-            used_pct: point.used_pct,
-        })
-        .chain(live_points.iter().cloned())
-        .collect();
-    points.push(QuotaTrendPoint {
-        ts_ms: as_of_ms,
-        used_pct,
-    });
-    points.sort_by_key(|point| point.ts_ms);
-    points.dedup_by(|right, left| {
-        if right.ts_ms == left.ts_ms {
-            left.used_pct = right.used_pct;
-            true
-        } else {
-            false
-        }
-    });
-    const MAX_POINTS: usize = 48;
-    if points.len() <= MAX_POINTS {
-        return points;
-    }
-    (0..MAX_POINTS)
-        .map(|index| {
-            let source = index * (points.len() - 1) / (MAX_POINTS - 1);
-            points[source].clone()
-        })
-        .collect()
-}
-
-/// Attach session-log Codex quota history to the matching provider windows so
-/// the trend has depth even before the next `hu` refresh.
-fn merge_log_trends(limits: &mut [ProviderLimit], store: &crate::store::Store) {
-    for limit in limits.iter_mut().filter(|limit| limit.provider == "codex") {
-        for window in &mut limit.windows {
-            let limit_id = if window.id == "spark" {
-                "codex_bengalfox"
-            } else {
-                "codex"
-            };
-            window.trend = window_trend(
-                &store.quota_history,
-                limit_id,
-                window.used_pct,
-                window.resets_at,
-                window.as_of_ms,
-                &window.trend,
-            );
-        }
-    }
-}
-
 pub fn build_dashboard() -> Dashboard {
     let _guard = BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -207,10 +140,8 @@ pub fn build_dashboard() -> Dashboard {
         store.save();
     }
     // Provider subscription limits (Claude / Codex) come from the `hu` CLI via
-    // quota_api; session-log Codex rate limits add trend depth. Provider limits
-    // are global — they never attach to a token-usage scope.
-    let mut provider_limits = quota_api::shared();
-    merge_log_trends(&mut provider_limits, &store);
+    // quota_api. They are global — they never attach to a token-usage scope.
+    let provider_limits = quota_api::shared();
     let telemetry_since_ms = store.telemetry_since_ms;
 
     // 2. Aggregate: apply current config + prices, slice by current time.
@@ -510,10 +441,6 @@ fn build_scope(
         week,
         month,
         heatmap,
-        quota: None,
-        spark_quota: None,
-        quota_trend: Vec::new(),
-        spark_quota_trend: Vec::new(),
     }
 }
 
@@ -1346,40 +1273,6 @@ mod tests {
         // Normal relative change is unchanged.
         assert_eq!(pct_delta(120.0, 100.0), 20.0);
         assert_eq!(pct_delta(0.0, 100.0), -100.0);
-    }
-
-    #[test]
-    fn quota_trend_merges_api_points_with_same_cycle_log_history() {
-        let history = vec![
-            crate::store::QuotaHistoryPoint {
-                ts_ms: 1_000,
-                limit_id: "codex".to_string(),
-                used_pct: 10.0,
-                resets_at: 20_000,
-            },
-            crate::store::QuotaHistoryPoint {
-                ts_ms: 2_000,
-                limit_id: "codex".to_string(),
-                used_pct: 20.0,
-                resets_at: 20_010,
-            },
-            crate::store::QuotaHistoryPoint {
-                ts_ms: 3_000,
-                limit_id: "codex".to_string(),
-                used_pct: 99.0,
-                resets_at: 30_000,
-            },
-        ];
-        let live = vec![QuotaTrendPoint {
-            ts_ms: 3_500,
-            used_pct: 25.0,
-        }];
-
-        let trend = window_trend(&history, "codex", 30.0, 20_020, 4_000, &live);
-        assert_eq!(trend.len(), 4);
-        assert_eq!(trend[0].used_pct, 10.0);
-        assert_eq!(trend[2].used_pct, 25.0);
-        assert_eq!(trend[3].used_pct, 30.0);
     }
 
     #[test]

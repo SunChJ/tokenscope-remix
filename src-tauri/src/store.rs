@@ -13,10 +13,10 @@
 //   codex  — ~/.codex/sessions/**/*.jsonl    (token_count turn deltas)
 //   pi     — ~/.pi/agent/sessions/**/*.jsonl (assistant messages)
 use crate::codex_adapter::{self, TokenCountOutcome};
-use crate::model::Quota;
+
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -63,20 +63,10 @@ pub struct TurnTelemetry {
     usage_ids: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-pub struct QuotaHistoryPoint {
-    pub ts_ms: i64,
-    pub limit_id: String,
-    pub used_pct: f64,
-    pub resets_at: i64,
-}
-
 #[derive(Serialize, Deserialize, Default)]
 struct TelemetryCache {
     since_ms: i64,
     turns: Vec<TurnTelemetry>,
-    #[serde(default)]
-    quota_history: Vec<QuotaHistoryPoint>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -181,13 +171,9 @@ pub struct Store {
     // count its token usage only once.
     index: HashMap<String, usize>,
     manifest: Manifest,
-    // Latest general and model-specific Codex rate-limit snapshots.
-    pub codex_quota: Option<Quota>,
-    pub codex_spark_quota: Option<Quota>,
     projects_by_source: HashMap<String, ProjectRef>,
     pub telemetry_since_ms: i64,
     pub turns: Vec<TurnTelemetry>,
-    pub quota_history: Vec<QuotaHistoryPoint>,
     telemetry_index: HashMap<String, usize>,
 }
 
@@ -222,17 +208,8 @@ const STORE_VERSION: u32 = 13;
 // v3: during the v2 migration, fully read source files that contain Spark
 // usage. A session can switch away from Spark after its last Spark snapshot,
 // leaving its model context outside the usual 64 KiB quota-file tail.
-// v4: an explicit `codex_bengalfox` limit id always identifies Spark. Real
-// concurrent sessions can report that id while the active model context still
-// says `gpt-5.6-sol`; trusting the model first temporarily put Spark's quota in
-// the standard Codex cache.
-const QUOTA_CACHE_VERSION: u32 = 4;
 const PROJECT_CACHE_VERSION: u32 = 1;
 const TELEMETRY_CACHE_VERSION: u32 = 1;
-// One-time quota migration: tail the 32 newest files, and fully read only
-// files which already contain Spark usage in the local event cache.
-const RECENT_QUOTA_FILES: usize = 32;
-const QUOTA_TAIL_BYTES: u64 = 64 * 1024;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -389,51 +366,15 @@ fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
     }
 }
 
-const CODEX_QUOTA_POOL: &str = "codex";
-const SPARK_QUOTA_POOL: &str = "codex_bengalfox";
-
-fn is_codex_spark_model(model: &str) -> bool {
-    let model = model
-        .trim()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    model == "gpt-5.3-codex-spark" || model.starts_with("gpt-5.3-codex-spark-")
-}
-
-/// Assign a quota snapshot to its independent rate-limit pool.
-///
-/// An explicit `codex_bengalfox` id is authoritative. The `codex` id is
-/// ambiguous because Codex also emits it for Spark turns, so model identity
-/// disambiguates that case.
-fn codex_quota_pool(model: &str, rl: &serde_json::Value) -> Option<&'static str> {
-    let limit_id = rl.get("limit_id").and_then(|value| value.as_str());
-    if limit_id == Some(SPARK_QUOTA_POOL) {
-        return Some(SPARK_QUOTA_POOL);
-    }
-    if !matches!(limit_id, None | Some(CODEX_QUOTA_POOL)) {
-        return None;
-    }
-    if is_codex_spark_model(model) {
-        return Some(SPARK_QUOTA_POOL);
-    }
-    Some(CODEX_QUOTA_POOL)
-}
-
 impl Store {
     /// Load persisted events + offset manifest (empty on first run).
     pub fn load() -> Self {
         let mut events: Vec<RawEvent> = Vec::new();
         let mut manifest = Manifest::default();
-        let mut codex_quota = None;
-        let mut codex_spark_quota = None;
         let mut projects_by_source = HashMap::new();
         let mut telemetry_since_ms = chrono::Utc::now().timestamp_millis();
         let mut turns = Vec::new();
-        let mut quota_history = Vec::new();
         let mut version_ok = false;
-        let mut quota_cache_ok = false;
         let mut telemetry_cache_ok = false;
         if let Some(dir) = cache_dir() {
             // If the cache was written by an older parser, discard it so ingest
@@ -460,19 +401,6 @@ impl Store {
                     events = e;
                     manifest = m;
                 }
-                quota_cache_ok = fs::read_to_string(dir.join("quota_version"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    == Some(QUOTA_CACHE_VERSION);
-                if quota_cache_ok {
-                    codex_quota = fs::read_to_string(dir.join("codex_quota.json"))
-                        .ok()
-                        .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
-                    codex_spark_quota =
-                        fs::read_to_string(dir.join("codex_bengalfox_quota.json"))
-                            .ok()
-                            .and_then(|t| serde_json::from_str::<Quota>(&t).ok());
-                }
                 let project_cache_ok = fs::read_to_string(dir.join("project_version"))
                     .ok()
                     .and_then(|text| text.trim().parse::<u32>().ok())
@@ -494,7 +422,6 @@ impl Store {
                     {
                         telemetry_since_ms = cache.since_ms;
                         turns = cache.turns;
-                        quota_history = cache.quota_history;
                         telemetry_cache_ok = true;
                     }
                 }
@@ -515,23 +442,11 @@ impl Store {
             events,
             index,
             manifest,
-            codex_quota,
-            codex_spark_quota,
             projects_by_source,
             telemetry_since_ms,
             turns,
-            quota_history,
             telemetry_index,
         };
-        if version_ok && !quota_cache_ok {
-            store.rebuild_codex_quotas();
-            if let Some(dir) = cache_dir() {
-                store.save_quota_cache(&dir);
-                // The quota trend uses the same pool id as the current
-                // snapshot, so persist the rebuilt history with it.
-                store.save_telemetry_cache(&dir);
-            }
-        }
         if version_ok && store.refresh_projects() {
             if let Some(dir) = cache_dir() {
                 store.save_project_cache(&dir);
@@ -558,7 +473,6 @@ impl Store {
             if let Ok(t) = serde_json::to_string(&self.manifest) {
                 let _ = write_atomic(&dir.join("offsets.json"), t.as_bytes());
             }
-            self.save_quota_cache(&dir);
             self.save_project_cache(&dir);
             self.save_telemetry_cache(&dir);
             let _ = write_atomic(&dir.join("version"), STORE_VERSION.to_string().as_bytes());
@@ -569,7 +483,6 @@ impl Store {
         let cache = TelemetryCache {
             since_ms: self.telemetry_since_ms,
             turns: self.turns.clone(),
-            quota_history: self.quota_history.clone(),
         };
         if let Ok(text) = serde_json::to_string(&cache) {
             let _ = write_atomic(&dir.join("telemetry.json"), text.as_bytes());
@@ -588,128 +501,6 @@ impl Store {
             &dir.join("project_version"),
             PROJECT_CACHE_VERSION.to_string().as_bytes(),
         );
-    }
-
-    fn save_quota_cache(&self, dir: &std::path::Path) {
-        let save = |name: &str, quota: &Option<Quota>| match quota {
-            Some(quota) => {
-                if let Ok(text) = serde_json::to_string(quota) {
-                    let _ = write_atomic(&dir.join(name), text.as_bytes());
-                }
-            }
-            None => {
-                let _ = fs::remove_file(dir.join(name));
-            }
-        };
-        save("codex_quota.json", &self.codex_quota);
-        save("codex_bengalfox_quota.json", &self.codex_spark_quota);
-        let _ = write_atomic(
-            &dir.join("quota_version"),
-            QUOTA_CACHE_VERSION.to_string().as_bytes(),
-        );
-    }
-
-    /// One-time migration from the old single-quota cache. Read only the tails
-    /// of recently active Codex logs; token_count snapshots occur frequently,
-    /// so this separates current quota buckets without rescanning usage history.
-    fn rebuild_codex_quotas(&mut self) {
-        self.codex_quota = None;
-        self.codex_spark_quota = None;
-        self.quota_history.clear();
-        let spark_sources: HashSet<String> = self
-            .events
-            .iter()
-            .filter(|event| is_codex_spark_model(&event.model))
-            .map(|event| event.source.clone())
-            .filter(|source| !source.is_empty())
-            .collect();
-        let Some(root) = codex_dir() else {
-            return;
-        };
-        let mut files: Vec<_> = WalkDir::new(root)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .map(|x| x == "jsonl")
-                    .unwrap_or(false)
-            })
-            .filter_map(|entry| {
-                let modified = entry.metadata().ok()?.modified().ok()?;
-                Some((modified, entry.into_path()))
-            })
-            .collect();
-        // Read the recent files oldest-first so quota history remains ordered.
-        // `update_codex_quota` still compares timestamps before replacing a
-        // current snapshot, so this is safe if filesystem mtimes are imperfect.
-        files.sort_by_key(|item| item.0);
-        let recent_start = files.len().saturating_sub(RECENT_QUOTA_FILES);
-
-        for (index, (_, path)) in files.into_iter().enumerate() {
-            let key = path.to_string_lossy().to_string();
-            let full_scan = spark_sources.contains(&key);
-            if index < recent_start && !full_scan {
-                continue;
-            }
-            let Ok(mut file) = fs::File::open(&path) else {
-                continue;
-            };
-            let Ok(size) = file.metadata().map(|meta| meta.len()) else {
-                continue;
-            };
-            let start = if full_scan {
-                0
-            } else {
-                size.saturating_sub(QUOTA_TAIL_BYTES)
-            };
-            if file.seek(SeekFrom::Start(start)).is_err() {
-                continue;
-            }
-            let mut bytes = Vec::with_capacity((size - start) as usize);
-            if file.read_to_end(&mut bytes).is_err() {
-                continue;
-            }
-            let skip = if start == 0 {
-                0
-            } else {
-                bytes
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(bytes.len())
-            };
-            // Tails usually begin after their last turn_context, so seed them
-            // with the final model from normal ingest. Spark source files are
-            // read from their start, where each turn_context is available.
-            // Keep `source` blank so this quota-only migration cannot alter
-            // persisted turn telemetry.
-            let mut state = if full_scan {
-                FileState::default()
-            } else {
-                self.manifest.files.get(&key).cloned().unwrap_or_default()
-            };
-            state.source.clear();
-            for line in bytes[skip..].split(|byte| *byte == b'\n') {
-                let Ok(text) = std::str::from_utf8(line) else {
-                    continue;
-                };
-                // `session_meta` is what arms the forked-thread replay skip, so
-                // a full scan must feed it through too — otherwise `replaying`
-                // never gets set and the parent's restamped rate_limits (216 in
-                // one sampled fork, all stamped with the fork instant) would be
-                // ingested as fresh quota readings. Tails don't need it: they
-                // inherit the flag from the manifest and start well past the
-                // replay window anyway.
-                if text.contains("\"session_meta\"")
-                    || text.contains("\"turn_context\"")
-                    || text.contains("\"rate_limits\"")
-                {
-                    let _ = self.parse_codex_line(text, &mut state);
-                }
-            }
-        }
     }
 
     /// Working directories seen in session headers. Config uses these to find
@@ -1144,21 +935,15 @@ impl Store {
                 let TokenCountOutcome::Usage(usage) = outcome else {
                     // Estimated context snapshots and unchanged-total quota
                     // heartbeats are not new upstream usage.
-                    if let Some(rl) = payload.get("rate_limits") {
-                        self.update_codex_quota(rl, ts_ms, &state.model);
-                    }
                     return None;
                 };
 
                 // A replay can carry a different rate-limit payload while still
                 // naming the same upstream response. The stable (turn,total)
-                // usage id is the second line of defense and must precede quota
-                // and telemetry side effects.
+                // usage id is the second line of defense and must precede
+                // telemetry side effects.
                 if !usage.event_id.is_empty() && self.index.contains_key(&usage.event_id) {
                     return None;
-                }
-                if let Some(rl) = payload.get("rate_limits") {
-                    self.update_codex_quota(rl, ts_ms, &state.model);
                 }
                 let context_window = payload
                     .get("info")
@@ -1553,84 +1338,6 @@ impl Store {
         }
 
         parse_claude_value(&value)
-    }
-
-    /// Keep the newest rate-limit snapshot. Spark and standard Codex models
-    /// consume separate pools. Honor an explicit Spark pool id first, then use
-    /// the active model to disambiguate snapshots carrying the shared `codex`
-    /// id.
-    fn update_codex_quota(&mut self, rl: &serde_json::Value, ts_ms: i64, model: &str) {
-        let Some(limit_id) = codex_quota_pool(model, rl) else {
-            return;
-        };
-        let previous = if limit_id == CODEX_QUOTA_POOL {
-            self.codex_quota.as_ref()
-        } else {
-            self.codex_spark_quota.as_ref()
-        };
-        if previous.map(|quota| quota.as_of_ms >= ts_ms).unwrap_or(false) {
-            return;
-        }
-        let win = |k: &str| rl.get(k);
-        let num = |w: Option<&serde_json::Value>, k: &str| {
-            w.and_then(|x| x.get(k)).and_then(|x| x.as_f64()).unwrap_or(0.0)
-        };
-        let (p, s) = (win("primary"), win("secondary"));
-        // A snapshot with no windows at all carries no information — skip it.
-        if p.is_none() && s.is_none() {
-            return;
-        }
-        let quota = Quota {
-            plan: rl
-                .get("plan_type")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string(),
-            primary_pct: num(p, "used_percent"),
-            primary_minutes: num(p, "window_minutes") as u64,
-            primary_resets_at: num(p, "resets_at") as i64,
-            secondary_pct: num(s, "used_percent"),
-            secondary_minutes: num(s, "window_minutes") as u64,
-            secondary_resets_at: num(s, "resets_at") as i64,
-            as_of_ms: ts_ms,
-        };
-        self.record_quota_history(limit_id, &quota);
-        if limit_id == CODEX_QUOTA_POOL {
-            self.codex_quota = Some(quota);
-        } else {
-            self.codex_spark_quota = Some(quota);
-        }
-    }
-
-    fn record_quota_history(&mut self, limit_id: &str, quota: &Quota) {
-        let Some((used_pct, resets_at)) = quota.weekly_window() else {
-            return;
-        };
-        let last = self
-            .quota_history
-            .iter()
-            .rev()
-            .find(|point| point.limit_id == limit_id);
-        if let Some(last) = last {
-            if quota.as_of_ms <= last.ts_ms {
-                return;
-            }
-            let same_value = (used_pct - last.used_pct).abs() < 0.1;
-            let recent = quota.as_of_ms - last.ts_ms < 15 * 60 * 1000;
-            if resets_at == last.resets_at && same_value && recent {
-                return;
-            }
-        }
-        self.quota_history.push(QuotaHistoryPoint {
-            ts_ms: quota.as_of_ms,
-            limit_id: limit_id.to_string(),
-            used_pct,
-            resets_at,
-        });
-        if self.quota_history.len().is_multiple_of(256) {
-            let cutoff = quota.as_of_ms - 180 * 24 * 60 * 60 * 1000;
-            self.quota_history.retain(|point| point.ts_ms >= cutoff);
-        }
     }
 }
 
@@ -2109,88 +1816,15 @@ mod tests {
             events: Vec::new(),
             index: HashMap::new(),
             manifest: Manifest::default(),
-            codex_quota: None,
-            codex_spark_quota: None,
             projects_by_source: HashMap::new(),
             telemetry_since_ms: 0,
             turns: Vec::new(),
-            quota_history: Vec::new(),
             telemetry_index: HashMap::new(),
         }
     }
 
     #[test]
-    fn keeps_spark_and_standard_codex_quotas_separate_by_model() {
-        let mut store = empty_store();
-        let snapshot = |limit_id: &str, used_percent: f64| {
-            serde_json::json!({
-                "limit_id": limit_id,
-                "primary": {
-                    "used_percent": used_percent,
-                    "window_minutes": 10080,
-                    "resets_at": 123
-                }
-            })
-        };
-
-        // Recent Spark JSONL events use `limit_id: codex`; model identity must
-        // still put that weekly usage in Spark's independent pool.
-        store.update_codex_quota(&snapshot("codex", 7.0), 100, "gpt-5.3-codex-spark");
-        store.update_codex_quota(&snapshot("codex", 24.05), 200, "gpt-5.6-sol");
-        // Explicit pool ids remain authoritative even when concurrent session
-        // context reports the same non-Spark model for both snapshots.
-        store.update_codex_quota(
-            &snapshot("codex_bengalfox", 24.1),
-            300,
-            "gpt-5.6-sol",
-        );
-
-        assert_eq!(store.codex_quota.unwrap().primary_pct, 24.05);
-        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 24.1);
-        assert_eq!(store.quota_history.len(), 3);
-    }
-
-    #[test]
-    fn explicit_spark_limit_id_overrides_model_context() {
-        let explicit_spark = serde_json::json!({
-            "limit_id": "codex_bengalfox",
-            "primary": {
-                "used_percent": 7.0,
-                "window_minutes": 10080,
-                "resets_at": 123
-            }
-        });
-
-        assert_eq!(
-            codex_quota_pool("", &explicit_spark),
-            Some(SPARK_QUOTA_POOL)
-        );
-        assert_eq!(
-            codex_quota_pool("chatgpt/gpt-5.3-codex-spark", &explicit_spark),
-            Some(SPARK_QUOTA_POOL)
-        );
-        assert_eq!(
-            codex_quota_pool("gpt-5.6-sol", &explicit_spark),
-            Some(SPARK_QUOTA_POOL)
-        );
-    }
-
-    #[test]
-    fn routes_codex_limit_id_to_spark_after_a_spark_turn_context() {
-        let mut store = empty_store();
-        let mut state = FileState::default();
-        let spark_context = r#"{"timestamp":"2026-07-15T09:50:00Z","type":"turn_context","payload":{"model":"gpt-5.3-codex-spark","turn_id":"spark-turn"}}"#;
-        let spark_usage = r#"{"timestamp":"2026-07-15T09:51:13Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":21,"window_minutes":10080,"resets_at":1784684425}}}}"#;
-
-        assert!(store.parse_codex_line(spark_context, &mut state).is_none());
-        assert!(store.parse_codex_line(spark_usage, &mut state).is_some());
-
-        assert!(store.codex_quota.is_none());
-        assert_eq!(store.codex_spark_quota.unwrap().primary_pct, 21.0);
-    }
-
-    #[test]
-    fn ignores_unchanged_codex_usage_but_keeps_its_new_quota() {
+    fn ignores_unchanged_codex_usage_heartbeats() {
         let mut store = empty_store();
         let mut state = FileState {
             source: "/tmp/codex-heartbeat.jsonl".to_string(),
@@ -2220,8 +1854,9 @@ mod tests {
         store.index.insert(first.id.clone(), store.events.len());
         store.events.push(first);
 
-        // A new turn starts by publishing fresher quota with the previous
-        // positive last_token_usage and an unchanged accumulated total.
+        // A new turn starts by republishing the previous positive
+        // last_token_usage with an unchanged accumulated total: a heartbeat,
+        // not new upstream work.
         store.parse_codex_line(&context("turn-b"), &mut state);
         assert!(store
             .parse_codex_line(
@@ -2230,7 +1865,6 @@ mod tests {
             )
             .is_none());
         assert_eq!(store.events.len(), 1);
-        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 11.0);
 
         let second = store
             .parse_codex_line(
@@ -2397,67 +2031,6 @@ mod tests {
             .expect("the child's own work counts");
         assert_eq!(fresh.id, "codex:turn-b@600:0:0:30:0:630");
         assert_eq!(fresh.in_tok, 300.0);
-    }
-
-    // A replayed usage event must not update the quota either: it carries the
-    // parent's stale rate_limits restamped with the fork instant, so letting it
-    // through made a long-past 100% reading beat the real current one.
-    #[test]
-    fn replayed_rate_limits_do_not_overwrite_the_current_quota() {
-        let mut store = empty_store();
-        let line = |pct: f64, ts: &str, total_input: u64, total_output: u64| {
-            format!(
-                r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":5,"cached_input_tokens":0,"output_tokens":1,"total_tokens":6}},"total_token_usage":{{"input_tokens":{total_input},"cached_input_tokens":0,"output_tokens":{total_output},"total_tokens":{total}}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{pct},"window_minutes":10080,"resets_at":100}}}}}}}}"#,
-                total = total_input + total_output,
-            )
-        };
-        let context = |turn: &str, ts: &str| {
-            format!(
-                r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"model":"gpt-5.6-sol","turn_id":"{turn}"}}}}"#
-            )
-        };
-
-        let mut parent = FileState {
-            source: "/tmp/p.jsonl".to_string(),
-            ..FileState::default()
-        };
-        store.parse_codex_line(&context("cap", "2026-07-23T00:00:00Z"), &mut parent);
-        let capped = store
-            .parse_codex_line(
-                &line(100.0, "2026-07-23T00:00:01Z", 5, 1),
-                &mut parent,
-            )
-            .expect("real reading");
-        store.index.insert(capped.id.clone(), store.events.len());
-        store.events.push(capped);
-        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 100.0);
-
-        // The window rolled over; a real later reading drops back to 9%.
-        store.parse_codex_line(&context("now", "2026-07-29T00:00:00Z"), &mut parent);
-        let fresh = store
-            .parse_codex_line(
-                &line(9.0, "2026-07-29T00:00:01Z", 10, 2),
-                &mut parent,
-            )
-            .expect("real reading");
-        store.index.insert(fresh.id.clone(), store.events.len());
-        store.events.push(fresh);
-        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 9.0);
-
-        // A fork now replays the capped turn, restamped as "now". It must not
-        // drag the displayed quota back to 100%.
-        let mut child = FileState {
-            source: "/tmp/c.jsonl".to_string(),
-            ..FileState::default()
-        };
-        store.parse_codex_line(&context("cap", "2026-07-29T00:05:00Z"), &mut child);
-        assert!(store
-            .parse_codex_line(
-                &line(100.0, "2026-07-29T00:05:00Z", 5, 1),
-                &mut child,
-            )
-            .is_none());
-        assert_eq!(store.codex_quota.as_ref().unwrap().primary_pct, 9.0);
     }
 
     // A forked/subagent thread replays the parent's whole history — usage, turn

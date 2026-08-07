@@ -7,7 +7,7 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Quota, Theme, TH,
+  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Theme, TH,
   ProviderLimit, LimitWindow,
   fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
 } from "./data";
@@ -556,7 +556,16 @@ function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme:
   const t = theme;
   const { locale, text } = useI18n();
   const now = Date.now();
-  if (limits.length === 0) return null;
+  // No usable snapshot from `hu` (missing subscription, expired OAuth, or the
+  // CLI not installed): show an explicit unavailable state instead of stale
+  // local data or nothing at all.
+  if (limits.length === 0) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "4px 0", opacity: 0.7 }}>
+        <span style={{ font: `500 9.5px ${t.mono}`, color: t.faint }}>{text.providerLimitsUnavailable}</span>
+      </div>
+    );
+  }
 
   const status = (w: LimitWindow) => {
     const left = Math.round(Math.max(0, Math.min(100, 100 - w.usedPct)));
@@ -582,8 +591,21 @@ function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme:
   };
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: limits.length >= 2 ? "1fr 1fr" : "1fr", gap: 16 }}>
-      {limits.map((limit) => {
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      {["claude", "codex"].map((provider) => {
+        const limit = limits.find((l) => l.provider === provider);
+        if (!limit) {
+          // The provider is known but `hu` returned no snapshot for it.
+          return (
+            <div key={provider} style={{ minWidth: 0, opacity: 0.7 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
+                <ProviderMark provider={provider} color={t.dim} />
+                <span style={{ font: `600 10px ${t.ui}`, color: t.text, letterSpacing: ".05em", textTransform: "uppercase" }}>{provider === "claude" ? "Claude" : "Codex"}</span>
+              </div>
+              <div style={{ font: `500 9.5px ${t.mono}`, color: t.faint }}>{text.providerUnavailable}</div>
+            </div>
+          );
+        }
         const stale = now - limit.windows[0].asOfMs > 60 * 60 * 1000;
         const asOf = new Date(limit.windows[0].asOfMs).toLocaleTimeString(localeTag(locale), { hour: "2-digit", minute: "2-digit" });
         return (

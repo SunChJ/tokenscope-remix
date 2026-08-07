@@ -36,13 +36,6 @@ export interface PeriodReport {
   agents: AgentSlice[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
-// Codex provider quota (authenticated usage API; token_count log fallback).
-export interface Quota {
-  plan: string;
-  primaryPct: number; primaryMinutes: number; primaryResetsAt: number;
-  secondaryPct: number; secondaryMinutes: number; secondaryResetsAt: number;
-  asOfMs: number;
-}
 // Provider subscription limits (Claude / Codex), independent of usage scopes.
 export interface LimitWindow {
   id: string; label: string; durationMinutes: number;
@@ -59,8 +52,7 @@ export interface ProviderLimit {
 export interface Scope {
   id: string; label: string; color: string;
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
-  heatmap: HeatDay[]; quota: Quota | null; sparkQuota?: Quota | null;
-  quotaTrend?: QuotaTrendPoint[]; sparkQuotaTrend?: QuotaTrendPoint[];
+  heatmap: HeatDay[];
 }
 export interface Dashboard {
   scopes: Scope[]; todayTokens: number; generatedAt: string; telemetrySinceMs?: number;
