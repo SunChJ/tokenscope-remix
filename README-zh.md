@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-**macOS 菜单栏 / Windows 系统托盘工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
+**macOS 菜单栏工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）+ **Rust**（数据层）。
 
@@ -21,13 +21,10 @@
 ## 安装
 
 ```bash
-# macOS（推荐）
 brew install --cask sunchj/tokenscope/tokenscope
-
-# Windows：从 Releases 下载安装 .exe
 ```
 
-`.dmg` / `.exe` 直接下载与更新方式见 [Releases](https://github.com/SunChJ/tokenscope-remix/releases)。
+DMG 直接下载与更新方式见 [Releases](https://github.com/SunChJ/tokenscope-remix/releases)。
 
 ## 快速上手
 
@@ -40,7 +37,7 @@ brew install --cask sunchj/tokenscope/tokenscope
 ```bash
 pnpm install
 pnpm tauri dev         # 桌面 App（需要 Rust 工具链）
-pnpm tauri build       # macOS：.app / .dmg；Windows：.exe
+pnpm tauri build       # macOS：.app / .dmg
 ```
 
 ## 文档

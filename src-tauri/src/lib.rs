@@ -140,6 +140,7 @@ struct TrayCopy {
     refresh: &'static str,
     check_updates: &'static str,
     provider_limits: &'static str,
+    provider_unavailable: &'static str,
     menu_bar_display: &'static str,
     off: &'static str,
     compact: &'static str,
@@ -161,6 +162,7 @@ fn tray_copy(language: AppLanguage) -> &'static TrayCopy {
         refresh: "Refresh",
         check_updates: "Check for Updates…",
         provider_limits: "Provider Limits",
+        provider_unavailable: "Unavailable",
         menu_bar_display: "Menu Bar Display",
         off: "Off",
         compact: "Compact",
@@ -180,6 +182,7 @@ fn tray_copy(language: AppLanguage) -> &'static TrayCopy {
         refresh: "刷新",
         check_updates: "检查更新…",
         provider_limits: "额度详情",
+        provider_unavailable: "不可用",
         menu_bar_display: "菜单栏显示",
         off: "关闭",
         compact: "紧凑",
@@ -365,9 +368,16 @@ fn tray_label(dash: &Dashboard, display: MenuBarQuotaDisplay, language: AppLangu
 
 /// Menu-bar text for each provider row under Provider Limits, e.g.
 /// "Claude — 5h 64% · W 82%" (Claude) or "Codex — W 29% · S 31%" (Codex).
-fn provider_menu_row(limit: Option<&model::ProviderLimit>, now_s: i64) -> String {
+fn provider_menu_row(
+    limit: Option<&model::ProviderLimit>,
+    provider_label: &str,
+    unavailable: &str,
+    now_s: i64,
+) -> String {
     let Some(limit) = limit else {
-        return String::new();
+        // Empty native menu-item titles collapse the macOS submenu into the
+        // tiny blank scroller seen when `hu` cannot run.
+        return format!("{provider_label} — {unavailable}");
     };
     let mut sorted: Vec<&model::LimitWindow> = limit
         .windows
@@ -441,8 +451,13 @@ fn update_provider_rows(app: &tauri::AppHandle, dash: &Dashboard) {
     };
     let now_s = now_ms() / 1000;
     let (claude, codex) = provider_rows(&dash.provider_limits);
-    let claude_text = provider_menu_row(claude, now_s);
-    let codex_text = provider_menu_row(codex, now_s);
+    let language = app
+        .try_state::<TrayPreferencesState>()
+        .and_then(|state| state.0.lock().ok().map(|prefs| prefs.language))
+        .unwrap_or_default();
+    let copy = tray_copy(language);
+    let claude_text = provider_menu_row(claude, "Claude", copy.provider_unavailable, now_s);
+    let codex_text = provider_menu_row(codex, "Codex", copy.provider_unavailable, now_s);
     let provider_claude = state.provider_claude.clone();
     let provider_codex = state.provider_codex.clone();
     let handle = app.clone();
@@ -1387,14 +1402,14 @@ pub fn run() {
             let provider_claude_i = MenuItem::with_id(
                 app,
                 "provider-claude",
-                provider_menu_row(claude_limit, now_s),
+                provider_menu_row(claude_limit, "Claude", copy.provider_unavailable, now_s),
                 true,
                 None::<&str>,
             )?;
             let provider_codex_i = MenuItem::with_id(
                 app,
                 "provider-codex",
-                provider_menu_row(codex_limit, now_s),
+                provider_menu_row(codex_limit, "Codex", copy.provider_unavailable, now_s),
                 true,
                 None::<&str>,
             )?;
@@ -1797,7 +1812,7 @@ mod tests {
         assert_eq!(provider_summary(&limit, false, 1), "Cx29%");
         assert_eq!(provider_summary(&limit, true, 1), "Cx W29%/S31%");
         assert_eq!(
-            provider_menu_row(Some(&limit), 1),
+            provider_menu_row(Some(&limit), "Codex", "Unavailable", 1),
             "Codex — W 29% · S 31%"
         );
     }
@@ -1831,7 +1846,10 @@ mod tests {
         };
         // The expired weekly window drops out; only the 5h window remains.
         assert_eq!(provider_summary(&limit, true, 1_000), "Cl 5h64%");
-        assert_eq!(provider_menu_row(Some(&limit), 1_000), "Claude — 5h 64%");
+        assert_eq!(
+            provider_menu_row(Some(&limit), "Claude", "Unavailable", 1_000),
+            "Claude — 5h 64%"
+        );
         // Once every window is expired the provider disappears entirely.
         assert_eq!(provider_summary(&limit, false, 2_001), "");
     }

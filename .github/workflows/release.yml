@@ -113,12 +113,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Build one app per CPU architecture so each package contains the
+          # matching single-architecture HappyUsage binary.
           - os: macos-latest
-            target: universal-apple-darwin
-            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            rust-targets: x86_64-pc-windows-msvc
+            target: aarch64-apple-darwin
+            rust-targets: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            rust-targets: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
@@ -176,9 +178,8 @@ jobs:
 
           ## Install
 
-          **macOS**: download `Tokenscope_*_universal.dmg` (Apple Silicon + Intel). Unsigned — right-click → **Open** on first launch, or install via `brew install --cask sunchj/tokenscope/tokenscope`.
+          **macOS**: download `Tokenscope_*_aarch64.dmg` on Apple Silicon or `Tokenscope_*_x64.dmg` on Intel. Unsigned — right-click → **Open** on first launch, or install via `brew install --cask sunchj/tokenscope/tokenscope`.
 
-          **Windows**: download `Tokenscope_*_x64-setup.exe`. Unsigned — on first launch click **More info → Run anyway** to dismiss SmartScreen.
           BODY
             if [ -n "$gen" ]; then
               printf '\n%s\n' "$gen"
@@ -202,11 +203,10 @@ jobs:
           releaseName: "Tokenscope ${{ env.RELEASE_TAG }}"
           releaseBody: ${{ steps.release_notes.outputs.body }}
           # Draft until every platform has uploaded: a failed job must not
-          # leave a partial public release (only its Windows assets once).
+          # leave a partial public release with only one macOS architecture.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true
-          updaterJsonPreferNsis: true
           args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json
 
   publish:
@@ -237,30 +237,32 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN not set; skipping tap update."
             exit 0
           fi
-          DMG_NAME="Tokenscope_${RELEASE_VERSION}_universal.dmg"
-          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${DMG_NAME}"
-
-          SHA256=""
-          for i in $(seq 1 10); do
-            if curl -fsSL "$DOWNLOAD_URL" -o /tmp/tokenscope.dmg; then
-              SHA256=$(shasum -a 256 /tmp/tokenscope.dmg | cut -d' ' -f1)
-              break
-            fi
-            echo "Retry $i: asset not ready yet..."
-            sleep 10
-          done
-          if [ -z "$SHA256" ]; then
-            echo "::error::Release asset $DMG_NAME never became available"
-            exit 1
-          fi
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}"
+          fetch_sha() {
+            arch="$1"
+            name="Tokenscope_${RELEASE_VERSION}_${arch}.dmg"
+            for i in $(seq 1 10); do
+              if curl -fsSL "${BASE_URL}/${name}" -o "/tmp/tokenscope-${arch}.dmg"; then
+                shasum -a 256 "/tmp/tokenscope-${arch}.dmg" | cut -d' ' -f1
+                return 0
+              fi
+              echo "Retry $i: $name not ready yet..." >&2
+              sleep 10
+            done
+            echo "::error::Release asset $name never became available" >&2
+            return 1
+          }
+          SHA_ARM="$(fetch_sha aarch64)"
+          SHA_INTEL="$(fetch_sha x64)"
 
           git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/SunChJ/homebrew-tokenscope.git /tmp/homebrew-tap
           cat > /tmp/homebrew-tap/Casks/tokenscope.rb <<CASK
           cask "tokenscope" do
             version "${RELEASE_VERSION}"
-            sha256 "${SHA256}"
+            arch arm: "aarch64", intel: "x64"
+            sha256 arm: "${SHA_ARM}", intel: "${SHA_INTEL}"
 
-            url "${DOWNLOAD_URL}"
+            url "${BASE_URL}/Tokenscope_#{version}_#{arch}.dmg"
             name "Tokenscope"
             desc "Menu-bar dashboard for local AI coding agent token usage (Claude Code, Codex)"
             homepage "https://github.com/${{ github.repository }}"

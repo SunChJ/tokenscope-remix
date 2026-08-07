@@ -2,7 +2,7 @@
 
 **English** · [中文](README-zh.md)
 
-A menu-bar / system-tray app for macOS and Windows that gives you **one dashboard for all your local AI coding agents** — token usage, estimated cost, per-model / MCP / Skill breakdowns, and live subscription quota.
+A macOS menu-bar app that gives you **one dashboard for all your local AI coding agents** — token usage, estimated cost, per-model / MCP / Skill breakdowns, and live subscription quota.
 
 Built with **Tauri 2 + React + TypeScript**, backed by a Rust data layer. Works with **Pi, Claude Code, and Codex CLI**.
 
@@ -21,13 +21,10 @@ Built with **Tauri 2 + React + TypeScript**, backed by a Rust data layer. Works 
 ## Install
 
 ```bash
-# macOS (recommended)
 brew install --cask sunchj/tokenscope/tokenscope
-
-# Windows: grab the setup .exe from Releases
 ```
 
-Downloads (`.dmg` / `.exe`) and update details: see [Releases](https://github.com/SunChJ/tokenscope-remix/releases).
+DMG downloads and update details: see [Releases](https://github.com/SunChJ/tokenscope-remix/releases).
 
 ## Quick start
 
@@ -40,7 +37,7 @@ Downloads (`.dmg` / `.exe`) and update details: see [Releases](https://github.co
 ```bash
 pnpm install
 pnpm tauri dev         # desktop app (requires the Rust toolchain)
-pnpm tauri build       # .app / .dmg (macOS), .exe (Windows)
+pnpm tauri build       # macOS .app / .dmg
 ```
 
 ## Docs
