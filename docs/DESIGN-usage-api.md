@@ -32,13 +32,13 @@ data source when a refresh fails.
 
 ## Bundling
 
-`src-tauri/bin/build-hu.sh` downloads the matching `hu` release asset for the
-current OS/arch before `tauri build`; `bundle.resources` ships it as
-`Resources/bin/hu`. At runtime `lib.rs` injects `resource_dir()` into
-`quota_api`, which prefers the bundled binary, then system installs. If no
-`hu` exists at all (development builds), `ensure_hu()` attempts a
-one-per-24h auto-install (Homebrew tap → official install script →
-`go install`).
+`src-tauri/bin/build-hu.sh` downloads the `hu` release asset matching the
+Tauri target OS/architecture before `tauri build`; `bundle.resources` ships it
+as `Resources/bin/hu`. macOS releases are separate Apple Silicon and Intel
+packages rather than a universal app, so each package contains exactly one
+matching `hu`. At runtime Tokenscope invokes only that bundled binary; it never
+uses or installs a system copy whose version and output schema it does not
+control.
 
 ## Normalization
 

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tokenscope",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "identifier": "com.tokenscope.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -35,34 +35,24 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRGREQ5QzhCQjc0QUIxNTYKUldSV3NVcTNpNXpkVDJvWTFpMUx6WEZialVXSXdyeDNSZnM5ZnMzK29NTThPUk5CVDVtWG02SjYK",
       "endpoints": [
         "https://github.com/SunChJ/tokenscope-remix/releases/latest/download/latest.json"
-      ],
-      "windows": {
-        "installMode": "passive"
-      }
+      ]
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis"],
+    "targets": ["app", "dmg"],
     "createUpdaterArtifacts": true,
     "resources": ["bin/hu"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/icon.icns"
     ],
     "macOS": {
       "minimumSystemVersion": "10.15",
       "hardenedRuntime": true,
       "signingIdentity": "-"
-    },
-    "windows": {
-      "nsis": {
-        "installerIcon": "icons/icon.ico",
-        "installMode": "currentUser"
-      }
     }
   }
 }

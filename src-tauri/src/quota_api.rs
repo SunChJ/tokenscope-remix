@@ -7,7 +7,6 @@
 
 use crate::model::{same_reset_cycle, LimitWindow, ProviderLimit, QuotaTrendPoint, WEEKLY_WINDOW_MINUTES};
 use serde_json::Value;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{OnceLock, RwLock};
@@ -41,41 +40,6 @@ pub fn shared() -> Vec<ProviderLimit> {
     limits
 }
 
-fn hu_executables() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    // 1. Bundled copy (app Resources/bin/hu) — the primary source so the app
-    //    is self-contained and the hu version ships with Tokenscope.
-    if let Some(path) = bundled_hu() {
-        candidates.push(path);
-    }
-    // 2. System installs (PATH + common locations; install.sh drops `hu` into
-    //    ~/.local/bin, which may not be on the app's PATH at launch).
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(if cfg!(windows) { "hu.exe" } else { "hu" }))
-            .find(|path| path.is_file())
-    }) {
-        if !candidates.contains(&path) {
-            candidates.push(path);
-        }
-    }
-    let mut extras = vec![
-        PathBuf::from("/opt/homebrew/bin/hu"),
-        PathBuf::from("/usr/local/bin/hu"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        extras.push(home.join(".local").join("bin").join("hu"));
-        extras.push(home.join("bin").join("hu"));
-        extras.push(home.join("go").join("bin").join("hu"));
-    }
-    for path in extras {
-        if path.is_file() && !candidates.contains(&path) {
-            candidates.push(path);
-        }
-    }
-    candidates
-}
-
 /// Directory injected by lib.rs at startup: `app.path().resource_dir()`.
 static BUNDLE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -92,120 +56,25 @@ fn bundled_hu() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-const HAPPYUSAGE_INSTALL_URL: &str =
-    "https://raw.githubusercontent.com/SunChJ/happyusage/main/scripts/install.sh";
-const INSTALL_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
-static LAST_INSTALL_ATTEMPT_MS: std::sync::atomic::AtomicI64 =
-    std::sync::atomic::AtomicI64::new(0);
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Make sure `hu` exists, installing it once per 24h when missing. Returns
-/// true when a usable executable is present afterwards. Runs on the
-/// background refresh thread; a slow brew install only delays this refresh.
-fn ensure_hu() -> bool {
-    if !hu_executables().is_empty() {
-        return true;
-    }
-    let now = now_ms();
-    let last = LAST_INSTALL_ATTEMPT_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if now - last < INSTALL_RETRY_MS {
-        return false;
-    }
-    let installed = try_install_hu();
-    LAST_INSTALL_ATTEMPT_MS.store(now, std::sync::atomic::Ordering::Relaxed);
-    installed
-}
-
-fn try_install_hu() -> bool {
-    // 1. Homebrew: tap + install (covers macOS and Linux with brew).
-    if let Some(brew) = find_on_path("brew") {
-        let tap_ok = Command::new(&brew)
-            .args(["tap", "SunChJ/happyusage"])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if tap_ok
-            && Command::new(&brew)
-                .args(["install", "hu"])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-            && !hu_executables().is_empty()
-        {
-            return true;
-        }
-    }
-    // 2. Official install script (needs curl + sh): fetch, run, then re-scan.
-    if let Some(curl) = find_on_path("curl") {
-        if let Ok(script) = Command::new(&curl).args(["-fsSL", HAPPYUSAGE_INSTALL_URL]).output() {
-            if script.status.success() {
-                let tmp = std::env::temp_dir().join(format!(
-                    "happyusage-install-{}.sh",
-                    std::process::id()
-                ));
-                if fs::write(&tmp, &script.stdout).is_ok() {
-                    let ok = Command::new("sh")
-                        .arg(&tmp)
-                        .status()
-                        .map(|status| status.success())
-                        .unwrap_or(false);
-                    let _ = fs::remove_file(tmp);
-                    if ok && !hu_executables().is_empty() {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    // 3. Go toolchain as a last resort.
-    if let Some(go) = find_on_path("go") {
-        if Command::new(&go)
-            .args(["install", "github.com/SunChJ/happyusage/cmd/hu@latest"])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-            && !hu_executables().is_empty()
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }))
-        .find(|path| path.is_file())
-}
-
 /// Run `hu usage <provider> --json` and return the provider envelope
 /// (with `ok: true`). The CLI owns credential handling and HTTP timeouts;
 /// Tokenscope's refresh runs on a background thread, so a slow run only
 /// delays that provider's next refresh.
 fn run_hu(provider: &str) -> Option<Value> {
-    for executable in hu_executables() {
-        let output = Command::new(executable)
-            .args(["usage", provider, "--json"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            continue;
-        }
-        let json: Value = serde_json::from_slice(&output.stdout).ok()?;
-        let envelope = json.get("provider")?;
-        if envelope.get("ok").and_then(Value::as_bool) != Some(true) {
-            continue;
-        }
-        return Some(envelope.clone());
+    // Tokenscope owns its HappyUsage version. Never fall back to a binary from
+    // PATH/Homebrew because its version and output schema are not controlled.
+    let executable = bundled_hu()?;
+    let output = Command::new(executable)
+        .args(["usage", provider, "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    None
+    let json: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let envelope = json.get("provider")?;
+    (envelope.get("ok").and_then(Value::as_bool) == Some(true))
+        .then(|| envelope.clone())
 }
 
 fn rfc3339_ms(value: Option<&Value>) -> i64 {
@@ -368,9 +237,6 @@ pub fn reload() -> bool {
         .map(|cache| cache.clone())
         .unwrap_or_default();
     let mut next = previous.clone();
-
-    // First reload attempt: make sure `hu` exists (auto-install when missing).
-    ensure_hu();
 
     if let Some(claude) = run_hu("claude").and_then(|envelope| claude_from_hu(&envelope)) {
         next.claude = Some(claude);
