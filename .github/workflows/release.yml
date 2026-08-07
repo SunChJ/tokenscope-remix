@@ -268,7 +268,7 @@ jobs:
             desc "Menu-bar dashboard for local AI coding agent token usage (Claude Code, Codex)"
             homepage "https://github.com/${{ github.repository }}"
 
-            depends_on macos: ">= :catalina"
+            depends_on macos: :catalina
             app "Tokenscope.app"
 
             postflight do

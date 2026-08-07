@@ -1247,9 +1247,15 @@ pub fn run() {
             // so provider quota works without any system install.
             quota_api::set_bundle_dir(app.path().resource_dir().ok());
 
-            // Menu-bar–only app: no Dock icon, runs in the background.
+            // Menu-bar–only app: use the accessory policy and explicitly hide
+            // the Dock tile. The explicit visibility call also covers `tauri
+            // dev`, whose unbundled debug process can briefly start as a
+            // regular foreground app before setup runs.
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                app.set_dock_visibility(false);
+            }
 
             // Holds the latest tray-icon rect so show_popover can anchor the panel.
             // Captured in the tray click handler on every platform — see

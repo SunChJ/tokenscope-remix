@@ -590,8 +590,17 @@ function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme:
     return `${burnPerDay >= 0 ? "+" : ""}${burnPerDay.toFixed(1)}%${text.perDay} · ${horizon} ${text.toCap}`;
   };
 
+  const hasClaude = limits.some((limit) => limit.provider === "claude");
+  const hasCodex = limits.some((limit) => limit.provider === "codex");
+  const onlyOneAvailable = hasClaude !== hasCodex;
+  const columns = onlyOneAvailable
+    ? hasClaude
+      ? "minmax(0, 1fr) max-content"
+      : "max-content minmax(0, 1fr)"
+    : "1fr 1fr";
+
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+    <div style={{ display: "grid", gridTemplateColumns: columns, gap: onlyOneAvailable ? 15 : 16 }}>
       {["claude", "codex"].map((provider) => {
         const limit = limits.find((l) => l.provider === provider);
         if (!limit) {
@@ -627,9 +636,9 @@ function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme:
                       <div style={{ width: `${left}%`, height: "100%", background: col, borderRadius: 3 }} />
                     </div>
                   </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
-                    <span style={{ font: `500 9.5px ${t.mono}`, color: left <= 20 ? col : t.text }}>{status(w)}</span>
-                    {note && <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint }}>{note}</span>}
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", marginTop: 3, marginLeft: 56 }}>
+                    <span style={{ font: `500 9.5px ${t.mono}`, color: left <= 20 ? col : t.text, textAlign: "right" }}>{status(w)}</span>
+                    {note && <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "right" }}>{note}</span>}
                   </div>
                 </div>
               );
@@ -981,14 +990,15 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   const slices = P.agents;
   // Keep the hero's agent split on the same model scope as its Total. The
   // historical chart below remains the complete period view.
-  const heroSlices = selectedModel && slices.length > 0
+  const heroSlices = (selectedModel && slices.length > 0
     ? slices.map((slice) => ({
         ...slice,
         tokens: models
           .filter((model) => model.name === selectedModel.name && model.agent === slice.id)
           .reduce((sum, model) => sum + model.tokens, 0),
-      })).filter((slice) => slice.tokens > 0)
-    : slices;
+      }))
+    : slices
+  ).filter((slice) => slice.tokens > 0);
   // animated Total tokens: counts up from 0 on each open / period / scope
   // / model switch; held at 0 while hidden so it never flashes.
   const animTotal = useCountUp(totalTokens, `${viewKey}:${scope.id}:${totalModel}:${openGen}`, active);
