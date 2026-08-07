@@ -9,8 +9,10 @@ REPO="SunChJ/happyusage"
 VERSION="${HAPPYUSAGE_VERSION:-}"
 
 if [ -z "$VERSION" ]; then
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+  # Avoid the rate-limited GitHub API on shared CI runners: the HTML
+  # releases/latest page 302-redirects to the newest tag.
+  VERSION="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" \
+    | sed -E 's#.*/tag/##' | sed 's#/$##')"
 fi
 [ -n "$VERSION" ] || { echo "failed to resolve latest version" >&2; exit 1; }
 
