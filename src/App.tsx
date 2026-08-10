@@ -51,15 +51,24 @@ function useCountUp(target: number, resetKey: string, active: boolean, duration 
   return val;
 }
 
+// Period-over-period change rendered as a ratio of the previous period
+// (e.g. ▲63x) — a percentage like 6240% is far less readable. The display
+// rounds; the exact ratio stays available in the tooltip.
+function fmtMultiple(m: number): string {
+  const s = m >= 100 ? m.toFixed(0) : m >= 10 ? m.toFixed(1) : m.toFixed(2);
+  return `${parseFloat(s)}x`;
+}
+
 function Delta({ v, theme }: { v: number; theme: Theme }) {
   const { text } = useI18n();
   const up = v >= 0;
+  const multiple = 1 + v / 100;
   // Usage/cost going up is "bad" → red; going down is "good" → green.
   const col = up ? "#e0795f" : theme.accent;
   return (
-    <span title={text.comparedPrevious} style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
+    <span title={`${text.comparedPrevious} (${parseFloat(multiple.toFixed(2))}x)`} style={{ font: `600 10px ${theme.mono}`, color: col, display: "inline-flex", alignItems: "center", gap: 2,
       padding: "1.5px 5px", borderRadius: 5, background: up ? "rgba(224,121,95,0.16)" : "rgba(39,176,110,0.14)" }}>
-      {up ? "▲" : "▼"}{Math.abs(Math.round(v))}%
+      {up ? "▲" : "▼"}{fmtMultiple(multiple)}
     </span>
   );
 }
@@ -373,18 +382,28 @@ function ShortcutEditor({ current, theme, dark, onClose, onSaved }:
 
 // Agent filter chips (All / Claude / Codex / Pi …). Rendered only when several
 // sources have data; a single-source install never sees them.
-function AgentChips({ scopes, value, theme, onSelect }:
-  { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void }) {
+function AgentChips({ scopes, value, theme, onSelect, reportOf }:
+  { scopes: Scope[]; value: string; theme: Theme; onSelect: (id: string) => void;
+    reportOf: (s: Scope) => PeriodReport | undefined }) {
   const t = theme;
   const { text } = useI18n();
   return (
-    <div data-no-drag="" style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+    <div data-no-drag="" style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
       {scopes.map((s) => {
         const on = s.id === value;
+        const rep = reportOf(s);
+        const tokens = rep?.metrics.totalTokens ?? 0;
+        const delta = rep?.metrics.deltaTokens;
+        const tip = rep
+          ? `${s.id === "all" ? text.all : s.label} · ${fmtTokens(tokens)}`
+            + (delta !== undefined && Math.round(delta) !== 0
+              ? ` · ${delta >= 0 ? "▲" : "▼"}${fmtMultiple(Math.abs(1 + delta / 100))} ${text.comparedPrevious}`
+              : "")
+          : s.label;
         return (
-          <div key={s.id} onClick={() => onSelect(s.id)} style={{
-            display: "inline-flex", alignItems: "center", gap: 6,
-            font: `600 10.5px ${t.ui}`, letterSpacing: ".02em", padding: "4px 11px",
+          <div key={s.id} onClick={() => onSelect(s.id)} title={tip} style={{
+            display: "inline-flex", alignItems: "center", gap: 5,
+            font: `600 10.5px ${t.ui}`, letterSpacing: ".02em", padding: "4px 10px",
             borderRadius: 20, cursor: "pointer", userSelect: "none",
             color: on ? t.segOnText : t.segOffText,
             background: on ? t.segOnBg : t.segBg,
@@ -393,7 +412,10 @@ function AgentChips({ scopes, value, theme, onSelect }:
           }}>
             {s.color && <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%",
               background: s.color, opacity: on ? 1 : 0.75, flex: "0 0 7px" }} />}
-            {s.id === "all" ? text.all : s.label}
+            <span style={{ whiteSpace: "nowrap" }}>{s.id === "all" ? text.all : s.label}</span>
+            <span style={{ font: `500 9.5px ${t.mono}`, color: on ? t.segOnText : t.faint, opacity: 0.9 }}>
+              {fmtTokens(tokens)}
+            </span>
           </div>
         );
       })}
@@ -1197,7 +1219,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
         )}
         {/* provider filter — only providers with usage in this period */}
         {visibleScopes.length > 1 && (
-          <AgentChips scopes={visibleScopes} value={scope.id} theme={t} onSelect={setScopeId} />
+          <AgentChips scopes={visibleScopes} value={scope.id} theme={t} onSelect={setScopeId}
+            reportOf={reportForScope} />
         )}
         {/* hero */}
         <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>

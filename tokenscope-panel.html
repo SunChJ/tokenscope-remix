@@ -547,14 +547,21 @@ function Heatmap({ days, theme, accent, gap = 2 }) {
 // SHARED PANEL PIECES
 // =====================================================================
 // Usage/cost going up is "bad" → red; going down is "good" → green.
+// Rendered as a ratio of the previous period (▲63x) instead of a percentage.
+function fmtMultiple(m) {
+  const s = m >= 100 ? m.toFixed(0) : m >= 10 ? m.toFixed(1) : m.toFixed(2);
+  return `${parseFloat(s)}x`;
+}
+
 function Delta({ v, theme }) {
   const up = v >= 0;
+  const multiple = 1 + v / 100;
   const col = up ? '#e0795f' : theme.accent;
   return (
-    <span style={{ font: `600 10px ${theme.mono}`, color: col,
+    <span title={`Compared with the previous period (${parseFloat(multiple.toFixed(2))}x)`} style={{ font: `600 10px ${theme.mono}`, color: col,
       display: 'inline-flex', alignItems: 'center', gap: 2, padding: '1.5px 5px',
       borderRadius: 5, background: up ? 'rgba(224,121,95,0.16)' : 'rgba(39,176,110,0.14)' }}>
-      {up ? '▲' : '▼'}{Math.abs(Math.round(v))}%
+      {up ? '▲' : '▼'}{fmtMultiple(multiple)}
     </span>
   );
 }
