@@ -56,25 +56,47 @@ fn bundled_hu() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Run `hu usage <provider> --json` and return the provider envelope
-/// (with `ok: true`). The CLI owns credential handling and HTTP timeouts;
-/// Tokenscope's refresh runs on a background thread, so a slow run only
-/// delays that provider's next refresh.
-fn run_hu(provider: &str) -> Option<Value> {
+/// Run `hu usage codex claude --json` once and return the full envelope. One
+/// invocation covers both displayed providers in a single process (OAuth
+/// discovery + provider API calls shared) instead of one spawn per provider.
+/// The CLI owns credential handling and HTTP timeouts; Tokenscope's refresh
+/// runs on a background thread, so a slow run only delays the next refresh.
+fn run_hu() -> Option<Value> {
     // Tokenscope owns its HappyUsage version. Never fall back to a binary from
     // PATH/Homebrew because its version and output schema are not controlled.
     let executable = bundled_hu()?;
     let output = Command::new(executable)
-        .args(["usage", provider, "--json"])
+        .args(["usage", "codex", "claude", "--json"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let json: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let envelope = json.get("provider")?;
-    (envelope.get("ok").and_then(Value::as_bool) == Some(true))
-        .then(|| envelope.clone())
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Per-provider envelopes from a `hu usage --json` response. Current `hu`
+/// emits a `providers` array (one entry per configured provider); tolerate a
+/// singular `provider` object for older builds.
+fn provider_envelopes(json: &Value) -> Vec<Value> {
+    if let Some(array) = json.get("providers").and_then(Value::as_array) {
+        return array.clone();
+    }
+    json.get("provider").cloned().into_iter().collect()
+}
+
+/// Map one provider envelope to a parsed limit. Unknown providers (cursor,
+/// copilot, …) and failed fetches (`ok: false`) yield None, leaving that
+/// provider unavailable instead of surfacing stale data.
+fn parse_provider(envelope: &Value) -> Option<ProviderLimit> {
+    if envelope.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    match envelope.get("provider").and_then(Value::as_str) {
+        Some("claude") => claude_from_hu(envelope),
+        Some("codex") => codex_from_hu(envelope),
+        _ => None,
+    }
 }
 
 fn rfc3339_ms(value: Option<&Value>) -> i64 {
@@ -228,9 +250,29 @@ fn merge_trend(
     }
 }
 
-/// Refresh provider limits, installing `hu` first when missing. Each provider
-/// is independent: `hu` is the only data source, so a failed fetch leaves that
-/// provider unavailable (no local log or cache fallback).
+/// Split one `hu usage` response into parsed Claude/Codex limits. A provider
+/// yields None when absent from the array (`hu` drops failed providers), when
+/// its envelope reports `ok: false`, or when no usable windows parsed.
+fn parse_response(json: &Value) -> (Option<ProviderLimit>, Option<ProviderLimit>) {
+    let mut claude = None;
+    let mut codex = None;
+    for envelope in provider_envelopes(json) {
+        match envelope.get("provider").and_then(Value::as_str) {
+            Some("claude") => claude = parse_provider(&envelope),
+            Some("codex") => codex = parse_provider(&envelope),
+            // Cursor/copilot/… are fetched by `hu` but not shown yet.
+            _ => {}
+        }
+    }
+    (claude, codex)
+}
+
+/// Refresh provider limits, installing `hu` first when missing. A single
+/// `hu usage codex claude --json` run covers both displayed providers in one
+/// process; each provider is independent, so a provider absent from the
+/// response or reported `ok: false` becomes unavailable without affecting the
+/// other. `hu` drops failed providers from the array entirely, so a transient
+/// miss (rate limit, expired OAuth) shows as unavailable until it recovers.
 pub fn reload() -> bool {
     let previous = cache_lock()
         .read()
@@ -238,18 +280,10 @@ pub fn reload() -> bool {
         .unwrap_or_default();
     let mut next = previous.clone();
 
-    if let Some(claude) = run_hu("claude").and_then(|envelope| claude_from_hu(&envelope)) {
-        next.claude = Some(claude);
-    } else {
-        // `hu` does not serve Claude usage right now (expired OAuth, rate
-        // limit, missing subscription): leave it unavailable instead of
-        // surfacing stale local data.
-        next.claude = None;
-    }
-    if let Some(codex) = run_hu("codex").and_then(|envelope| codex_from_hu(&envelope)) {
-        next.codex = Some(codex);
-    } else {
-        next.codex = None;
+    if let Some(json) = run_hu() {
+        let (claude, codex) = parse_response(&json);
+        next.claude = claude;
+        next.codex = codex;
     }
 
     let changed = next.claude.is_some() || next.codex.is_some();
@@ -267,8 +301,63 @@ pub fn reload() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_from_hu, codex_from_hu};
+    use super::{claude_from_hu, codex_from_hu, parse_provider, parse_response, provider_envelopes};
     use crate::model::WEEKLY_WINDOW_MINUTES;
+
+    #[test]
+    fn parses_multi_provider_envelope_and_ignores_unknown() {
+        // `hu usage codex claude --json` returns the requested providers in one array.
+        let envelope = serde_json::json!({
+            "ok": true,
+            "source": "native_provider_scripts",
+            "checked_at": "2026-08-11T08:47:00Z",
+            "provider_count": 2,
+            "providers": [
+                {"provider": "codex", "ok": true, "checked_at": "2026-08-11T08:47:11Z", "plan": "Pro 5x",
+                 "quotas": [
+                    {"name": "weekly", "period": "7d", "used_pct": 34, "left_pct": 66, "resets_at": "2026-08-18T01:39:45Z"},
+                    {"name": "Spark_weekly", "period": "7d", "used_pct": 0, "left_pct": 100, "resets_at": "2026-08-18T08:47:12Z"}
+                 ]},
+                {"provider": "cursor", "ok": true, "checked_at": "2026-08-11T08:47:05Z", "plan": "Free",
+                 "quotas": [{"name": "total", "period": "monthly", "used_pct": 0, "left_pct": 100, "resets_at": "2026-08-15T11:57:01Z"}]}
+            ]
+        });
+        let (claude, codex) = parse_response(&envelope);
+        assert!(claude.is_none());
+        let codex = codex.unwrap();
+        assert_eq!(codex.provider, "codex");
+        assert_eq!(codex.windows.len(), 2);
+        assert_eq!(codex.windows[0].id, "weekly");
+        assert_eq!(codex.windows[1].id, "spark");
+    }
+
+    #[test]
+    fn failed_provider_stays_unavailable_without_taking_others_down() {
+        let envelope = serde_json::json!({
+            "ok": true,
+            "providers": [
+                {"provider": "claude", "ok": false, "error": "expired OAuth"},
+                {"provider": "codex", "ok": true, "checked_at": "2026-08-11T08:47:11Z", "plan": "Pro 5x",
+                 "quotas": [{"name": "weekly", "period": "7d", "used_pct": 34, "resets_at": "2026-08-18T01:39:45Z"}]}
+            ]
+        });
+        let (claude, codex) = parse_response(&envelope);
+        // The failed Claude stays None, so reload() marks it unavailable;
+        // the working Codex still comes through.
+        assert!(claude.is_none());
+        assert!(codex.is_some());
+    }
+
+    #[test]
+    fn tolerates_singular_provider_envelope() {
+        let envelope = serde_json::json!({
+            "provider": {"provider": "claude", "ok": true, "checked_at": "2026-08-06T09:16:00Z", "plan": "Pro",
+             "quotas": [{"name": "session", "period": "5h", "used_pct": 12.5, "resets_at": "2026-08-06T14:16:00Z"}]}
+        });
+        let providers = provider_envelopes(&envelope);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(parse_provider(&providers[0]).unwrap().provider, "claude");
+    }
 
     #[test]
     fn parses_claude_envelope_windows() {

@@ -482,6 +482,11 @@ fn provider_rows(
     (claude, codex)
 }
 
+/// Provider quota poll interval. Network-backed (`hu` → provider API), so it
+/// stays off the session-ingest path; see the comment at the spawn site for
+/// the tradeoff between freshness and rate limits.
+const QUOTA_REFRESH_SECS: u64 = 60;
+
 /// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
 /// change at most a few times a day, so back-to-back clicks inside this window
 /// coalesce into one fetch.
@@ -1718,12 +1723,15 @@ pub fn run() {
             // Provider quotas are network-backed and independent from session
             // ingest. Refresh them off the dashboard build lock; a failed request
             // keeps the last successful API cache/log snapshot fallback intact.
+            // 60s balances freshness against provider API rate limits: one `hu`
+            // run covers both providers, and the provider-side usage data
+            // itself lags, so 30s buys little extra accuracy.
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 if quota_api::reload() {
                     refresh(&handle);
                 }
-                std::thread::sleep(Duration::from_secs(5 * 60));
+                std::thread::sleep(Duration::from_secs(QUOTA_REFRESH_SECS));
             });
 
             // Background refresh: keep the tray's token count current and push
