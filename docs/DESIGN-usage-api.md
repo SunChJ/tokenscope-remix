@@ -16,10 +16,11 @@ subscription limits.
 ## Architecture
 
 ```
-refresh thread (every 5 min)
+refresh thread (every 60 s)
   └─ quota_api::reload()
-       ├─ bundled hu → `hu usage claude --json` → claude ProviderLimit
-       ├─ bundled hu → `hu usage codex --json` → codex ProviderLimit
+       └─ bundled hu → `hu usage codex claude --json`
+            ├─ claude ProviderLimit
+            └─ codex ProviderLimit
        └─ failed fetch ⇒ that provider is None (unavailable)
 parser::build_dashboard()
   └─ quota_api::shared() → provider_limits (dashboard + tray)
