@@ -1,7 +1,7 @@
 import { useId, useRef, useState } from "react";
 import {
   Theme, ModelStat, NamedCount, SeriesPoint, HeatDay,
-  fmtInt, fmtMoney, fmtTokens, linePath, fmtHeatDate,
+  fmtInt, fmtMoney, fmtTokens, linePath, fmtHeatDate, reasoningEffortColor,
 } from "./data";
 import { localeTag, localizeSeriesText, useI18n } from "./i18n";
 
@@ -141,27 +141,55 @@ export function Sparkline({ values, theme, width = 80, height = 24, accent, stro
 const DONUT_PALETTE = ["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
 const DONUT_OVERFLOW = "#79817b";
 
-export function CostDonut({ models, theme, size = 104, thickness = 16, keepColors = false, limit = 3 }:
+type CostHighlight = { model: string; effort?: string };
+type CostSegment = { model: ModelStat; effort?: string; color: string; cost: number; weight: number };
+
+export function CostDonut({ models, theme, size = 104, thickness = 16, keepColors = false, limit = 3,
+  selectedModel = "", effortLabel }:
   { models: ModelStat[]; theme: Theme; size?: number; thickness?: number; limit?: number;
+    selectedModel?: string; effortLabel?: (effort: string) => string;
     // true → keep each model's own (agent-tinted) color so wedges match the
     // token-list dots; false → classic cost-rank green recoloring.
     keepColors?: boolean }) {
   const t = theme;
-  const [hi, setHi] = useState(-1);
+  const [hi, setHi] = useState<CostHighlight | null>(null);
   const [open, setOpen] = useState(false);
   // Rank by cost (desc); recolor by that rank unless colors are meaningful.
   const ranked = [...models]
     .sort((a, b) => b.cost - a.cost)
     .map((m, i) => (keepColors ? m : { ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
-  models = ranked;
-  const shownModels = models.slice(0, open ? models.length : limit);
-  const total = models.reduce((s, m) => s + m.cost, 0) || 1e-9;
+  const initiallyShown = ranked.slice(0, limit);
+  const selected = ranked.find((model) => model.name === selectedModel);
+  const shownModels = open
+    ? ranked
+    : selected && !initiallyShown.includes(selected) ? [...initiallyShown, selected] : initiallyShown;
+  const total = ranked.reduce((sum, model) => sum + model.cost, 0) || 1e-9;
   const cx = size / 2, cy = size / 2;
   const rOut = (size - 2) / 2, rIn = rOut - thickness;
-  // No inter-segment gap: wedges butt together into one continuous solid ring.
-  // (Segments stay distinguishable by colour and the hover dim.)
-  const gap = 0;
-  let a = -Math.PI / 2;
+
+  // A selected model remains one contiguous model block in the ring, but that
+  // block is subdivided by its observed effort costs. Geometry is normalized
+  // back to the model total to absorb backend rounding without leaving a gap.
+  const segments = ranked.flatMap<CostSegment>((model) => {
+    if (model.name !== selectedModel) {
+      return [{ model, color: model.color, cost: model.cost, weight: model.cost }];
+    }
+    const efforts = model.efforts?.length
+      ? model.efforts
+      : [{ effort: "unknown", tokens: model.tokens, cacheTokens: model.cacheTokens ?? 0, cost: model.cost }];
+    const costSum = efforts.reduce((sum, effort) => sum + Math.max(0, effort.cost), 0);
+    if (costSum <= 0) return [{ model, color: model.color, cost: model.cost, weight: model.cost }];
+    return efforts
+      .filter((effort) => effort.cost > 0)
+      .map((effort) => ({
+        model,
+        effort: effort.effort,
+        color: reasoningEffortColor(effort.effort),
+        cost: effort.cost,
+        weight: model.cost * effort.cost / costSum,
+      }));
+  });
+  let angle = -Math.PI / 2;
   const arc = (a0: number, a1: number, rO: number, rI: number) => {
     const large = a1 - a0 > Math.PI ? 1 : 0;
     const x0 = cx + rO * Math.cos(a0), y0 = cy + rO * Math.sin(a0);
@@ -170,55 +198,98 @@ export function CostDonut({ models, theme, size = 104, thickness = 16, keepColor
     const x3 = cx + rI * Math.cos(a0), y3 = cy + rI * Math.sin(a0);
     return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${rO} ${rO} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)} L ${x2.toFixed(2)} ${y2.toFixed(2)} A ${rI} ${rI} 0 ${large} 0 ${x3.toFixed(2)} ${y3.toFixed(2)} Z`;
   };
-  const wedges = models.map((m, i) => {
-    const frac = m.cost / total;
-    const a0 = a + gap / 2, a1 = a + frac * 2 * Math.PI - gap / 2;
-    a += frac * 2 * Math.PI;
-    return { m, i, d: arc(a0, a1, hi === i ? rOut + 2 : rOut, rIn) };
+  const highlighted = (model: string, effort?: string) =>
+    !hi || (hi.model === model && (hi.effort === undefined || hi.effort === effort));
+  const wedges = segments.map((segment, index) => {
+    const fraction = segment.weight / total;
+    const a0 = angle, a1 = angle + fraction * 2 * Math.PI;
+    angle = a1;
+    const active = hi?.model === segment.model.name
+      && (hi.effort === undefined || hi.effort === segment.effort);
+    return { ...segment, index, d: arc(a0, a1, active ? rOut + 2 : rOut, rIn) };
   });
-  const cur = hi >= 0 ? models[hi] : null;
-  const amount = cur ? cur.cost : total;
+  const highlightedModel = hi ? ranked.find((model) => model.name === hi.model) : undefined;
+  const highlightedEffort = hi?.effort === undefined
+    ? undefined
+    : highlightedModel?.efforts?.find((effort) => effort.effort === hi.effort);
+  const amount = highlightedEffort?.cost ?? highlightedModel?.cost ?? total;
+  const centerColor = highlightedEffort
+    ? reasoningEffortColor(highlightedEffort.effort)
+    : highlightedModel?.color ?? t.text;
   const txt = fmtMoney(amount);
   const avail = (size - 2 - thickness * 2) * 0.98;
-  const base = cur ? 15 : 17;
+  const base = hi ? 15 : 17;
   const fit = Math.min(base, Math.max(10, avail / (txt.length * 0.62)));
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
       <div style={{ position: "relative", width: size, height: size, flex: "0 0 auto" }}>
         <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ overflow: "visible" }}>
-          {models.length === 1 ? (
-            // Single model: a full closed ring (one 360° arc would be
-            // degenerate). Trace both edges with a 1px card-coloured stroke for
-            // a crisp inset look.
-            <g onMouseEnter={() => setHi(0)} onMouseLeave={() => setHi(-1)} style={{ cursor: "default" }}>
+          {segments.length === 1 ? (
+            // One segment needs a circle: an SVG arc whose endpoints are equal
+            // cannot describe a full 360° ring.
+            <g onMouseEnter={() => setHi({ model: segments[0].model.name, effort: segments[0].effort })}
+              onMouseLeave={() => setHi(null)} style={{ cursor: "default" }}>
               <circle cx={cx} cy={cy} r={(rOut + rIn) / 2}
-                fill="none" stroke={models[0].color} strokeWidth={thickness} />
+                fill="none" stroke={segments[0].color} strokeWidth={thickness} />
               <circle cx={cx} cy={cy} r={rOut} fill="none" stroke={t.card} strokeWidth={1} />
               <circle cx={cx} cy={cy} r={rIn} fill="none" stroke={t.card} strokeWidth={1} />
             </g>
           ) : (
-            wedges.map((w) => (
-              <path key={w.i} d={w.d} fill={w.m.color}
-                opacity={hi === -1 || hi === w.i ? 1 : 0.32}
-                onMouseEnter={() => setHi(w.i)} onMouseLeave={() => setHi(-1)}
+            wedges.map((wedge) => (
+              <path key={`${wedge.model.name}:${wedge.effort ?? "model"}`} d={wedge.d} fill={wedge.color}
+                opacity={highlighted(wedge.model.name, wedge.effort) ? 1 : 0.32}
+                onMouseEnter={() => setHi({ model: wedge.model.name, effort: wedge.effort })}
+                onMouseLeave={() => setHi(null)}
                 style={{ transition: "opacity .14s", cursor: "default" }} />
             ))
           )}
         </svg>
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
-          <span style={{ font: `600 ${fit.toFixed(1)}px/1 ${t.mono}`, color: cur ? cur.color : t.text, letterSpacing: "-.01em" }}>{txt}</span>
+          <span style={{ font: `600 ${fit.toFixed(1)}px/1 ${t.mono}`, color: centerColor, letterSpacing: "-.01em" }}>{txt}</span>
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        {shownModels.map((m, i) => (
-          <div key={i} onMouseEnter={() => setHi(i)} onMouseLeave={() => setHi(-1)}
-            style={{ display: "flex", alignItems: "center", gap: 7, padding: "2.5px 0", opacity: hi === -1 || hi === i ? 1 : 0.45, transition: "opacity .14s", cursor: "default", userSelect: "none" }}>
-            <span style={{ width: 7, height: 7, borderRadius: 2, background: m.color, flex: "0 0 auto" }} />
-            <span style={{ font: `500 10.5px ${t.ui}`, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, fontWeight: hi === i ? 600 : 500 }}>{m.name.replace("Claude ", "")}</span>
-            <span style={{ font: `600 10.5px ${t.mono}`, color: hi === i ? m.color : t.dim, flex: "0 0 auto" }}>{fmtMoney(m.cost)}</span>
-          </div>
-        ))}
-        <ListToggle expanded={open} total={models.length} limit={limit} theme={t} onToggle={() => setOpen((value) => !value)} />
+        {shownModels.map((model) => {
+          const modelActive = hi?.model === model.name && hi.effort === undefined;
+          const modelVisible = !hi || hi.model === model.name;
+          const efforts = model.name === selectedModel
+            ? model.efforts?.length
+              ? model.efforts
+              : [{ effort: "unknown", tokens: model.tokens, cacheTokens: model.cacheTokens ?? 0, cost: model.cost }]
+            : [];
+          return (
+            <div key={model.name} style={{ opacity: modelVisible ? 1 : 0.45, transition: "opacity .14s" }}>
+              <div onMouseEnter={() => setHi({ model: model.name })} onMouseLeave={() => setHi(null)}
+                style={{ display: "flex", alignItems: "center", gap: 7, padding: "2.5px 0", cursor: "default", userSelect: "none" }}>
+                <span style={{ width: 7, height: 7, borderRadius: 2, background: model.color, flex: "0 0 auto" }} />
+                <span style={{ font: `500 10.5px ${t.ui}`, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, fontWeight: modelActive ? 600 : 500 }}>{model.name.replace("Claude ", "")}</span>
+                <span style={{ font: `600 10.5px ${t.mono}`, color: modelActive ? model.color : t.dim, flex: "0 0 auto" }}>{fmtMoney(model.cost)}</span>
+              </div>
+              {efforts.map((effort) => {
+                const effortActive = hi?.model === model.name && hi.effort === effort.effort;
+                const color = reasoningEffortColor(effort.effort);
+                return (
+                  <div key={effort.effort}
+                    title={`${effortLabel?.(effort.effort) ?? effort.effort} · ${fmtMoney(effort.cost)}`}
+                    onMouseEnter={() => setHi({ model: model.name, effort: effort.effort })}
+                    onMouseLeave={() => setHi(null)} style={{
+                      display: "flex", alignItems: "center", gap: 6, marginLeft: 14, padding: "2px 0 2px 7px",
+                      borderLeft: `1px solid ${t.gridLine}`, cursor: "default", userSelect: "none",
+                      opacity: !hi || effortActive || (hi.model === model.name && hi.effort === undefined)
+                        ? 1 : hi.model === model.name ? 0.42 : 1,
+                    }}>
+                    <span style={{ width: 5, height: 5, borderRadius: 2, background: color, flex: "0 0 auto" }} />
+                    <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 9.5px ${t.ui}`, color: effortActive ? t.text : t.dim }}>
+                      {effortLabel?.(effort.effort) ?? effort.effort}
+                    </span>
+                    <span style={{ flex: "0 0 auto", font: `500 9px ${t.mono}`, color: effortActive ? color : t.faint }}>{fmtMoney(effort.cost)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })}
+        <ListToggle expanded={open} total={ranked.length} limit={limit} theme={t} onToggle={() => setOpen((value) => !value)} />
       </div>
     </div>
   );

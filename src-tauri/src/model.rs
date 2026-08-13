@@ -11,6 +11,15 @@ pub struct SeriesPoint {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ReasoningEffortStat {
+    pub effort: String,
+    pub tokens: f64, // M tokens (input + cache + output)
+    #[serde(rename = "cacheTokens")]
+    pub cache_tokens: f64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelStat {
     pub name: String,
     pub vendor: String,
@@ -23,6 +32,8 @@ pub struct ModelStat {
     // Owning agent id ("claude" / "codex" / "pi"). In the All scope the same model name
     // can appear once per agent (e.g. gpt-5 via a router AND via Codex).
     pub agent: String,
+    // Only levels observed locally for this model in the report's scope/period.
+    pub efforts: Vec<ReasoningEffortStat>,
 }
 
 #[derive(Debug, Clone, Serialize)]

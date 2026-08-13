@@ -25,6 +25,7 @@ struct Event {
     input: f64,  // raw tokens, uncached new input only
     cache: f64,  // raw tokens, cache creation + read
     output: f64, // raw tokens
+    reasoning_effort: String, // canonical level, including "unknown"
     cost: f64,   // USD (differentiated by token type), 0 if unknown model
     priced: bool, // whether a price was found for this model
     agent: &'static str, // owning agent id (interned via agent_def)
@@ -108,6 +109,30 @@ fn normalize_model(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+fn reasoning_effort_rank(effort: &str) -> usize {
+    match effort {
+        "off" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        "ultra" => 7,
+        "unknown" => usize::MAX,
+        _ => 8,
+    }
+}
+
+fn normalize_reasoning_effort(effort: &str) -> String {
+    let effort = effort.trim().to_ascii_lowercase();
+    if effort.is_empty() {
+        "unknown".to_string()
+    } else {
+        effort
+    }
 }
 
 fn vendor_of(model: &str) -> &'static str {
@@ -398,6 +423,7 @@ fn clone_event(e: &Event) -> Event {
         input: e.input,
         cache: e.cache,
         output: e.output,
+        reasoning_effort: e.reasoning_effort.clone(),
         cost: e.cost,
         priced: e.priced,
         agent: e.agent,
@@ -499,6 +525,7 @@ fn compute_event(
         input: r.in_tok,
         cache: r.cc + r.cr,
         output: r.out_tok,
+        reasoning_effort: normalize_reasoning_effort(&r.reasoning_effort),
         cost: cost_opt.unwrap_or(0.0),
         priced: cost_opt.is_some(),
         agent: agent_def(&r.agent).id,
@@ -673,6 +700,9 @@ struct Agg {
     model_cost: HashMap<String, f64>,
     model_priced: HashMap<String, bool>,
     model_agent: HashMap<String, &'static str>,
+    model_effort_tok: HashMap<(String, String), f64>,
+    model_effort_cache_tok: HashMap<(String, String), f64>,
+    model_effort_cost: HashMap<(String, String), f64>,
     projects: HashMap<String, ProjectAgg>,
     mcp_counts: HashMap<String, u64>,
     skill_counts: HashMap<String, u64>,
@@ -708,6 +738,14 @@ impl Agg {
             // a model is "priced" if any of its messages had a known price
             *self.model_priced.entry(e.model.clone()).or_default() |= e.priced;
             self.model_agent.entry(e.model.clone()).or_insert(e.agent);
+            let effort_key = (e.model.clone(), e.reasoning_effort.clone());
+            *self.model_effort_tok.entry(effort_key.clone()).or_default() +=
+                e.input + e.cache + e.output;
+            *self
+                .model_effort_cache_tok
+                .entry(effort_key.clone())
+                .or_default() += e.cache;
+            *self.model_effort_cost.entry(effort_key).or_default() += e.cost;
         }
         if !e.project_id.is_empty() {
             let project = self.projects.entry(e.project_id.clone()).or_default();
@@ -742,6 +780,34 @@ impl Agg {
             .enumerate()
             .map(|(i, (name, tok, cost))| {
                 let priced = *self.model_priced.get(&name).unwrap_or(&false);
+                let mut efforts: Vec<ReasoningEffortStat> = self
+                    .model_effort_tok
+                    .iter()
+                    .filter(|((model, _), _)| model == &name)
+                    .map(|((model, effort), effort_tokens)| ReasoningEffortStat {
+                        effort: effort.clone(),
+                        tokens: *effort_tokens / 1e6,
+                        cache_tokens: self
+                            .model_effort_cache_tok
+                            .get(&(model.clone(), effort.clone()))
+                            .copied()
+                            .unwrap_or_default()
+                            / 1e6,
+                        cost: (self
+                            .model_effort_cost
+                            .get(&(model.clone(), effort.clone()))
+                            .copied()
+                            .unwrap_or_default()
+                            * 1_000_000.0)
+                            .round()
+                            / 1_000_000.0,
+                    })
+                    .collect();
+                efforts.sort_by(|left, right| {
+                    reasoning_effort_rank(&left.effort)
+                        .cmp(&reasoning_effort_rank(&right.effort))
+                        .then_with(|| left.effort.cmp(&right.effort))
+                });
                 ModelStat {
                     vendor: vendor_of(&name).to_string(),
                     tokens: tok / 1e6,
@@ -751,6 +817,7 @@ impl Agg {
                     color: if i < palette.len() { palette[i] } else { OVERFLOW_GRAY }.to_string(),
                     priced,
                     agent: self.model_agent.get(&name).copied().unwrap_or("").to_string(),
+                    efforts,
                     name,
                 }
             })
@@ -1253,6 +1320,7 @@ mod tests {
             input: tokens,
             cache: 0.0,
             output: 0.0,
+            reasoning_effort: "unknown".to_string(),
             cost: tokens / 1e6,
             priced: true,
             agent: AGENT_CLAUDE,
@@ -1315,6 +1383,34 @@ mod tests {
         assert_eq!(report.models[0].tokens, 0.001);
         assert_eq!(report.models[0].cache_tokens, 0.0008);
         assert_eq!(report.metrics.total_tokens, report.models[0].tokens);
+    }
+
+    #[test]
+    fn model_stats_split_tokens_cache_and_cost_by_observed_reasoning_effort() {
+        let day = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut high = event(2026, 7, 13, 12, 100.0);
+        high.cache = 800.0;
+        high.output = 100.0;
+        high.cost = 1.25;
+        high.reasoning_effort = "high".to_string();
+        let mut unknown = event(2026, 7, 13, 13, 50.0);
+        unknown.cache = 25.0;
+        unknown.output = 25.0;
+        unknown.cost = 0.25;
+        unknown.reasoning_effort = "unknown".to_string();
+
+        let report = report_range(&[high, unknown], &[], day, day, PALETTE);
+        let model = report.models.first().expect("model breakdown");
+
+        assert_eq!(model.tokens, 0.0011);
+        assert_eq!(model.efforts.len(), 2);
+        assert_eq!(model.efforts[0].effort, "high");
+        assert_eq!(model.efforts[0].tokens, 0.001);
+        assert_eq!(model.efforts[0].cache_tokens, 0.0008);
+        assert_eq!(model.efforts[0].cost, 1.25);
+        assert_eq!(model.efforts[1].effort, "unknown");
+        assert_eq!(model.efforts[1].tokens, 0.0001);
+        assert_eq!(model.efforts.iter().map(|effort| effort.tokens).sum::<f64>(), model.tokens);
     }
 
     #[test]

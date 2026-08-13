@@ -78,6 +78,10 @@ pub struct RawEvent {
     pub cc: f64,       // cache creation/write
     pub cr: f64,       // cache read (codex: cached_input_tokens, a subset of its raw input)
     pub out_tok: f64,
+    // Effective reasoning/thinking level for this upstream request. Empty means
+    // the source log did not report one; aggregation exposes that as "unknown".
+    #[serde(default)]
+    pub reasoning_effort: String,
     pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
     pub skills: Vec<String>, // all detected Skill ids called (unfiltered)
     pub id: String,          // message id (dedup); "" = no cross-line dedup needed
@@ -119,6 +123,10 @@ struct FileState {
     turn_id: String,
     #[serde(default)]
     turn_started_ms: i64,
+    // Effective request-level reasoning setting. Codex writes it in turn
+    // context/settings events; Pi resolves it from each entry's tree ancestry.
+    #[serde(default)]
+    reasoning_effort: String,
     #[serde(default)]
     skills_seen: Vec<String>,
     // Newer Codex logs emit tool_search_output groups, then call the selected
@@ -161,6 +169,11 @@ struct Manifest {
     // active path verbatim, including ids, and must not replay usage/telemetry.
     #[serde(default)]
     pi_entries: HashMap<String, String>,
+    // Pi settings are tree entries, not fields on assistant messages. Persist
+    // each entry's effective level so descendants and copied fork paths can
+    // inherit it correctly during incremental reads.
+    #[serde(default)]
+    pi_reasoning_efforts: HashMap<String, String>,
 }
 
 pub struct Store {
@@ -201,7 +214,8 @@ pub struct Store {
 //       tool outcomes, reasoning, compactions, projects, and Skill reads.
 //  v13: persist every Pi tree entry id so copied fork/clone paths cannot replay
 //       either usage or reliability side effects across source files.
-const STORE_VERSION: u32 = 13;
+//  v14: extract each request's effective reasoning effort for model filtering.
+const STORE_VERSION: u32 = 14;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -645,6 +659,9 @@ impl Store {
         self.manifest
             .pi_entries
             .retain(|_, source| source != key);
+        self.manifest
+            .pi_reasoning_efforts
+            .retain(|entry_id, _| self.manifest.pi_entries.contains_key(entry_id));
     }
 
     /// Incrementally read only the new bytes of new/changed JSONL files across
@@ -758,6 +775,9 @@ impl Store {
                             // Same message, another line: merge its tool calls
                             // (don't re-count tokens — usage repeats per line).
                             let prev = &mut self.events[i];
+                            if prev.reasoning_effort.is_empty() && !ev.reasoning_effort.is_empty() {
+                                prev.reasoning_effort = ev.reasoning_effort;
+                            }
                             prev.mcp.extend(ev.mcp);
                             prev.skills.extend(ev.skills);
                             continue;
@@ -824,6 +844,9 @@ impl Store {
             "turn_context" => {
                 // The child's own turns start here; the replay window is over.
                 state.replaying = false;
+                if let Some(effort) = codex_reasoning_effort(payload) {
+                    state.reasoning_effort = effort;
+                }
                 if let Some(m) = payload.get("model").and_then(|x| x.as_str()) {
                     state.model = m.to_string();
                 }
@@ -848,6 +871,12 @@ impl Store {
                     }
                 }
                 match event_type {
+                    "thread_settings_applied" => {
+                        if let Some(effort) = codex_reasoning_effort(payload) {
+                            state.reasoning_effort = effort;
+                        }
+                        return None;
+                    }
                     "task_started" => {
                         state.skills_seen.clear();
                         let context_window = payload
@@ -967,6 +996,7 @@ impl Store {
                     cc: usage.cache_write_input_tokens as f64,
                     cr: usage.cache_read_input_tokens as f64,
                     out_tok: usage.output_tokens as f64,
+                    reasoning_effort: state.reasoning_effort.clone(),
                     mcp: Vec::new(),
                     skills: Vec::new(),
                     id: usage.event_id,
@@ -1024,6 +1054,7 @@ impl Store {
                     cc: 0.0,
                     cr: 0.0,
                     out_tok: 0.0,
+                    reasoning_effort: String::new(),
                     mcp: vec![server],
                     skills: Vec::new(),
                     id: String::new(),
@@ -1044,8 +1075,34 @@ impl Store {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let entry_type = value.get("type")?.as_str()?;
         let ts_ms = parse_ts(&value).unwrap_or(0);
+        let entry_id = value.get("id").and_then(|item| item.as_str());
+        if entry_type != "session" {
+            // Resolve settings along the entry's parent chain rather than by
+            // physical line order: Pi files are trees and a later line may
+            // return to an earlier branch with a different thinking level.
+            let inherited_effort = value
+                .get("parentId")
+                .and_then(|item| item.as_str())
+                .and_then(|parent_id| self.manifest.pi_reasoning_efforts.get(parent_id))
+                .cloned()
+                .unwrap_or_default();
+            state.reasoning_effort = if entry_type == "thinking_level_change" {
+                value
+                    .get("thinkingLevel")
+                    .and_then(|item| item.as_str())
+                    .map(normalize_reasoning_effort)
+                    .unwrap_or(inherited_effort)
+            } else {
+                inherited_effort
+            };
+            if let Some(entry_id) = entry_id {
+                self.manifest
+                    .pi_reasoning_efforts
+                    .insert(entry_id.to_string(), state.reasoning_effort.clone());
+            }
+        }
         if entry_type != "session" && !state.source.is_empty() {
-            if let Some(entry_id) = value.get("id").and_then(|item| item.as_str()) {
+            if let Some(entry_id) = entry_id {
                 if self.manifest.pi_entries.contains_key(entry_id) {
                     return None;
                 }
@@ -1065,6 +1122,7 @@ impl Store {
                 }
                 None
             }
+            "thinking_level_change" => None,
             "model_change" => {
                 if let Some(provider) = value.get("provider").and_then(|item| item.as_str()) {
                     state.provider = provider.to_string();
@@ -1395,6 +1453,7 @@ fn pi_event(
         cc: data.cache_write,
         cr: data.cache_read,
         out_tok: data.output,
+        reasoning_effort: state.reasoning_effort.clone(),
         mcp: data.mcp,
         skills: data.skills,
         id: if entry_id.is_empty() {
@@ -1531,6 +1590,33 @@ fn pi_context_window(provider: &str, model: &str) -> f64 {
 }
 
 /// RFC3339 top-level `timestamp` → epoch ms.
+fn normalize_reasoning_effort(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn codex_reasoning_effort(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("effort")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            payload
+                .pointer("/collaboration_mode/settings/reasoning_effort")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .pointer("/thread_settings/reasoning_effort")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            payload
+                .pointer("/thread_settings/collaboration_mode/settings/reasoning_effort")
+                .and_then(|value| value.as_str())
+        })
+        .map(normalize_reasoning_effort)
+        .filter(|effort| !effort.is_empty())
+}
+
 fn parse_ts(v: &serde_json::Value) -> Option<i64> {
     let ts = v.get("timestamp")?.as_str()?;
     Some(DateTime::parse_from_rfc3339(ts).ok()?.timestamp_millis())
@@ -1659,6 +1745,7 @@ fn codex_exec_event(
         cc: 0.0,
         cr: 0.0,
         out_tok: 0.0,
+        reasoning_effort: String::new(),
         mcp,
         skills,
         id: String::new(),
@@ -1731,6 +1818,7 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         cc: 0.0,
         cr: 0.0,
         out_tok: 0.0,
+        reasoning_effort: String::new(),
         mcp: Vec::new(),
         skills: vec![skill],
         id,
@@ -1798,6 +1886,11 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
         cc: g("cache_creation_input_tokens"),
         cr: g("cache_read_input_tokens"),
         out_tok: g("output_tokens"),
+        reasoning_effort: v
+            .get("effort")
+            .and_then(|effort| effort.as_str())
+            .map(normalize_reasoning_effort)
+            .unwrap_or_default(),
         mcp,
         skills,
         id,
@@ -1935,7 +2028,7 @@ mod tests {
             source: "/tmp/codex-cache-write.jsonl".to_string(),
             ..FileState::default()
         };
-        let context = r#"{"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","turn_id":"turn-cache"}}"#;
+        let context = r#"{"timestamp":"2026-07-30T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol","turn_id":"turn-cache","effort":"xhigh"}}"#;
         let usage = r#"{"timestamp":"2026-07-30T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}"#;
 
         store.parse_codex_line(context, &mut state);
@@ -1947,6 +2040,7 @@ mod tests {
         assert_eq!(event.cc, 50.0);
         assert_eq!(event.cr, 40.0);
         assert_eq!(event.out_tok, 10.0);
+        assert_eq!(event.reasoning_effort, "xhigh");
         let turn = store.turns.first().expect("turn telemetry");
         assert_eq!(turn.input_tokens, 10.0);
         assert_eq!(turn.cache_creation_tokens, 50.0);
@@ -2128,16 +2222,19 @@ mod tests {
             ..FileState::default()
         };
         let user = r#"{"timestamp":"2026-07-13T12:00:00Z","type":"user","sessionId":"session-1","promptId":"prompt-1","message":{"content":"hi"}}"#;
-        let assistant = r#"{"timestamp":"2026-07-13T12:00:01Z","type":"assistant","sessionId":"session-1","message":{"id":"message-1","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#;
+        let assistant = r#"{"timestamp":"2026-07-13T12:00:01Z","type":"assistant","sessionId":"session-1","effort":"high","message":{"id":"message-1","model":"claude-sonnet-4","content":[],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40}}}"#;
         let error = r#"{"timestamp":"2026-07-13T12:00:02Z","type":"user","sessionId":"session-1","sourceToolUseID":"tool-1","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"failed"}]}}"#;
         let duration = r#"{"timestamp":"2026-07-13T12:00:03Z","type":"system","sessionId":"session-1","subtype":"turn_duration","durationMs":3000}"#;
 
         let _ = store.parse_claude_line(user, &mut state);
-        let _ = store.parse_claude_line(assistant, &mut state);
+        let event = store
+            .parse_claude_line(assistant, &mut state)
+            .expect("assistant usage event");
         let _ = store.parse_claude_line(assistant, &mut state);
         let _ = store.parse_claude_line(error, &mut state);
         let _ = store.parse_claude_line(duration, &mut state);
 
+        assert_eq!(event.reasoning_effort, "high");
         let turn = &store.turns[0];
         assert_eq!(turn.outcome, "completed");
         assert_eq!(turn.input_tokens, 10.0);
@@ -2278,6 +2375,41 @@ mod tests {
         assert!(store.parse_pi_line(user, &mut copied).is_none());
         assert!(store.parse_pi_line(assistant, &mut copied).is_none());
         assert_eq!(store.turns.len(), 1);
+    }
+
+    #[test]
+    fn resolves_pi_reasoning_effort_from_each_entries_tree_branch() {
+        let mut store = empty_store();
+        let mut state = FileState {
+            source: "/tmp/pi-branches.jsonl".to_string(),
+            session: "session-pi".to_string(),
+            ..FileState::default()
+        };
+        let high = r#"{"type":"thinking_level_change","id":"think-hi","parentId":null,"timestamp":"2026-08-01T10:00:00Z","thinkingLevel":"high"}"#;
+        let high_user = r#"{"type":"message","id":"user-hi","parentId":"think-hi","timestamp":"2026-08-01T10:00:01Z","message":{"role":"user","content":"high branch"}}"#;
+        let low = r#"{"type":"thinking_level_change","id":"think-lo","parentId":"think-hi","timestamp":"2026-08-01T10:00:02Z","thinkingLevel":"low"}"#;
+        let low_user = r#"{"type":"message","id":"user-lo","parentId":"think-lo","timestamp":"2026-08-01T10:00:03Z","message":{"role":"user","content":"low branch"}}"#;
+        let assistant = |id: &str, parent: &str| {
+            format!(
+                r#"{{"type":"message","id":"{id}","parentId":"{parent}","timestamp":"2026-08-01T10:00:04Z","message":{{"role":"assistant","provider":"test","model":"test-model","content":[],"usage":{{"input":10,"cacheRead":0,"cacheWrite":0,"output":5,"totalTokens":15,"cost":{{"total":0.01}}}},"stopReason":"stop"}}}}"#
+            )
+        };
+
+        store.parse_pi_line(high, &mut state);
+        store.parse_pi_line(high_user, &mut state);
+        store.parse_pi_line(low, &mut state);
+        store.parse_pi_line(low_user, &mut state);
+        let low_event = store
+            .parse_pi_line(&assistant("assist-lo", "user-lo"), &mut state)
+            .expect("low-branch usage");
+        // This line appears physically after the low branch but descends from
+        // the high branch, so line-order state would attribute it incorrectly.
+        let high_event = store
+            .parse_pi_line(&assistant("assist-hi", "user-hi"), &mut state)
+            .expect("high-branch usage");
+
+        assert_eq!(low_event.reasoning_effort, "low");
+        assert_eq!(high_event.reasoning_effort, "high");
     }
 
     #[test]
