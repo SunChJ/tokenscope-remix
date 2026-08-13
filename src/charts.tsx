@@ -158,11 +158,9 @@ export function CostDonut({ models, theme, size = 104, thickness = 16, keepColor
   const ranked = [...models]
     .sort((a, b) => b.cost - a.cost)
     .map((m, i) => (keepColors ? m : { ...m, color: i < DONUT_PALETTE.length ? DONUT_PALETTE[i] : DONUT_OVERFLOW }));
-  const initiallyShown = ranked.slice(0, limit);
-  const selected = ranked.find((model) => model.name === selectedModel);
-  const shownModels = open
-    ? ranked
-    : selected && !initiallyShown.includes(selected) ? [...initiallyShown, selected] : initiallyShown;
+  // Collapsing only limits the legend. The donut geometry always uses the
+  // complete ranked dataset passed by the active model filter.
+  const shownModels = ranked.slice(0, open ? ranked.length : limit);
   const total = ranked.reduce((sum, model) => sum + model.cost, 0) || 1e-9;
   const cx = size / 2, cy = size / 2;
   const rOut = (size - 2) / 2, rIn = rOut - thickness;

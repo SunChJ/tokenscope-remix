@@ -544,17 +544,12 @@ function ProjectSettlement({ projects, theme, onExport }:
 function ModelList({ models, shares, max, theme, selectedModel = "" }:
   { models: ModelStat[]; shares: number[]; max: number; theme: Theme; selectedModel?: string }) {
   const [open, setOpen] = useState(false);
-  const shareByModel = new Map(models.map((model, index) => [model.name, shares[index]]));
-  const initiallyShown = models.slice(0, 3);
-  const selected = models.find((model) => model.name === selectedModel);
-  const shown = open
-    ? models
-    : selected && !initiallyShown.includes(selected) ? [...initiallyShown, selected] : initiallyShown;
+  const shown = models.slice(0, open ? models.length : 3);
   return (
     <div>
-      {shown.map((model) => (
+      {shown.map((model, index) => (
         <ModelRow key={model.name} m={model} max={max} theme={theme}
-          share={shareByModel.get(model.name) ?? 0} expanded={model.name === selectedModel} />
+          share={shares[index] ?? 0} expanded={model.name === selectedModel} />
       ))}
       <ListToggle expanded={open} total={models.length} theme={theme} onToggle={() => setOpen((value) => !value)} />
     </div>
@@ -1126,10 +1121,13 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
   // that it'd render a meaningless "0.0%" (a negligible token share). Such a
   // model can still appear under Cost if it has a non-zero cost.
-  const tokenModels = modelTotals.filter(
+  const allTokenModels = modelTotals.filter(
     (model) => model.name === selectedModel?.name
       || Math.round((model.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
   );
+  const tokenModels = selectedModel
+    ? allTokenModels.filter((model) => model.name === selectedModel.name)
+    : allTokenModels;
   const costModels = modelTotals.filter((model) => model.cost > 0);
   // Once a model is selected, the donut becomes that model's composition view:
   // its full ring is split only by observed reasoning effort, with no other
@@ -1374,7 +1372,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>{text.tokensByModel}</Label></div>
         {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>{text.noUsagePeriod}</div>}
-        <ModelList key={`${viewKey}:${scope.id}:tokens`} models={tokenModels} shares={tokenShares} max={maxM} theme={t}
+        <ModelList key={`${modelContextKey}:tokens`} models={tokenModels} shares={tokenShares} max={maxM} theme={t}
           selectedModel={selectedModel?.name} />
         <SectionRule t={t} m="10px 0 10px" />
         {/* cost donut */}
