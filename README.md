@@ -11,7 +11,7 @@ Built with **Tauri 2 + React + TypeScript**, backed by a Rust data layer. Works 
 ## Highlights
 
 - **One dashboard, every agent** — filter chips (All / Claude / Codex / Pi) switch between aggregated and per-agent views, each with its own accent theme
-- **Token & cost analytics** — day / week / month plus custom date ranges; breakdowns by model, MCP calls, and Skills (yours only — built-ins are filtered out)
+- **Token & cost analytics** — day / week / month plus custom date ranges; selecting a model reveals its locally observed reasoning-effort composition, with breakdowns for MCP calls and Skills (yours only — built-ins are filtered out)
 - **Live subscription quota** — Claude (5-hour + weekly) and Codex (weekly + Spark) refreshed every 60 seconds, shown Codex-status style (`29% left (resets 05:01 on 9 Aug)`), with a burn-rate projection
 - **Menu-bar glanceability** — today's tokens plus a compact per-provider quota summary (`52.8M · Cl79% · Cx29%`) or a detailed list
 - **Project settlement** — usage grouped by Git repo / working directory, exported as CSV without raw paths or conversation content

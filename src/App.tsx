@@ -7,9 +7,9 @@ import { check as checkUpdate, Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import appPackage from "../package.json";
 import {
-  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReliabilityStats, Scope, Theme, TH,
+  ContextStats, Dashboard, DateRange, PeriodReport, QuotaTrendPoint, RangeDashboard, ModelStat, ProjectStat, ReasoningEffortStat, ReliabilityStats, Scope, Theme, TH,
   ProviderLimit, LimitWindow,
-  fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, themeForScope,
+  fetchDashboard, fetchRangeDashboard, fmtInt, fmtMoney, fmtTokens, pct, reasoningEffortColor, themeForScope,
 } from "./data";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
@@ -90,20 +90,78 @@ function sharePcts(values: number[]): number[] {
   return units.map((u) => u / 10);
 }
 
-function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: Theme; share: number }) {
+const REASONING_EFFORT_ORDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+function reasoningEffortRank(effort: string): number {
+  if (effort === "unknown") return Number.MAX_SAFE_INTEGER;
+  const index = REASONING_EFFORT_ORDER.indexOf(effort);
+  return index >= 0 ? index : REASONING_EFFORT_ORDER.length;
+}
+
+function reasoningEffortLabel(effort: string, unknown: string): string {
+  if (effort === "unknown") return unknown;
+  if (effort === "xhigh") return "XHigh";
+  return effort
+    .split(/[-_]/)
+    .map((part) => part ? part[0].toUpperCase() + part.slice(1) : part)
+    .join(" ");
+}
+
+function observedReasoningEfforts(model: ModelStat, cacheTokens: number): ReasoningEffortStat[] {
+  return model.efforts?.length
+    ? model.efforts
+    : [{ effort: "unknown", tokens: model.tokens, cacheTokens, cost: model.cost }];
+}
+
+function ModelRow({ m, max, theme, share, expanded = false }:
+  { m: ModelStat; max: number; theme: Theme; share: number; expanded?: boolean }) {
+  const { text } = useI18n();
   // 1-decimal share; whole numbers drop the ".0" (100% not 100.0%).
-  const pctStr = share % 1 === 0 ? share.toFixed(0) : share.toFixed(1);
+  const pctStr = share === 0 && m.tokens > 0
+    ? "<0.1"
+    : share % 1 === 0 ? share.toFixed(0) : share.toFixed(1);
+  const cacheTokens = m.cacheTokens ?? 0;
+  const efforts = observedReasoningEfforts(m, cacheTokens);
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "5px 0" }}>
-      <span style={{ width: 7, height: 7, borderRadius: 2, background: m.color, flex: "0 0 auto" }} />
-      <div style={{ minWidth: 0, flex: "0 0 118px" }}>
-        <div style={{ font: `500 11.5px ${theme.ui}`, color: theme.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.name}</div>
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "5px 0" }}>
+        <span style={{ width: 7, height: 7, borderRadius: 2, background: m.color, flex: "0 0 auto" }} />
+        <div style={{ minWidth: 0, flex: "0 0 118px" }}>
+          <div style={{ font: `500 11.5px ${theme.ui}`, color: theme.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m.name}</div>
+        </div>
+        <div style={{ flex: 1, height: 5, borderRadius: 3, background: theme.gridLine, overflow: "hidden" }}>
+          <div style={{ width: `${(m.tokens / max) * 100}%`, height: "100%", background: m.color, borderRadius: 3 }} />
+        </div>
+        <span style={{ font: `500 10.5px ${theme.mono}`, color: theme.dim, flex: "0 0 auto", width: 42, textAlign: "right" }}>{fmtTokens(m.tokens)}</span>
+        <span style={{ font: `600 10.5px ${theme.mono}`, color: theme.text, flex: "0 0 auto", width: 40, textAlign: "right" }}>{pctStr}%</span>
       </div>
-      <div style={{ flex: 1, height: 5, borderRadius: 3, background: theme.gridLine, overflow: "hidden" }}>
-        <div style={{ width: `${(m.tokens / max) * 100}%`, height: "100%", background: m.color, borderRadius: 3 }} />
-      </div>
-      <span style={{ font: `500 10.5px ${theme.mono}`, color: theme.dim, flex: "0 0 auto", width: 42, textAlign: "right" }}>{fmtTokens(m.tokens)}</span>
-      <span style={{ font: `600 10.5px ${theme.mono}`, color: theme.text, flex: "0 0 auto", width: 40, textAlign: "right" }}>{pctStr}%</span>
+      {expanded && (
+        <div style={{ margin: "0 0 3px 3px", padding: "2px 0 2px 12px", borderLeft: `1px solid ${theme.gridLine}` }}>
+          <div style={{ marginBottom: 2, font: `600 8px ${theme.ui}`, color: theme.faint, letterSpacing: ".05em", textTransform: "uppercase" }}>
+            {text.reasoningEffort}
+          </div>
+          {efforts.map((effort) => {
+            const actualPct = m.tokens > 0 ? (effort.tokens / m.tokens) * 100 : 0;
+            const pctLabel = actualPct > 0 && actualPct < 0.1
+              ? "<0.1"
+              : (actualPct % 1 === 0 ? actualPct.toFixed(0) : actualPct.toFixed(1));
+            const color = reasoningEffortColor(effort.effort);
+            const label = reasoningEffortLabel(effort.effort, text.unknownEffort);
+            return (
+              <div key={effort.effort} title={`${label} · ${fmtTokens(effort.tokens)} · ${actualPct.toFixed(3)}% · ${fmtMoney(effort.cost)}`}
+                style={{ display: "flex", alignItems: "center", gap: 7, padding: "2px 0" }}>
+                <span style={{ width: 5, height: 5, borderRadius: 2, background: color, flex: "0 0 auto" }} />
+                <span style={{ flex: "0 0 90px", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", font: `500 9.5px ${theme.ui}`, color: theme.dim }}>{label}</span>
+                <div style={{ flex: 1, height: 4, borderRadius: 2, background: theme.gridLine, overflow: "hidden" }}>
+                  <div style={{ width: `${Math.min(100, actualPct)}%`, minWidth: actualPct > 0 ? 2 : 0, maxWidth: "100%", height: "100%", borderRadius: 2, background: color }} />
+                </div>
+                <span style={{ width: 42, flex: "0 0 auto", textAlign: "right", font: `500 9px ${theme.mono}`, color: theme.faint }}>{fmtTokens(effort.tokens)}</span>
+                <span style={{ width: 40, flex: "0 0 auto", textAlign: "right", font: `600 9px ${theme.mono}`, color: theme.dim }}>{pctLabel}%</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -483,14 +541,20 @@ function ProjectSettlement({ projects, theme, onExport }:
   );
 }
 
-function ModelList({ models, shares, max, theme }:
-  { models: ModelStat[]; shares: number[]; max: number; theme: Theme }) {
+function ModelList({ models, shares, max, theme, selectedModel = "" }:
+  { models: ModelStat[]; shares: number[]; max: number; theme: Theme; selectedModel?: string }) {
   const [open, setOpen] = useState(false);
-  const shown = models.slice(0, open ? models.length : 3);
+  const shareByModel = new Map(models.map((model, index) => [model.name, shares[index]]));
+  const initiallyShown = models.slice(0, 3);
+  const selected = models.find((model) => model.name === selectedModel);
+  const shown = open
+    ? models
+    : selected && !initiallyShown.includes(selected) ? [...initiallyShown, selected] : initiallyShown;
   return (
     <div>
-      {shown.map((model, index) => (
-        <ModelRow key={`${model.agent}:${model.name}`} m={model} max={max} theme={theme} share={shares[index]} />
+      {shown.map((model) => (
+        <ModelRow key={model.name} m={model} max={max} theme={theme}
+          share={shareByModel.get(model.name) ?? 0} expanded={model.name === selectedModel} />
       ))}
       <ListToggle expanded={open} total={models.length} theme={theme} onToggle={() => setOpen((value) => !value)} />
     </div>
@@ -989,29 +1053,56 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
     compactions: 0, reasoningTokens: 0, reasoningPct: 0,
   };
   const [totalModel, setTotalModel] = useState("");
-  // The All scope can contain the same model once per agent. The selector is
-  // model-based, so combine those rows before calculating its Total and cost.
-  const modelTotals = Array.from(models.reduce((totals, model) => {
-    const prev = totals.get(model.name) ?? { name: model.name, tokens: 0, cacheTokens: 0, cost: 0 };
-    prev.tokens += model.tokens;
-    // Live payloads carry the exact per-model cache split. The proportional
-    // fallback keeps old/static snapshots internally consistent.
-    prev.cacheTokens += model.cacheTokens
+  type ModelTotal = Omit<ModelStat, "efforts" | "cacheTokens"> & {
+    cacheTokens: number;
+    efforts: Map<string, ReasoningEffortStat>;
+  };
+  // The All scope can contain the same model once per agent. Treat one model
+  // name as one visual block, combining its totals and effort levels before it
+  // reaches the selector, token bars, or cost donut.
+  const modelTotals: ModelStat[] = Array.from(models.reduce((totals, model) => {
+    const prev = totals.get(model.name) ?? {
+      name: model.name, vendor: model.vendor, tokens: 0, cacheTokens: 0, cost: 0,
+      color: model.color, priced: model.priced, agent: model.agent,
+      efforts: new Map<string, ReasoningEffortStat>(),
+    };
+    const cacheTokens = model.cacheTokens
       ?? (M.totalTokens > 0 ? model.tokens * M.cacheTokens / M.totalTokens : 0);
+    prev.tokens += model.tokens;
+    prev.cacheTokens += cacheTokens;
     prev.cost += model.cost;
+    prev.priced = prev.priced && model.priced;
+    if (prev.agent !== model.agent) prev.agent = "";
+    for (const effort of observedReasoningEfforts(model, cacheTokens)) {
+      const total = prev.efforts.get(effort.effort) ?? {
+        effort: effort.effort, tokens: 0, cacheTokens: 0, cost: 0,
+      };
+      total.tokens += effort.tokens;
+      total.cacheTokens += effort.cacheTokens;
+      total.cost += effort.cost;
+      prev.efforts.set(effort.effort, total);
+    }
     totals.set(model.name, prev);
     return totals;
-  }, new Map<string, { name: string; tokens: number; cacheTokens: number; cost: number }>()).values())
+  }, new Map<string, ModelTotal>()).values())
+    .map((model) => ({
+      ...model,
+      efforts: Array.from(model.efforts.values()).sort((left, right) =>
+        reasoningEffortRank(left.effort) - reasoningEffortRank(right.effort)
+          || left.effort.localeCompare(right.effort)
+      ),
+    }))
     .filter((model) => model.tokens > 0)
     .sort((a, b) => b.tokens - a.tokens);
   const selectedModel = modelTotals.find((model) => model.name === totalModel);
+  const modelContextKey = `${viewKey}:${scope.id}:${totalModel}`;
   const totalTokens = selectedModel?.tokens ?? M.totalTokens;
   const totalCost = selectedModel?.cost ?? M.cost;
   // Per-agent slices — non-empty only in the All scope with >=2 sources; they
   // switch the hero bar + chart from Cached/New to a by-agent breakdown.
   const slices = P.agents;
-  // Keep the hero's agent split on the same model scope as its Total. The
-  // historical chart below remains the complete period view.
+  // Keep the hero's agent split on the selected model. Effort is a composition
+  // detail now, not a second filter; the historical chart remains complete.
   const heroSlices = (selectedModel && slices.length > 0
     ? slices.map((slice) => ({
         ...slice,
@@ -1021,9 +1112,9 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
       }))
     : slices
   ).filter((slice) => slice.tokens > 0);
-  // animated Total tokens: counts up from 0 on each open / period / scope
-  // / model switch; held at 0 while hidden so it never flashes.
-  const animTotal = useCountUp(totalTokens, `${viewKey}:${scope.id}:${totalModel}:${openGen}`, active);
+  // Animated Total tokens: counts up from 0 on each open / period / scope /
+  // model switch; held at 0 while hidden so it never flashes.
+  const animTotal = useCountUp(totalTokens, `${modelContextKey}:${openGen}`, active);
   const heroTotal = tokenAmount(animTotal, totalTokens, text.tokens);
   // Explicit percentages avoid WebKit's incorrect flexGrow + flexBasis:0 sizing.
   const displayCacheTokens = selectedModel?.cacheTokens ?? M.cacheTokens;
@@ -1035,12 +1126,20 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
   // that it'd render a meaningless "0.0%" (a negligible token share). Such a
   // model can still appear under Cost if it has a non-zero cost.
-  const tokenModels = models.filter(
-    (m) => Math.round((m.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
+  const tokenModels = modelTotals.filter(
+    (model) => model.name === selectedModel?.name
+      || Math.round((model.tokens / (M.totalTokens || 1)) * 1000) / 10 >= 0.1
   );
-  const costModels = models.filter((m) => m.cost > 0);
-  // models that were used but have no LiteLLM pricing (cost unknown, not $0)
-  const unpricedModels = models.filter((m) => !m.priced && m.tokens > 0);
+  const costModels = modelTotals.filter((model) => model.cost > 0);
+  // Once a model is selected, the donut becomes that model's composition view:
+  // its full ring is split only by observed reasoning effort, with no other
+  // models retained as context.
+  const displayedCostModels = selectedModel
+    ? costModels.filter((model) => model.name === selectedModel.name)
+    : costModels;
+  // Models that were used but have incomplete LiteLLM pricing (cost unknown,
+  // not $0). Cross-agent rows with the same name remain one model block.
+  const unpricedModels = modelTotals.filter((model) => !model.priced && model.tokens > 0);
   const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
   // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
   const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
@@ -1223,16 +1322,16 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
             reportOf={reportForScope} />
         )}
         {/* hero */}
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", marginBottom: 10 }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "end", gap: 8, marginBottom: 10 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
               <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{text.totalTokens}</div>
               <select
                 data-no-drag=""
                 aria-label={text.totalTokensModel}
                 title={selectedModel?.name ?? text.allModels}
                 value={selectedModel?.name ?? ""}
-                onChange={(e) => setTotalModel(e.target.value)}
+                onChange={(event) => setTotalModel(event.target.value)}
                 style={{
                   width: 132, height: 22, minWidth: 0, borderRadius: 6,
                   border: `1px solid ${t.gridLine}`, background: t.gridLine,
@@ -1275,12 +1374,15 @@ function Panel({ dash, dark, themePref, onToggleTheme, onToggleLanguage, openGen
         {/* models */}
         <div style={{ marginBottom: 4 }}><Label t={t}>{text.tokensByModel}</Label></div>
         {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>{text.noUsagePeriod}</div>}
-        <ModelList key={`${viewKey}:${scope.id}:tokens`} models={tokenModels} shares={tokenShares} max={maxM} theme={t} />
+        <ModelList key={`${viewKey}:${scope.id}:tokens`} models={tokenModels} shares={tokenShares} max={maxM} theme={t}
+          selectedModel={selectedModel?.name} />
         <SectionRule t={t} m="10px 0 10px" />
         {/* cost donut */}
         <div style={{ marginBottom: 8 }}><Label t={t}>{text.costByModel}</Label></div>
-        {costModels.length > 0
-          ? <CostDonut key={`${viewKey}:${scope.id}:cost`} models={costModels} theme={t} size={100} thickness={15} keepColors={scopes.length > 1} />
+        {displayedCostModels.length > 0
+          ? <CostDonut key={`${viewKey}:${scope.id}:cost:${selectedModel?.name ?? "all"}`} models={displayedCostModels} theme={t} size={100} thickness={15}
+              keepColors={scopes.length > 1} selectedModel={selectedModel?.name}
+              effortLabel={(effort) => reasoningEffortLabel(effort, text.unknownEffort)} />
           : <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>—</div>}
         {unpricedModels.length > 0 && (
           <div style={{ marginTop: 9, font: `500 9.5px/1.5 ${t.mono}`, color: t.faint }}>

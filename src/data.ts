@@ -1,10 +1,34 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number }
+export interface ReasoningEffortStat {
+  effort: string; tokens: number; cacheTokens: number; cost: number;
+}
+
+// Categorical colors for observed reasoning levels. They intentionally stay
+// stable across model/agent themes so an expanded model row and its donut
+// segments use the same visual language.
+const REASONING_EFFORT_COLORS: Record<string, string> = {
+  off: "#7b8494",
+  minimal: "#62a8d8",
+  low: "#4db6c6",
+  medium: "#4fbd9b",
+  high: "#d4ad48",
+  xhigh: "#e3874f",
+  max: "#d76674",
+  ultra: "#a56ad7",
+  unknown: "#70777f",
+};
+
+export function reasoningEffortColor(effort: string): string {
+  return REASONING_EFFORT_COLORS[effort] ?? "#8b72c8";
+}
+
 export interface ModelStat {
   name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean; agent: string;
   // Optional only for compatibility with older/static dashboard payloads.
   cacheTokens?: number;
+  efforts?: ReasoningEffortStat[];
 }
 export interface NamedCount { name: string; count: number }
 export interface ProjectStat { id: string; name: string; tokens: number; cost: number; requests: number; sessions: number }

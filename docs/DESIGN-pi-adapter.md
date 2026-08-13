@@ -19,6 +19,7 @@ Pi resolves relative session directories against each CLI process's cwd. A backg
 |---|---|
 | Session header `id` / `cwd` | Session and project identity |
 | Assistant `provider` / `model` | Active provider/model metadata |
+| `thinking_level_change.thinkingLevel` | Effective request reasoning effort, inherited through `parentId` |
 | `usage.input` | Uncached input |
 | `usage.cacheWrite` | Cache creation |
 | `usage.cacheRead` | Cache read |
@@ -33,7 +34,7 @@ Model context windows are resolved from Pi's `models-store.json` and `models.jso
 
 ## Tree and copy semantics
 
-All physical assistant entries in one tree file represent real upstream requests, including abandoned branches, and therefore count as usage.
+All physical assistant entries in one tree file represent real upstream requests, including abandoned branches, and therefore count as usage. Reasoning effort is resolved through each entry's `parentId` ancestry rather than physical line order, so requests on different branches retain the level active on that branch.
 
 `/fork` and `/clone` can copy an active path into a new file. Pi preserves each entry's stable id, so the store persists a global `entry id → original source` manifest and accepts only the first occurrence. Files are ordered by their timestamp-prefixed filename so the original normally wins. This deduplication runs before token, tool, and reliability side effects.
 
