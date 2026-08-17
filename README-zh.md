@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-**macOS 菜单栏工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
+**macOS 菜单栏工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI，以及 Gloss 内置的 Codex app-server）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）+ **Rust**（数据层）。
 

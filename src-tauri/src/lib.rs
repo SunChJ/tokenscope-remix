@@ -1766,12 +1766,15 @@ pub fn run() {
                         Err(_) => return,
                     };
                     let mut watching = false;
-                    for (_agent, dir) in &roots {
+                    for root in &roots {
                         // The CLI may not have created its dir yet on a fresh
                         // machine; create it so watch() registers instead of
                         // silently falling back to the 30s poll all session.
-                        let _ = std::fs::create_dir_all(dir);
-                        if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
+                        let _ = std::fs::create_dir_all(&root.path);
+                        if watcher
+                            .watch(&root.path, RecursiveMode::Recursive)
+                            .is_ok()
+                        {
                             watching = true;
                         }
                     }
