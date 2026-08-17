@@ -4,7 +4,7 @@
 
 A macOS menu-bar app that gives you **one dashboard for all your local AI coding agents** — token usage, estimated cost, per-model / MCP / Skill breakdowns, and live subscription quota.
 
-Built with **Tauri 2 + React + TypeScript**, backed by a Rust data layer. Works with **Pi, Claude Code, and Codex CLI**.
+Built with **Tauri 2 + React + TypeScript**, backed by a Rust data layer. Works with **Pi, Claude Code, Codex CLI, and Gloss's built-in Codex app-server sessions**.
 
 ![Tokenscope panel (dark / light)](docs/screenshot.png)
 

@@ -67,4 +67,5 @@ control.
   remaining capacity, the reset date, and an optional burn-rate projection.
   A provider with no `hu` snapshot shows **Unavailable**; if both are
   unavailable the whole section says so. Provider limits never attach to a
-  token-usage scope (Pi / Codex CLI remain only usage sources).
+  token-usage scope (Pi / Codex rollout clients such as Codex CLI and Gloss
+  remain only usage sources).
