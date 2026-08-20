@@ -71,46 +71,8 @@ trait UsageSource {
 
 ### 2.3 Codex 适配器（本期新增）
 
-**数据源**：
-
-- `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`（遵循 `CODEX_HOME`）
-- `~/Library/Application Support/Gloss/Usage/codex-usage-YYYY-MM-DD-v1.jsonl`
-  （Gloss 持久事实源）
-- `~/Library/Application Support/Gloss/Codex/sessions/**/rollout-*.jsonl`
-  （旧版/实时 fallback）
-
-Gloss 仍归入 `agent = codex`，但 source origin 为 `gloss`；其 app-server
-工作目录是内部临时目录，因此项目统计固定归一为 `Gloss`。各 root
-按规范化绝对路径去重。Gloss 会在收到
-`thread/tokenUsage/updated` 时，把 exact `last` usage 和累计 `total`
-fingerprint 写入自有的 versioned JSONL；因为 pooled thread 在 rollback
-后最终会被 `thread/delete`，临时 rollout 不能单独承担历史事实源。
-持久事件与 rollout 都使用 `gloss:<turnId>@<total fingerprint>`，因此
-同时可见时只计一次；旧版 Gloss 尚未写 sidecar 时仍可 best-effort
-读取存活的 rollout。
-
-Sidecar v1 每行一个完成事件：
-
-```json
-{
-  "schemaVersion": 1,
-  "eventId": "<turnId>@<input>:<cached>:<cacheWrite>:<output>:<reasoning>:<total>",
-  "timestampMs": 1786968418000,
-  "source": "gloss",
-  "sessionId": "<threadId>",
-  "turnId": "<turnId>",
-  "model": "gpt-5.3-codex-spark",
-  "reasoningEffort": "low",
-  "usage": {
-    "inputTokens": 1000,
-    "cachedInputTokens": 800,
-    "cacheWriteInputTokens": 0,
-    "outputTokens": 200,
-    "reasoningOutputTokens": 100,
-    "totalTokens": 1200
-  }
-}
-```
+**数据源**：`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`
+（目录可被 `CODEX_HOME` 环境变量重定向，设置里允许自定义路径。）
 
 关键事件与字段（已在本机实测验证，codex-cli 0.142）：
 

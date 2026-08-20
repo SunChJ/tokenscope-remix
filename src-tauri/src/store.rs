@@ -8,9 +8,9 @@
 // events — cheap, and recomputed per request because preset windows are
 // relative to "now" and custom date ranges are selected at runtime.
 //
-// Three agents are ingested, normalized to the same RawEvent shape:
+// Three sources are ingested, normalized to the same RawEvent shape:
 //   claude — ~/.claude/projects/**/*.jsonl   (assistant messages)
-//   codex  — Codex rollouts plus durable usage from built-in app-server clients
+//   codex  — ~/.codex/sessions/**/*.jsonl    (token_count turn deltas)
 //   pi     — ~/.pi/agent/sessions/**/*.jsonl (assistant messages)
 use crate::codex_adapter::{self, TokenCountOutcome};
 
@@ -153,13 +153,6 @@ struct FileState {
     // Replayed parent metas follow it and must not overwrite session/cwd.
     #[serde(default)]
     meta_seen: bool,
-    // Stable client that owns this rollout root (for example "codex-cli" or
-    // "gloss"). The agent remains Codex; origin only controls source-specific
-    // metadata such as suppressing an app-server client's synthetic cwd.
-    #[serde(default)]
-    origin: String,
-    #[serde(default)]
-    project_override: String,
     // Runtime-only source key used while appending telemetry records.
     #[serde(skip)]
     source: String,
@@ -222,9 +215,9 @@ pub struct Store {
 //  v13: persist every Pi tree entry id so copied fork/clone paths cannot replay
 //       either usage or reliability side effects across source files.
 //  v14: extract each request's effective reasoning effort for model filtering.
-// Adding a rollout root does not change parsing semantics: keep v14 so existing
-// users scan only the newly discovered Gloss files instead of all history.
-const STORE_VERSION: u32 = 14;
+//  v15: remove Gloss app-server sources and rebuild caches to purge their
+//       previously ingested usage and telemetry.
+const STORE_VERSION: u32 = 15;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -287,126 +280,26 @@ fn pi_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// One filesystem root handled by an agent adapter. App-server clients still
-/// use the Codex adapter; origin metadata prevents their synthetic runtime cwd
-/// from leaking into project settlement.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UsageRoot {
-    pub agent: &'static str,
-    pub path: PathBuf,
-    format: UsageFormat,
-    origin: &'static str,
-    project_override: Option<&'static str>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UsageFormat {
-    Claude,
-    CodexRollout,
-    GlossCodexUsage,
-    Pi,
-}
-
-impl UsageRoot {
-    fn plain(agent: &'static str, path: PathBuf) -> Self {
-        Self {
-            agent,
-            path,
-            format: match agent {
-                AGENT_PI => UsageFormat::Pi,
-                _ => UsageFormat::Claude,
-            },
-            origin: agent,
-            project_override: None,
-        }
-    }
-
-    fn codex(path: PathBuf, origin: &'static str, project_override: Option<&'static str>) -> Self {
-        Self {
-            agent: AGENT_CODEX,
-            path,
-            format: UsageFormat::CodexRollout,
-            origin,
-            project_override,
-        }
-    }
-
-    fn gloss_usage(path: PathBuf) -> Self {
-        Self {
-            agent: AGENT_CODEX,
-            path,
-            format: UsageFormat::GlossCodexUsage,
-            origin: "gloss",
-            project_override: Some("Gloss"),
-        }
-    }
-}
-
 /// ~/.codex/sessions, honoring the CODEX_HOME override the Codex CLI supports.
-fn default_codex_sessions_dir() -> Option<PathBuf> {
+fn codex_dir() -> Option<PathBuf> {
     let home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| Some(dirs::home_dir()?.join(".codex")))?;
     Some(home.join("sessions"))
 }
 
-#[cfg(target_os = "macos")]
-fn gloss_codex_sessions_dir(data_dir: &Path) -> Option<PathBuf> {
-    let sessions = data_dir.join("Gloss").join("Codex").join("sessions");
-    sessions.is_dir().then_some(sessions)
-}
-
-#[cfg(target_os = "macos")]
-fn gloss_usage_dir(data_dir: &Path) -> Option<PathBuf> {
-    let gloss = data_dir.join("Gloss");
-    gloss.is_dir().then(|| gloss.join("Usage"))
-}
-
-/// Insert a root once by canonical filesystem identity. A more specific
-/// built-in detector may enrich an already-added default root (for example if
-/// CODEX_HOME itself points at Gloss's Codex home).
-fn push_source_root(roots: &mut Vec<UsageRoot>, mut root: UsageRoot) {
-    let identity = fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone());
-    if let Some(existing) = roots.iter_mut().find(|existing| {
-        existing.agent == root.agent
-            && existing.format == root.format
-            && fs::canonicalize(&existing.path).unwrap_or_else(|_| existing.path.clone())
-                == identity
-    }) {
-        if existing.project_override.is_none() && root.project_override.is_some() {
-            existing.origin = root.origin;
-            existing.project_override = root.project_override;
-        }
-        return;
-    }
-    root.path = identity;
-    roots.push(root);
-}
-
-/// The log roots to ingest/watch. Missing default agent directories are kept so
-/// the watcher can create them; optional app integrations are added only after
-/// their own session directory exists.
-pub fn source_roots() -> Vec<UsageRoot> {
+/// The log roots to ingest/watch: (agent id, directory). Missing directories
+/// are simply skipped by the walker.
+pub fn source_roots() -> Vec<(&'static str, PathBuf)> {
     let mut v = Vec::new();
     if let Some(d) = claude_dir() {
-        push_source_root(&mut v, UsageRoot::plain(AGENT_CLAUDE, d));
+        v.push((AGENT_CLAUDE, d));
     }
-    if let Some(d) = default_codex_sessions_dir() {
-        push_source_root(&mut v, UsageRoot::codex(d, "codex-cli", None));
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(data_dir) = dirs::data_dir() {
-        // Durable app-owned usage wins dedup over the temporary app-server
-        // rollout fallback, whose thread files Gloss eventually deletes.
-        if let Some(d) = gloss_usage_dir(&data_dir) {
-            push_source_root(&mut v, UsageRoot::gloss_usage(d));
-        }
-        if let Some(d) = gloss_codex_sessions_dir(&data_dir) {
-            push_source_root(&mut v, UsageRoot::codex(d, "gloss", Some("Gloss")));
-        }
+    if let Some(d) = codex_dir() {
+        v.push((AGENT_CODEX, d));
     }
     for d in pi_dirs() {
-        push_source_root(&mut v, UsageRoot::plain(AGENT_PI, d));
+        v.push((AGENT_PI, d));
     }
     v
 }
@@ -418,12 +311,6 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn project_group(source: &str, agent: &str, state: Option<&FileState>) -> String {
-    if let Some(origin) = state
-        .filter(|state| !state.project_override.is_empty())
-        .map(|state| state.origin.as_str())
-    {
-        return format!("origin:{origin}");
-    }
     if agent == AGENT_CLAUDE {
         return Path::new(source)
             .parent()
@@ -493,15 +380,6 @@ fn project_ref(cwd: Option<&str>, fallback: &str) -> ProjectRef {
         id: stable_project_id(&key),
         name,
     }
-}
-
-fn project_override(state: Option<&FileState>) -> Option<ProjectRef> {
-    let state = state.filter(|state| !state.project_override.is_empty())?;
-    let key = format!("origin:{}", state.origin);
-    Some(ProjectRef {
-        id: stable_project_id(&key),
-        name: state.project_override.clone(),
-    })
 }
 
 impl Store {
@@ -730,9 +608,7 @@ impl Store {
             }
             let state = self.manifest.files.get(&source);
             let group = project_group(&source, &agent, state);
-            let project = if let Some(project) = project_override(state) {
-                project
-            } else if let Some(project) = resolved_groups.get(&group) {
+            let project = if let Some(project) = resolved_groups.get(&group) {
                 project.clone()
             } else {
                 let cwd = state
@@ -796,8 +672,8 @@ impl Store {
     /// nothing moved.
     pub fn ingest(&mut self) -> bool {
         let mut dirty = false;
-        for root in source_roots() {
-            if self.ingest_root(&root) {
+        for (agent, root) in source_roots() {
+            if self.ingest_root(agent, &root) {
                 dirty = true;
             }
         }
@@ -807,20 +683,20 @@ impl Store {
         dirty
     }
 
-    fn ingest_root(&mut self, root: &UsageRoot) -> bool {
+    fn ingest_root(&mut self, agent: &'static str, root: &PathBuf) -> bool {
         let mut dirty = false;
         // Sort by path so a parent thread is ingested before the forks that
         // replay it: Codex lays sessions out as YYYY/MM/DD/rollout-<ISO>-<id>,
         // so path order is chronological. Codex dedup is first-writer-wins, and
         // the first writer should be the original — the replay carries the fork
         // instant instead of the turn's real timestamp.
-        let mut entries: Vec<PathBuf> = WalkDir::new(&root.path)
+        let mut entries: Vec<PathBuf> = WalkDir::new(root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
             .map(|e| e.into_path())
             .collect();
-        if root.agent == AGENT_PI {
+        if agent == AGENT_PI {
             // Pi copies stable entry ids into a fork/clone. Ordering by the
             // timestamp-prefixed filename makes the original session win global
             // id dedup even when its encoded project directory sorts later.
@@ -844,22 +720,9 @@ impl Store {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
 
-            let origin = root.origin.to_string();
-            let project_override = root.project_override.unwrap_or_default().to_string();
             let mut state = match self.manifest.files.get(&key).cloned() {
-                Some(mut prev) => {
-                    let root_metadata_changed = prev.origin != origin
-                        || prev.project_override != project_override;
-                    if root_metadata_changed {
-                        prev.origin = origin.clone();
-                        prev.project_override = project_override.clone();
-                        self.projects_by_source.remove(&key);
-                        dirty = true;
-                    }
+                Some(prev) => {
                     if prev.size == size && prev.mtime_ms == mtime_ms {
-                        if root_metadata_changed {
-                            self.manifest.files.insert(key, prev);
-                        }
                         continue; // unchanged → skip
                     }
                     if size < prev.offset {
@@ -875,8 +738,6 @@ impl Store {
                 None => FileState::default(),
             };
             state.source = key.clone();
-            state.origin = origin;
-            state.project_override = project_override;
 
             let Ok(mut f) = fs::File::open(path) else { continue };
             if f.seek(SeekFrom::Start(state.offset)).is_err() {
@@ -895,7 +756,7 @@ impl Store {
             // Codex session ids also live in the filename (rollout-<ts>-<uuid>);
             // seed from it so events parsed before/without session_meta still
             // group into a session. Pi gets its authoritative id from the header.
-            if root.agent == AGENT_CODEX && state.session.is_empty() {
+            if agent == AGENT_CODEX && state.session.is_empty() {
                 state.session = codex_session_from_filename(path);
             }
             for line in buf[..process_until].split(|&b| b == b'\n') {
@@ -903,20 +764,14 @@ impl Store {
                     continue;
                 }
                 let Ok(s) = std::str::from_utf8(line) else { continue };
-                let parsed = match root.format {
-                    UsageFormat::Claude => self.parse_claude_line(s, &mut state),
-                    UsageFormat::CodexRollout => self.parse_codex_line(s, &mut state),
-                    UsageFormat::GlossCodexUsage => parse_gloss_codex_usage_line(s),
-                    UsageFormat::Pi => self.parse_pi_line(s, &mut state),
+                let parsed = match agent {
+                    AGENT_CODEX => self.parse_codex_line(s, &mut state),
+                    AGENT_PI => self.parse_pi_line(s, &mut state),
+                    _ => self.parse_claude_line(s, &mut state),
                 };
                 if let Some(mut ev) = parsed {
                     ev.source = key.clone();
-                    ev.agent = root.agent.to_string();
-                    if root.format == UsageFormat::CodexRollout && root.origin == "gloss" {
-                        if let Some(event_id) = ev.id.strip_prefix("codex:") {
-                            ev.id = format!("gloss:{event_id}");
-                        }
-                    }
+                    ev.agent = agent.to_string();
                     if !ev.id.is_empty() {
                         if let Some(&i) = self.index.get(&ev.id) {
                             // Same message, another line: merge its tool calls
@@ -2047,67 +1902,9 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
     })
 }
 
-/// Gloss owns this versioned sidecar schema. It persists exact app-server
-/// completion usage before pooled threads are rolled back or deleted.
-fn parse_gloss_codex_usage_line(line: &str) -> Option<RawEvent> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    if value.get("schemaVersion").and_then(|item| item.as_u64()) != Some(1)
-        || value.get("source").and_then(|item| item.as_str()) != Some("gloss")
-    {
-        return None;
-    }
-    let usage = value.get("usage")?;
-    let number = |key: &str| {
-        usage
-            .get(key)
-            .and_then(|item| item.as_i64())
-            .unwrap_or_default()
-            .max(0)
-    };
-    let raw_input = number("inputTokens");
-    let cache_read = number("cachedInputTokens").clamp(0, raw_input);
-    let cache_write = number("cacheWriteInputTokens").clamp(0, raw_input - cache_read);
-    let output = number("outputTokens");
-    if raw_input + output <= 0 {
-        return None;
-    }
-    let turn_id = value.get("turnId")?.as_str()?;
-    let event_id = value
-        .get("eventId")
-        .and_then(|item| item.as_str())
-        .filter(|id| !id.is_empty())
-        .unwrap_or(turn_id);
-
-    Some(RawEvent {
-        ts_ms: value.get("timestampMs")?.as_i64()?,
-        session: value
-            .get("sessionId")
-            .and_then(|item| item.as_str())
-            .unwrap_or("")
-            .to_string(),
-        model: value.get("model")?.as_str()?.to_string(),
-        in_tok: (raw_input - cache_read - cache_write) as f64,
-        cc: cache_write as f64,
-        cr: cache_read as f64,
-        out_tok: output as f64,
-        reasoning_effort: value
-            .get("reasoningEffort")
-            .and_then(|item| item.as_str())
-            .map(normalize_reasoning_effort)
-            .unwrap_or_default(),
-        mcp: Vec::new(),
-        skills: Vec::new(),
-        id: format!("gloss:{event_id}"),
-        reported_cost: None,
-        source: String::new(),
-        agent: String::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn empty_store() -> Store {
         Store {
@@ -2119,149 +1916,6 @@ mod tests {
             turns: Vec::new(),
             telemetry_index: HashMap::new(),
         }
-    }
-
-    fn test_dir(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "tokenscope-{name}-{}-{nonce}",
-            std::process::id()
-        ))
-    }
-
-    #[test]
-    fn source_root_dedup_prefers_built_in_client_metadata() {
-        let directory = test_dir("source-root-dedup");
-        fs::create_dir_all(&directory).expect("create test root");
-        let mut roots = Vec::new();
-        push_source_root(
-            &mut roots,
-            UsageRoot::codex(directory.clone(), "codex-cli", None),
-        );
-        push_source_root(
-            &mut roots,
-            UsageRoot::codex(directory.join("."), "gloss", Some("Gloss")),
-        );
-        push_source_root(
-            &mut roots,
-            UsageRoot::plain(AGENT_CLAUDE, directory.clone()),
-        );
-
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].origin, "gloss");
-        assert_eq!(roots[0].project_override, Some("Gloss"));
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn discovers_gloss_only_after_its_codex_sessions_exist() {
-        let data_dir = test_dir("gloss-discovery");
-        assert!(gloss_codex_sessions_dir(&data_dir).is_none());
-        assert!(gloss_usage_dir(&data_dir).is_none());
-
-        let sessions = data_dir.join("Gloss").join("Codex").join("sessions");
-        fs::create_dir_all(&sessions).expect("create Gloss sessions");
-
-        assert_eq!(gloss_codex_sessions_dir(&data_dir), Some(sessions));
-        assert_eq!(gloss_usage_dir(&data_dir), Some(data_dir.join("Gloss/Usage")));
-        let _ = fs::remove_dir_all(data_dir);
-    }
-
-    #[test]
-    fn ingests_gloss_spark_rollouts_and_overrides_the_synthetic_project() {
-        let directory = test_dir("gloss-spark");
-        let sessions = directory.join("sessions");
-        let day = sessions.join("2026").join("08").join("17");
-        fs::create_dir_all(&day).expect("create rollout directory");
-        let rollout = day.join(
-            "rollout-2026-08-17T15-06-48-01a00e8b-597c-70c1-95e3-4a92a9c33629.jsonl",
-        );
-        let lines = [
-            r#"{"timestamp":"2026-08-17T07:06:54.371Z","type":"session_meta","payload":{"id":"01a00e8b-597c-70c1-95e3-4a92a9c33629","source":"vscode","cwd":"/private/tmp/gloss-codex","model_provider":"openai"}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:54.371Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:57.596Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.3-codex-spark","reasoning_effort":"low","cwd":"/private/tmp/gloss-codex"}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:58.949Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":790,"cached_input_tokens":100,"cache_write_input_tokens":50,"output_tokens":157,"reasoning_output_tokens":116,"total_tokens":947},"last_token_usage":{"input_tokens":790,"cached_input_tokens":100,"cache_write_input_tokens":50,"output_tokens":157,"reasoning_output_tokens":116,"total_tokens":947},"model_context_window":121600}}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:58.951Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:58.972Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":790,"cached_input_tokens":100,"cache_write_input_tokens":50,"output_tokens":157,"reasoning_output_tokens":116,"total_tokens":947},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":292},"model_context_window":121600}}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:59.236Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
-            r#"{"timestamp":"2026-08-17T07:06:59.240Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.3-codex-spark","reasoning_effort":"low","cwd":"/private/tmp/gloss-codex"}}"#,
-            r#"{"timestamp":"2026-08-17T07:07:01.502Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1841,"cached_input_tokens":300,"cache_write_input_tokens":50,"output_tokens":431,"reasoning_output_tokens":163,"total_tokens":2272},"last_token_usage":{"input_tokens":1051,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":274,"reasoning_output_tokens":47,"total_tokens":1325},"model_context_window":121600}}}"#,
-        ];
-        fs::write(&rollout, lines.join("\n") + "\n").expect("write rollout");
-
-        let usage_directory = directory.join("usage");
-        fs::create_dir_all(&usage_directory).expect("create durable usage directory");
-        let durable = serde_json::json!({
-            "schemaVersion": 1,
-            "eventId": "turn-1@790:100:50:157:116:947",
-            "timestampMs": 1_787_782_018_949_i64,
-            "source": "gloss",
-            "sessionId": "01a00e8b-597c-70c1-95e3-4a92a9c33629",
-            "turnId": "turn-1",
-            "model": "gpt-5.3-codex-spark",
-            "reasoningEffort": "low",
-            "usage": {
-                "inputTokens": 790,
-                "cachedInputTokens": 100,
-                "cacheWriteInputTokens": 50,
-                "outputTokens": 157,
-                "reasoningOutputTokens": 116,
-                "totalTokens": 947
-            }
-        });
-        fs::write(
-            usage_directory.join("codex-usage-2026-08-17-v1.jsonl"),
-            durable.to_string() + "\n",
-        )
-        .expect("write durable usage");
-
-        let mut store = empty_store();
-        let durable_root = UsageRoot::gloss_usage(usage_directory);
-        let gloss_root = UsageRoot::codex(sessions, "gloss", Some("Gloss"));
-        assert!(store.ingest_root(&durable_root));
-        assert!(store.ingest_root(&gloss_root));
-        assert!(store.refresh_projects());
-
-        // turn-1 exists in both sources but shares one stable event id. The
-        // temporary rollout contributes only turn-2.
-        assert_eq!(store.events.len(), 2);
-        assert!(store
-            .events
-            .iter()
-            .all(|event| event.model == "gpt-5.3-codex-spark"));
-        assert_eq!(
-            store.events.iter().map(|event| event.in_tok).sum::<f64>(),
-            1_491.0
-        );
-        assert_eq!(
-            store.events.iter().map(|event| event.cr).sum::<f64>(),
-            300.0
-        );
-        assert_eq!(
-            store.events.iter().map(|event| event.cc).sum::<f64>(),
-            50.0
-        );
-        assert_eq!(
-            store.events.iter().map(|event| event.out_tok).sum::<f64>(),
-            431.0
-        );
-        for event in &store.events {
-            assert_eq!(event.agent, AGENT_CODEX);
-            assert!(event.id.starts_with("gloss:"));
-            assert_eq!(
-                store.project_for(event).map(|project| project.name.as_str()),
-                Some("Gloss")
-            );
-        }
-
-        assert!(!store.ingest_root(&durable_root));
-        assert!(!store.ingest_root(&gloss_root));
-        assert_eq!(store.events.len(), 2);
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
