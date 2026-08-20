@@ -280,7 +280,7 @@ fn window_left(window: &model::LimitWindow, now_s: i64) -> Option<u8> {
 }
 
 /// Provider prefix + window token used in menu-bar summaries.
-/// Claude → Cl, Codex → Cx; windows: 5h / W / S.
+/// Claude → Cl, Codex → Cx; windows: 5h / W / S5h / SW.
 fn provider_prefix(provider: &str) -> &'static str {
     match provider {
         "claude" => "Cl",
@@ -292,8 +292,20 @@ fn provider_prefix(provider: &str) -> &'static str {
 fn window_token(window: &model::LimitWindow) -> &'static str {
     match window.id.as_str() {
         "5h" => "5h",
+        "spark_5h" => "S5h",
+        "spark_weekly" => "SW",
         "spark" => "S",
         _ => "W",
+    }
+}
+
+fn window_sort_order(window: &model::LimitWindow) -> u8 {
+    match window.id.as_str() {
+        "5h" => 0,
+        "weekly" => 1,
+        "spark_5h" => 2,
+        "spark_weekly" | "spark" => 3,
+        _ => 4,
     }
 }
 
@@ -324,11 +336,7 @@ fn provider_summary(limit: &model::ProviderLimit, detailed: bool, now_s: i64) ->
         return format!("{prefix}{left}%");
     }
     let mut sorted = active;
-    sorted.sort_by_key(|window| match window.id.as_str() {
-        "5h" => 0,
-        "weekly" => 1,
-        _ => 2,
-    });
+    sorted.sort_by_key(|window| window_sort_order(window));
     let parts: Vec<String> = sorted
         .iter()
         .filter_map(|window| {
@@ -367,7 +375,7 @@ fn tray_label(dash: &Dashboard, display: MenuBarQuotaDisplay, language: AppLangu
 }
 
 /// Menu-bar text for each provider row under Provider Limits, e.g.
-/// "Claude — 5h 64% · W 82%" (Claude) or "Codex — W 29% · S 31%" (Codex).
+/// "Claude — 5h 64% · W 82%" or "Codex — W 29% · S5h 90% · SW 31%".
 fn provider_menu_row(
     limit: Option<&model::ProviderLimit>,
     provider_label: &str,
@@ -384,21 +392,12 @@ fn provider_menu_row(
         .iter()
         .filter(|window| window_left(window, now_s).is_some())
         .collect();
-    sorted.sort_by_key(|window| match window.id.as_str() {
-        "5h" => 0,
-        "weekly" => 1,
-        _ => 2,
-    });
+    sorted.sort_by_key(|window| window_sort_order(window));
     let parts: Vec<String> = sorted
         .iter()
         .filter_map(|window| {
             window_left(window, now_s).map(|left| {
-                let label = match window.id.as_str() {
-                    "5h" => "5h".to_string(),
-                    "weekly" => "W".to_string(),
-                    _ => "S".to_string(),
-                };
-                format!("{label} {left}%")
+                format!("{} {left}%", window_token(window))
             })
         })
         .collect();
@@ -1816,8 +1815,17 @@ mod tests {
                     trend: Vec::new(),
                 },
                 model::LimitWindow {
-                    id: "spark".to_string(),
-                    label: "Spark".to_string(),
+                    id: "spark_5h".to_string(),
+                    label: "Spark 5-hour".to_string(),
+                    duration_minutes: 300,
+                    used_pct: 10.0,
+                    resets_at: 0,
+                    as_of_ms: 0,
+                    trend: Vec::new(),
+                },
+                model::LimitWindow {
+                    id: "spark_weekly".to_string(),
+                    label: "Spark Weekly".to_string(),
                     duration_minutes: 7 * 24 * 60,
                     used_pct: 69.0,
                     resets_at: 0,
@@ -1827,10 +1835,10 @@ mod tests {
             ],
         };
         assert_eq!(provider_summary(&limit, false, 1), "Cx29%");
-        assert_eq!(provider_summary(&limit, true, 1), "Cx W29%/S31%");
+        assert_eq!(provider_summary(&limit, true, 1), "Cx W29%/S5h90%/SW31%");
         assert_eq!(
             provider_menu_row(Some(&limit), "Codex", "Unavailable", 1),
-            "Codex — W 29% · S 31%"
+            "Codex — W 29% · S5h 90% · SW 31%"
         );
     }
 

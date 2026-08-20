@@ -46,13 +46,13 @@ control.
 | Provider | Source | Windows |
 |---|---|---|
 | Claude | `hu` envelope `quotas[]` | `session` → 5-hour, `weekly` → 7d |
-| Codex | `hu` envelope `quotas[]` | primary → Weekly, `Spark` → Spark |
+| Codex | `hu` envelope `quotas[]` | primary → Weekly, `Spark` → Spark 5-hour, `Spark_weekly` → Spark Weekly |
 
-- Matching is case-insensitive and tolerates renamed quota names across
-  happyusage versions (`Spark` / `Spark_weekly`, `session` / `weekly`).
-- Codex's `period` label is **not** trusted (`limit_window_seconds` can be
-  absent, which makes `hu` fall back to a misleading `5h`); the 5h Codex
-  window is retired anyway, so both Codex windows are classified as weekly.
+- Matching is case-insensitive. Codex's primary pool remains normalized from
+  either `session` or `weekly`; Spark's independent `Spark` (5-hour) and
+  `Spark_weekly` (7-day) pools retain distinct IDs, labels, and trend histories.
+- Spark's `_weekly` suffix is authoritative; `period: 7d` is also accepted for
+  compatibility with envelopes that omit the suffix.
 - `used_pct` is retained in storage; presentation converts to rounded
   percentage left (`29% left (resets 05:01 on 9 Aug)`).
 
@@ -62,7 +62,7 @@ control.
   (`Claude — 5h 0% · W 79%`), refreshed with every dashboard build.
 - **Menu Bar Display**: Off / Compact / Detailed.
   - Compact: `52.8M · Cl79% · Cx29%` — tightest window per provider.
-  - Detailed: `52.8M · Cl 5h0/W79 · Cx W29/S31`.
+  - Detailed: `52.8M · Cl 5h0/W79 · Cx W29/S5h100/SW31`.
 - Dashboard: a global two-column card (Claude | Codex), each window showing
   remaining capacity, the reset date, and an optional burn-rate projection.
   A provider with no `hu` snapshot shows **Unavailable**; if both are
