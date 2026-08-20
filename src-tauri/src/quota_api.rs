@@ -152,10 +152,10 @@ fn claude_from_hu(envelope: &Value) -> Option<ProviderLimit> {
     })
 }
 
-/// Codex windows from the `hu` envelope. The primary pool and Spark are both
-/// rolling weekly windows today (the 5h window is retired); HappyUsage's quota
-/// names have changed across versions (`session`/`weekly`, `Spark`/`Spark_weekly`),
-/// so matching is case-insensitive and name-agnostic.
+/// Codex windows from the `hu` envelope. The primary pool is weekly today;
+/// Spark has independent 5-hour and weekly limits. HappyUsage identifies those
+/// as `Spark` and `Spark_weekly`, respectively. Keep their IDs distinct so the
+/// UI, React keys, and in-memory trend histories cannot conflate them.
 fn codex_from_hu(envelope: &Value) -> Option<ProviderLimit> {
     let checked_at = rfc3339_ms(envelope.get("checked_at"));
     let plan = envelope
@@ -167,10 +167,15 @@ fn codex_from_hu(envelope: &Value) -> Option<ProviderLimit> {
     for quota in envelope.get("quotas")?.as_array()? {
         let name = quota.get("name").and_then(Value::as_str)?;
         let lower = name.to_ascii_lowercase();
-        let (id, label) = if lower.contains("spark") {
-            ("spark", "Spark")
+        let period = quota.get("period").and_then(Value::as_str).unwrap_or("");
+        let (id, label, duration) = if lower.contains("spark") {
+            if lower.ends_with("_weekly") || period.eq_ignore_ascii_case("7d") {
+                ("spark_weekly", "Spark Weekly", WEEKLY_WINDOW_MINUTES)
+            } else {
+                ("spark_5h", "Spark 5-hour", 300)
+            }
         } else if lower == "session" || lower == "weekly" {
-            ("weekly", "Weekly")
+            ("weekly", "Weekly", WEEKLY_WINDOW_MINUTES)
         } else {
             continue;
         };
@@ -179,7 +184,7 @@ fn codex_from_hu(envelope: &Value) -> Option<ProviderLimit> {
         windows.push(LimitWindow {
             id: id.to_string(),
             label: label.to_string(),
-            duration_minutes: WEEKLY_WINDOW_MINUTES,
+            duration_minutes: duration,
             used_pct,
             resets_at,
             as_of_ms: checked_at,
@@ -197,8 +202,8 @@ fn codex_from_hu(envelope: &Value) -> Option<ProviderLimit> {
     })
 }
 
-/// Merge the Codex weekly trend points from the process cache into the window
-/// trend. Claude has no history source, so its windows stay trend-free.
+/// Merge Codex trend points from the process cache into each quota window.
+/// Claude has no history source, so its windows stay trend-free.
 fn merge_trend(
     previous: &ProviderCache,
     next: &mut ProviderCache,
@@ -328,7 +333,7 @@ mod tests {
         assert_eq!(codex.provider, "codex");
         assert_eq!(codex.windows.len(), 2);
         assert_eq!(codex.windows[0].id, "weekly");
-        assert_eq!(codex.windows[1].id, "spark");
+        assert_eq!(codex.windows[1].id, "spark_weekly");
     }
 
     #[test]
@@ -383,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_codex_envelope_as_weekly_windows() {
+    fn parses_codex_spark_five_hour_window() {
         let envelope = serde_json::json!({
             "provider": "codex",
             "ok": true,
@@ -400,14 +405,38 @@ mod tests {
         assert_eq!(limit.windows[0].id, "weekly");
         assert_eq!(limit.windows[0].duration_minutes, WEEKLY_WINDOW_MINUTES);
         assert_eq!(limit.windows[0].used_pct, 71.0);
-        assert_eq!(limit.windows[1].id, "spark");
+        assert_eq!(limit.windows[1].id, "spark_5h");
+        assert_eq!(limit.windows[1].duration_minutes, 300);
         assert_eq!(limit.windows[1].used_pct, 69.0);
     }
 
     #[test]
+    fn distinguishes_codex_spark_windows_by_period() {
+        let envelope = serde_json::json!({
+            "provider": "codex",
+            "ok": true,
+            "checked_at": "2026-08-20T01:57:21Z",
+            "plan": "Pro 5x",
+            "quotas": [
+                {"name": "weekly", "period": "7d", "used_pct": 96, "left_pct": 4, "resets_at": "2026-08-20T03:44:48Z"},
+                {"name": "Spark", "period": "5h", "used_pct": 0, "left_pct": 100, "resets_at": "2026-08-20T06:57:22Z"},
+                {"name": "Spark_weekly", "period": "7d", "used_pct": 100, "left_pct": 0, "resets_at": "2026-08-20T06:23:42Z"}
+            ]
+        });
+        let limit = codex_from_hu(&envelope).unwrap();
+        assert_eq!(limit.windows.len(), 3);
+        assert_eq!(limit.windows[0].id, "weekly");
+        assert_eq!(limit.windows[1].id, "spark_5h");
+        assert_eq!(limit.windows[1].label, "Spark 5-hour");
+        assert_eq!(limit.windows[1].duration_minutes, 300);
+        assert_eq!(limit.windows[2].id, "spark_weekly");
+        assert_eq!(limit.windows[2].label, "Spark Weekly");
+        assert_eq!(limit.windows[2].duration_minutes, WEEKLY_WINDOW_MINUTES);
+    }
+
+    #[test]
     fn parses_codex_0211_names_and_ignores_missing_provider() {
-        // happyusage 0.2.11 renames primary to `weekly` and Spark to
-        // `Spark_weekly`; both must still map to the same windows.
+        // HappyUsage 0.2.11 uses period-specific names for weekly pools.
         let envelope = serde_json::json!({
             "provider": "codex",
             "ok": true,
@@ -421,7 +450,8 @@ mod tests {
         let limit = codex_from_hu(&envelope).unwrap();
         assert_eq!(limit.windows.len(), 2);
         assert_eq!(limit.windows[0].id, "weekly");
-        assert_eq!(limit.windows[1].id, "spark");
+        assert_eq!(limit.windows[1].id, "spark_weekly");
+        assert_eq!(limit.windows[1].duration_minutes, WEEKLY_WINDOW_MINUTES);
         assert_eq!(limit.windows[1].used_pct, 69.0);
 
         // A provider that only has unknown quota names yields no windows.

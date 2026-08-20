@@ -171,9 +171,9 @@ pub struct HeatDay {
     pub level: u8,    // 0..4
 }
 
-/// Provider limit windows are rolling weekly (Claude also has a 5-hour
-/// window). Same-cycle reset timestamps may drift a few seconds between `hu`
-/// calls, so trend continuity allows a small tolerance.
+/// Provider limits can be 5-hour or rolling weekly windows. Same-cycle reset
+/// timestamps may drift a few seconds between `hu` calls, so trend continuity
+/// allows a small tolerance.
 pub const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 pub const RESET_CYCLE_TOLERANCE_SECONDS: i64 = 5 * 60;
 
@@ -184,10 +184,10 @@ pub fn same_reset_cycle(left: i64, right: i64) -> bool {
             && left.abs_diff(right) <= RESET_CYCLE_TOLERANCE_SECONDS as u64)
 }
 
-/// One window of a provider quota (Claude 5-hour / weekly, Codex weekly / Spark).
+/// One provider quota window (Claude 5-hour/weekly; Codex weekly/Spark 5-hour/weekly).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct LimitWindow {
-    pub id: String, // "5h" | "weekly" | "spark"
+    pub id: String, // "5h" | "weekly" | "spark_5h" | "spark_weekly"
     pub label: String,
     pub duration_minutes: u64,
     #[serde(rename = "usedPct")]
