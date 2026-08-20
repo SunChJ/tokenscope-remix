@@ -280,7 +280,7 @@ fn window_left(window: &model::LimitWindow, now_s: i64) -> Option<u8> {
 }
 
 /// Provider prefix + window token used in menu-bar summaries.
-/// Claude → Cl, Codex → Cx; windows: 5h / W / S5h / SW.
+/// Claude → Cl, Codex → Cx; windows: 5h / W.
 fn provider_prefix(provider: &str) -> &'static str {
     match provider {
         "claude" => "Cl",
@@ -290,22 +290,18 @@ fn provider_prefix(provider: &str) -> &'static str {
 }
 
 fn window_token(window: &model::LimitWindow) -> &'static str {
-    match window.id.as_str() {
-        "5h" => "5h",
-        "spark_5h" => "S5h",
-        "spark_weekly" => "SW",
-        "spark" => "S",
-        _ => "W",
+    if window.id == "5h" {
+        "5h"
+    } else {
+        "W"
     }
 }
 
 fn window_sort_order(window: &model::LimitWindow) -> u8 {
-    match window.id.as_str() {
-        "5h" => 0,
-        "weekly" => 1,
-        "spark_5h" => 2,
-        "spark_weekly" | "spark" => 3,
-        _ => 4,
+    if window.id == "5h" {
+        0
+    } else {
+        1
     }
 }
 
@@ -375,7 +371,7 @@ fn tray_label(dash: &Dashboard, display: MenuBarQuotaDisplay, language: AppLangu
 }
 
 /// Menu-bar text for each provider row under Provider Limits, e.g.
-/// "Claude — 5h 64% · W 82%" or "Codex — W 29% · S5h 90% · SW 31%".
+/// "Claude — 5h 64% · W 82%" or "Codex — W 29%".
 fn provider_menu_row(
     limit: Option<&model::ProviderLimit>,
     provider_label: &str,
@@ -1765,15 +1761,12 @@ pub fn run() {
                         Err(_) => return,
                     };
                     let mut watching = false;
-                    for root in &roots {
+                    for (_agent, dir) in &roots {
                         // The CLI may not have created its dir yet on a fresh
                         // machine; create it so watch() registers instead of
                         // silently falling back to the 30s poll all session.
-                        let _ = std::fs::create_dir_all(&root.path);
-                        if watcher
-                            .watch(&root.path, RecursiveMode::Recursive)
-                            .is_ok()
-                        {
+                        let _ = std::fs::create_dir_all(dir);
+                        if watcher.watch(dir, RecursiveMode::Recursive).is_ok() {
                             watching = true;
                         }
                     }
@@ -1804,41 +1797,21 @@ mod tests {
             provider: "codex".to_string(),
             label: "Codex".to_string(),
             plan: "Pro 5x".to_string(),
-            windows: vec![
-                model::LimitWindow {
-                    id: "weekly".to_string(),
-                    label: "Weekly".to_string(),
-                    duration_minutes: 7 * 24 * 60,
-                    used_pct: 71.0,
-                    resets_at: 0,
-                    as_of_ms: 0,
-                    trend: Vec::new(),
-                },
-                model::LimitWindow {
-                    id: "spark_5h".to_string(),
-                    label: "Spark 5-hour".to_string(),
-                    duration_minutes: 300,
-                    used_pct: 10.0,
-                    resets_at: 0,
-                    as_of_ms: 0,
-                    trend: Vec::new(),
-                },
-                model::LimitWindow {
-                    id: "spark_weekly".to_string(),
-                    label: "Spark Weekly".to_string(),
-                    duration_minutes: 7 * 24 * 60,
-                    used_pct: 69.0,
-                    resets_at: 0,
-                    as_of_ms: 0,
-                    trend: Vec::new(),
-                },
-            ],
+            windows: vec![model::LimitWindow {
+                id: "weekly".to_string(),
+                label: "Weekly".to_string(),
+                duration_minutes: 7 * 24 * 60,
+                used_pct: 71.0,
+                resets_at: 0,
+                as_of_ms: 0,
+                trend: Vec::new(),
+            }],
         };
         assert_eq!(provider_summary(&limit, false, 1), "Cx29%");
-        assert_eq!(provider_summary(&limit, true, 1), "Cx W29%/S5h90%/SW31%");
+        assert_eq!(provider_summary(&limit, true, 1), "Cx W29%");
         assert_eq!(
             provider_menu_row(Some(&limit), "Codex", "Unavailable", 1),
-            "Codex — W 29% · S5h 90% · SW 31%"
+            "Codex — W 29%"
         );
     }
 

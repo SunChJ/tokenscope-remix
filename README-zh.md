@@ -2,7 +2,7 @@
 
 [English](README.md) · **中文**
 
-**macOS 菜单栏工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI，以及 Gloss 内置的 Codex app-server）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
+**macOS 菜单栏工具**，为本机 **AI 编码 Agent**（Pi、Claude Code、Codex CLI）提供一个统一仪表盘：**Token 用量、估算花费、按模型 / MCP / Skill 的统计，以及实时订阅额度**。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）+ **Rust**（数据层）。
 
@@ -12,7 +12,7 @@
 
 - **一个仪表盘，覆盖所有 Agent** — 过滤 chips（All / Claude / Codex / Pi）在汇总与单 Agent 视图间切换，各自带品牌色主题
 - **Token 与成本分析** — 今天 / 本周 / 本月 + 自定义日期区间；选择模型后可查看本地实际出现的推理档位构成，并提供 MCP 调用与 Skill 切片（只统计你自己安装的，内置工具全部过滤）
-- **实时订阅额度** — Claude（5 小时 + 每周）与 Codex（每周 + Spark 5 小时/每周）每 60 秒刷新，Codex status 风格展示（`29% left (resets 05:01 on 9 Aug)`），含消耗速率预测
+- **实时订阅额度** — Claude（5 小时 + 每周）与 Codex（每周）每 60 秒刷新，Codex status 风格展示（`29% left (resets 05:01 on 9 Aug)`），含消耗速率预测
 - **菜单栏一瞥即知** — 当日 Token 数 + 各 provider 最紧张窗口的紧凑额度摘要（`52.8M · Cl79% · Cx29%`）或完整列表
 - **项目结算** — 按 Git 仓库 / 工作目录归集用量，导出 CSV，不暴露原始路径或对话正文
 - **可靠性与上下文遥测** — 中止任务浪费、工具错误、上下文窗口压力、压缩次数与 reasoning 占比

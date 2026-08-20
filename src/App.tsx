@@ -712,12 +712,12 @@ function ProviderLimitsCard({ limits, theme }: { limits: ProviderLimit[]; theme:
               return (
                 <div key={w.id} style={{ padding: "4px 0" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ font: `500 9.5px ${t.mono}`, color: t.dim, flex: "0 0 72px" }}>{w.label}</span>
+                    <span style={{ font: `500 9.5px ${t.mono}`, color: t.dim, flex: "0 0 48px" }}>{w.label}</span>
                     <div style={{ flex: 1, height: 5, borderRadius: 3, background: t.gridLine, overflow: "hidden" }}>
                       <div style={{ width: `${left}%`, height: "100%", background: col, borderRadius: 3 }} />
                     </div>
                   </div>
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", marginTop: 3, marginLeft: 80 }}>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", marginTop: 3, marginLeft: 56 }}>
                     <span style={{ font: `500 9.5px ${t.mono}`, color: left <= 20 ? col : t.text, textAlign: "right" }}>{status(w)}</span>
                     {note && <span style={{ font: `500 8.5px ${t.mono}`, color: t.faint, textAlign: "right" }}>{note}</span>}
                   </div>
