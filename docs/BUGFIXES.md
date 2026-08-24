@@ -7,6 +7,20 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ## Data accuracy (call counting)
 
+### Claude streaming snapshots and fork replays distorted accounting
+
+- **Symptom**: Claude output tokens and cost were low, while some MCP/Skill and
+  turn-telemetry counts were high after a session was forked or resumed.
+- **Cause**: Claude can emit several transcript entries with one `message.id`.
+  Their usage is a cumulative streaming snapshot—`output_tokens` can grow—but
+  the store kept the first snapshot. Forked sessions also copy stable transcript
+  and `tool_use` ids into another file; token ids were deduped, but telemetry ran
+  before that check and tool names were appended unconditionally.
+- **Fix**: Merge each message's token fields by component-wise maximum, persist
+  per-message telemetry snapshots and apply only their positive deltas, reject
+  replayed top-level entry UUIDs before side effects, and merge MCP/Skill calls
+  by stable `tool_use.id`. `STORE_VERSION` 16 forces a clean rebuild.
+
 ### 1. Skills invoked via slash command were not counted
 
 - **Symptom**: Calling a skill with `/find-skills` never showed up in the panel;
@@ -27,16 +41,14 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Symptom**: A model-invoked skill (`skill-creator`) produced a real `Skill`
   `tool_use`, yet still wasn't counted.
 - **Cause**: A single assistant message (same `message.id`) is split across
-  several JSONL lines — e.g. `thinking` on one line, `tool_use` on the next,
-  **both repeating the same `usage`**. The store deduped **by `message.id` and
-  dropped whole duplicate lines**, so the line carrying the `tool_use` was
-  discarded after the `thinking` line was ingested first. This also silently
-  dropped MCP calls in the same shape.
-- **Fix**: Replaced the drop-on-duplicate logic in `store.rs` with a
-  merge: keep an `id → index` map, and when a line repeats a known id, **merge
-  its `mcp`/`skills` into the existing event without re-counting tokens** (usage
-  is identical across the split lines, so it's still counted once). Bumped
-  `STORE_VERSION` for a full rescan.
+  several JSONL lines — e.g. `thinking` on one line, `tool_use` on the next.
+  The store deduped **by `message.id` and dropped whole duplicate lines**, so
+  the line carrying the `tool_use` was discarded after the `thinking` line was
+  ingested first. This also silently dropped MCP calls in the same shape.
+- **Fix**: Replaced the drop-on-duplicate logic in `store.rs` with a merge: keep
+  an `id → index` map, merge each unique tool call into the existing event, and
+  retain the greatest cumulative usage snapshot. Bumped `STORE_VERSION` for a
+  full rescan.
 
 ### 3. Delta percentage was ~100× too small (and hidden)
 

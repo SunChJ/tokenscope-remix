@@ -32,6 +32,26 @@ pub struct ProjectRef {
     pub name: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Default)]
+#[serde(default)]
+struct UsageSnapshot {
+    input_tokens: f64,
+    cache_creation_tokens: f64,
+    cache_read_tokens: f64,
+    output_tokens: f64,
+}
+
+impl UsageSnapshot {
+    fn merge(self, next: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.max(next.input_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.max(next.cache_creation_tokens),
+            cache_read_tokens: self.cache_read_tokens.max(next.cache_read_tokens),
+            output_tokens: self.output_tokens.max(next.output_tokens),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct TurnTelemetry {
@@ -58,9 +78,10 @@ pub struct TurnTelemetry {
     // Pi persists the model catalog's request cost alongside usage. Prefer it
     // over a later public-price estimate when available (including $0 local models).
     pub reported_cost: Option<f64>,
-    // Claude can repeat one assistant message across several JSONL lines.
-    // Persist ids so incremental restarts never count its usage twice.
-    usage_ids: Vec<String>,
+    // Claude streams one API response across several transcript entries. The
+    // usage fields are cumulative snapshots and output_tokens can grow between
+    // entries, so retain the greatest snapshot per message id and apply deltas.
+    usage_snapshots: HashMap<String, UsageSnapshot>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -84,7 +105,14 @@ pub struct RawEvent {
     pub reasoning_effort: String,
     pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
     pub skills: Vec<String>, // all detected Skill ids called (unfiltered)
-    pub id: String,          // message id (dedup); "" = no cross-line dedup needed
+    // Claude can repeat content blocks while streaming or replaying a session.
+    // Keep stable tool_use ids parallel to the names so merges stay idempotent
+    // without collapsing two legitimate calls to the same server or Skill.
+    #[serde(default)]
+    mcp_call_ids: Vec<String>,
+    #[serde(default)]
+    skill_call_ids: Vec<String>,
+    pub id: String, // message id (dedup); "" = no cross-line dedup needed
     // Pi records the effective request cost in the session. Other adapters leave
     // this unset and pricing is derived from the current public model table.
     #[serde(default)]
@@ -161,6 +189,11 @@ struct FileState {
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
     files: HashMap<String, FileState>,
+    // Claude forks/resumes by copying transcript entries into another file.
+    // Top-level entry UUIDs stay stable, so first-writer-wins dedup must happen
+    // before usage, telemetry, and tool-call side effects.
+    #[serde(default)]
+    claude_entries: HashMap<String, String>,
     // Stable token-count payload fingerprint -> original source file. This
     // prevents a fork's restamped replay from mutating either usage or quota.
     #[serde(default)]
@@ -180,8 +213,8 @@ pub struct Store {
     pub events: Vec<RawEvent>,
     // message id -> index in `events`. A single assistant message can be split
     // across several JSONL lines (e.g. thinking on one line, tool_use on the
-    // next) that all share its id; we merge their tool calls into one event and
-    // count its token usage only once.
+    // next) that all share its id; merge the greatest usage snapshot and each
+    // unique tool call into one event.
     index: HashMap<String, usize>,
     manifest: Manifest,
     projects_by_source: HashMap<String, ProjectRef>,
@@ -217,7 +250,9 @@ pub struct Store {
 //  v14: extract each request's effective reasoning effort for model filtering.
 //  v15: remove Gloss app-server sources and rebuild caches to purge their
 //       previously ingested usage and telemetry.
-const STORE_VERSION: u32 = 15;
+//  v16: merge Claude's growing usage snapshots and dedup replayed transcript
+//       entries/tool calls before any accounting side effect.
+const STORE_VERSION: u32 = 16;
 // v2: quota pools are determined by the active model. Recent Codex logs report
 // Spark token_count snapshots with `limit_id: "codex"`, even though Spark and
 // the other Codex models have independent allowances.
@@ -225,7 +260,7 @@ const STORE_VERSION: u32 = 15;
 // usage. A session can switch away from Spark after its last Spark snapshot,
 // leaving its model context outside the usual 64 KiB quota-file tail.
 const PROJECT_CACHE_VERSION: u32 = 1;
-const TELEMETRY_CACHE_VERSION: u32 = 1;
+const TELEMETRY_CACHE_VERSION: u32 = 2;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -234,6 +269,47 @@ fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, data)?;
     fs::rename(&tmp, path)
+}
+
+fn merge_named_calls(
+    existing_names: &mut Vec<String>,
+    existing_ids: &mut Vec<String>,
+    incoming_names: Vec<String>,
+    incoming_ids: Vec<String>,
+) {
+    for (index, name) in incoming_names.into_iter().enumerate() {
+        let call_id = incoming_ids.get(index).cloned().unwrap_or_default();
+        if !call_id.is_empty() && existing_ids.iter().any(|id| id == &call_id) {
+            continue;
+        }
+        existing_names.push(name);
+        existing_ids.push(call_id);
+    }
+}
+
+fn merge_event(existing: &mut RawEvent, incoming: RawEvent) {
+    // Claude transcript entries expose cumulative usage snapshots for one API
+    // message. Component-wise max is monotonic and remains correct regardless
+    // of file traversal order when the same message is replayed elsewhere.
+    existing.in_tok = existing.in_tok.max(incoming.in_tok);
+    existing.cc = existing.cc.max(incoming.cc);
+    existing.cr = existing.cr.max(incoming.cr);
+    existing.out_tok = existing.out_tok.max(incoming.out_tok);
+    if existing.reasoning_effort.is_empty() && !incoming.reasoning_effort.is_empty() {
+        existing.reasoning_effort = incoming.reasoning_effort;
+    }
+    merge_named_calls(
+        &mut existing.mcp,
+        &mut existing.mcp_call_ids,
+        incoming.mcp,
+        incoming.mcp_call_ids,
+    );
+    merge_named_calls(
+        &mut existing.skills,
+        &mut existing.skill_call_ids,
+        incoming.skills,
+        incoming.skill_call_ids,
+    );
 }
 
 fn claude_dir() -> Option<PathBuf> {
@@ -656,6 +732,9 @@ impl Store {
         self.turns.retain(|turn| turn.source != key);
         self.rebuild_telemetry_index();
         self.manifest
+            .claude_entries
+            .retain(|_, source| source != key);
+        self.manifest
             .codex_token_counts
             .retain(|_, source| source != key);
         self.manifest
@@ -774,14 +853,7 @@ impl Store {
                     ev.agent = agent.to_string();
                     if !ev.id.is_empty() {
                         if let Some(&i) = self.index.get(&ev.id) {
-                            // Same message, another line: merge its tool calls
-                            // (don't re-count tokens — usage repeats per line).
-                            let prev = &mut self.events[i];
-                            if prev.reasoning_effort.is_empty() && !ev.reasoning_effort.is_empty() {
-                                prev.reasoning_effort = ev.reasoning_effort;
-                            }
-                            prev.mcp.extend(ev.mcp);
-                            prev.skills.extend(ev.skills);
+                            merge_event(&mut self.events[i], ev);
                             continue;
                         }
                         self.index.insert(ev.id.clone(), self.events.len());
@@ -1001,6 +1073,8 @@ impl Store {
                     reasoning_effort: state.reasoning_effort.clone(),
                     mcp: Vec::new(),
                     skills: Vec::new(),
+                    mcp_call_ids: Vec::new(),
+                    skill_call_ids: Vec::new(),
                     id: usage.event_id,
                     reported_cost: None,
                     source: String::new(),
@@ -1059,6 +1133,8 @@ impl Store {
                     reasoning_effort: String::new(),
                     mcp: vec![server],
                     skills: Vec::new(),
+                    mcp_call_ids: Vec::new(),
+                    skill_call_ids: Vec::new(),
                     id: String::new(),
                     reported_cost: None,
                     source: String::new(),
@@ -1297,6 +1373,16 @@ impl Store {
         if let Some(cwd) = value.get("cwd").and_then(|item| item.as_str()) {
             state.cwd = cwd.to_string();
         }
+        if !state.source.is_empty() {
+            if let Some(entry_id) = value.get("uuid").and_then(|item| item.as_str()) {
+                if self.manifest.claude_entries.contains_key(entry_id) {
+                    return None;
+                }
+                self.manifest
+                    .claude_entries
+                    .insert(entry_id.to_string(), state.source.clone());
+            }
+        }
 
         match value.get("type").and_then(|item| item.as_str()) {
             Some("user") => {
@@ -1357,23 +1443,45 @@ impl Store {
                     .get("id")
                     .and_then(|item| item.as_str())
                     .unwrap_or("");
-                if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
-                    if let Some(model) = message.get("model").and_then(|item| item.as_str()) {
-                        turn.model = model.to_string();
-                    }
-                    if !usage_id.is_empty() && !turn.usage_ids.iter().any(|id| id == usage_id) {
-                        let usage = message.get("usage").unwrap_or(&serde_json::Value::Null);
-                        let number = |key: &str| {
-                            usage
-                                .get(key)
-                                .and_then(|item| item.as_f64())
-                                .unwrap_or(0.0)
-                        };
-                        turn.input_tokens += number("input_tokens");
-                        turn.cache_creation_tokens += number("cache_creation_input_tokens");
-                        turn.cache_read_tokens += number("cache_read_input_tokens");
-                        turn.output_tokens += number("output_tokens");
-                        turn.usage_ids.push(usage_id.to_string());
+                // A few replay layouts regenerate the outer entry UUID while
+                // preserving message.id. Keep parsing the event so a greater
+                // final snapshot can merge, but suppress duplicate telemetry
+                // when another source file already owns this API response.
+                let replayed_usage = self
+                    .index
+                    .get(usage_id)
+                    .and_then(|index| self.events.get(*index))
+                    .is_some_and(|event| event.source != state.source);
+                if !replayed_usage {
+                    if let Some(turn) = self.turn_mut(state, AGENT_CLAUDE, ts_ms) {
+                        if let Some(model) = message.get("model").and_then(|item| item.as_str()) {
+                            turn.model = model.to_string();
+                        }
+                        if !usage_id.is_empty() {
+                            let usage = message.get("usage").unwrap_or(&serde_json::Value::Null);
+                            let number = |key: &str| {
+                                usage.get(key).and_then(|item| item.as_f64()).unwrap_or(0.0)
+                            };
+                            let incoming = UsageSnapshot {
+                                input_tokens: number("input_tokens"),
+                                cache_creation_tokens: number("cache_creation_input_tokens"),
+                                cache_read_tokens: number("cache_read_input_tokens"),
+                                output_tokens: number("output_tokens"),
+                            };
+                            let previous = turn
+                                .usage_snapshots
+                                .get(usage_id)
+                                .copied()
+                                .unwrap_or_default();
+                            let merged = previous.merge(incoming);
+                            turn.input_tokens += merged.input_tokens - previous.input_tokens;
+                            turn.cache_creation_tokens +=
+                                merged.cache_creation_tokens - previous.cache_creation_tokens;
+                            turn.cache_read_tokens +=
+                                merged.cache_read_tokens - previous.cache_read_tokens;
+                            turn.output_tokens += merged.output_tokens - previous.output_tokens;
+                            turn.usage_snapshots.insert(usage_id.to_string(), merged);
+                        }
                     }
                 }
             }
@@ -1458,6 +1566,8 @@ fn pi_event(
         reasoning_effort: state.reasoning_effort.clone(),
         mcp: data.mcp,
         skills: data.skills,
+        mcp_call_ids: Vec::new(),
+        skill_call_ids: Vec::new(),
         id: if entry_id.is_empty() {
             String::new()
         } else {
@@ -1750,6 +1860,8 @@ fn codex_exec_event(
         reasoning_effort: String::new(),
         mcp,
         skills,
+        mcp_call_ids: Vec::new(),
+        skill_call_ids: Vec::new(),
         id: String::new(),
         reported_cost: None,
         source: String::new(),
@@ -1823,6 +1935,8 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
         reasoning_effort: String::new(),
         mcp: Vec::new(),
         skills: vec![skill],
+        mcp_call_ids: Vec::new(),
+        skill_call_ids: vec![id.clone()],
         id,
         reported_cost: None,
         source: String::new(),
@@ -1858,14 +1972,22 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
 
     let mut mcp = Vec::new();
     let mut skills = Vec::new();
+    let mut mcp_call_ids = Vec::new();
+    let mut skill_call_ids = Vec::new();
     if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                 continue;
             }
             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            let call_id = block
+                .get("id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Some(rest) = name.strip_prefix("mcp__") {
                 mcp.push(rest.split("__").next().unwrap_or("").to_string());
+                mcp_call_ids.push(call_id);
             } else if name == "Skill" {
                 if let Some(sk) = block
                     .get("input")
@@ -1874,6 +1996,7 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
                 {
                     if !sk.is_empty() {
                         skills.push(sk.to_string());
+                        skill_call_ids.push(call_id);
                     }
                 }
             }
@@ -1895,6 +2018,8 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
             .unwrap_or_default(),
         mcp,
         skills,
+        mcp_call_ids,
+        skill_call_ids,
         id,
         reported_cost: None,
         source: String::new(),
@@ -2214,6 +2339,62 @@ mod tests {
         assert_eq!(turn.output_tokens, 100.0);
         assert_eq!(turn.reasoning_tokens, 40.0);
         assert_eq!(turn.duration_ms, 2000);
+    }
+
+    #[test]
+    fn merges_claude_streaming_snapshots_and_dedupes_replayed_side_effects() {
+        let mut store = empty_store();
+        let root = std::env::temp_dir().join(format!(
+            "tokenscope-claude-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let user = r#"{"uuid":"entry-user","timestamp":"2026-07-13T12:00:00Z","type":"user","sessionId":"session-parent","promptId":"prompt-1","message":{"content":"test"}}"#;
+        let partial = r#"{"uuid":"entry-partial","timestamp":"2026-07-13T12:00:01Z","type":"assistant","sessionId":"session-parent","message":{"id":"message-1","model":"claude-sonnet-4","content":[{"type":"tool_use","id":"tool-mcp","name":"mcp__browser__open","input":{}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":3}}}"#;
+        let final_snapshot = r#"{"uuid":"entry-final","timestamp":"2026-07-13T12:00:02Z","type":"assistant","sessionId":"session-parent","message":{"id":"message-1","model":"claude-sonnet-4","content":[{"type":"tool_use","id":"tool-skill","name":"Skill","input":{"skill":"demo"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":640}}}"#;
+        // A distinct transcript entry may repeat a previously emitted content
+        // block for the same API message. The tool_use id, not the outer entry
+        // uuid or server name, identifies the one real invocation.
+        let repeated_tool = r#"{"uuid":"entry-tool-repeat","timestamp":"2026-07-13T12:00:03Z","type":"assistant","sessionId":"session-parent","message":{"id":"message-1","model":"claude-sonnet-4","content":[{"type":"tool_use","id":"tool-mcp","name":"mcp__browser__open","input":{}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":640}}}"#;
+        let tool_error = r#"{"uuid":"entry-tool-error","timestamp":"2026-07-13T12:00:04Z","type":"user","sessionId":"session-parent","sourceToolUseID":"tool-mcp","message":{"content":[{"type":"tool_result","tool_use_id":"tool-mcp","is_error":true,"content":"failed"}]}}"#;
+        let duration = r#"{"uuid":"entry-duration","timestamp":"2026-07-13T12:00:05Z","type":"system","sessionId":"session-parent","subtype":"turn_duration","durationMs":5000}"#;
+        let parent = format!(
+            "{user}\n{partial}\n{final_snapshot}\n{repeated_tool}\n{tool_error}\n{duration}\n"
+        );
+        fs::write(root.join("a-parent.jsonl"), &parent).unwrap();
+
+        // Claude forks/resumes by copying stable transcript entry and tool ids
+        // into another session file. No usage, telemetry, or tool side effect
+        // from that copied history may be counted again.
+        let replay = parent.replace("session-parent", "session-child");
+        fs::write(root.join("b-child.jsonl"), replay).unwrap();
+
+        assert!(store.ingest_root(AGENT_CLAUDE, &root));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(store.events.len(), 1);
+        let event = &store.events[0];
+        assert_eq!(event.in_tok, 10.0);
+        assert_eq!(event.cc, 20.0);
+        assert_eq!(event.cr, 30.0);
+        assert_eq!(event.out_tok, 640.0);
+        assert_eq!(event.mcp, vec!["browser"]);
+        assert_eq!(event.skills, vec!["demo"]);
+
+        assert_eq!(store.turns.len(), 1);
+        let turn = &store.turns[0];
+        assert_eq!(turn.input_tokens, 10.0);
+        assert_eq!(turn.cache_creation_tokens, 20.0);
+        assert_eq!(turn.cache_read_tokens, 30.0);
+        assert_eq!(turn.output_tokens, 640.0);
+        assert_eq!(turn.tool_errors, 1);
+        assert_eq!(turn.outcome, "completed");
+        assert_eq!(turn.duration_ms, 5000);
     }
 
     #[test]
