@@ -7,7 +7,7 @@ mod quota_api;
 mod store;
 
 use model::{Dashboard, RangeDashboard};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -482,11 +482,26 @@ fn provider_rows(
 /// the tradeoff between freshness and rate limits.
 const QUOTA_REFRESH_SECS: u64 = 60;
 
-/// Cooldown for manual force-refreshes (the tray "Refresh" item). Price tables
-/// change at most a few times a day, so back-to-back clicks inside this window
-/// coalesce into one fetch.
+/// Cooldown for network-backed work triggered by the tray "Refresh" item.
+/// Pricing and quota use independent clocks because they are separate data
+/// sources, while back-to-back clicks for either source coalesce into one fetch.
 const FORCE_COOLDOWN_MS: i64 = 30_000;
-static LAST_FORCE_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_PRICING_FORCE_MS: AtomicI64 = AtomicI64::new(0);
+static LAST_QUOTA_FORCE_MS: AtomicI64 = AtomicI64::new(0);
+static QUOTA_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn claim_force_refresh(last_force_ms: &AtomicI64, now: i64) -> bool {
+    loop {
+        let previous = last_force_ms.load(Ordering::Relaxed);
+        if now >= previous && now - previous < FORCE_COOLDOWN_MS {
+            return false;
+        }
+        match last_force_ms.compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(_) => continue,
+        }
+    }
+}
 
 /// Off-thread, silent price-table refresh (models.dev + LiteLLM) bypassing the
 /// 24h cache, folded into the tray's "Refresh" item. Returns immediately; once
@@ -496,21 +511,35 @@ static LAST_FORCE_MS: AtomicI64 = AtomicI64::new(0);
 /// compare_exchange (fixed window, not sliding) so rapid clicks can't spawn
 /// concurrent fetches racing on the cache.
 fn refresh_pricing_bg(app: &tauri::AppHandle) {
-    let now = now_ms();
-    loop {
-        let prev = LAST_FORCE_MS.load(Ordering::Relaxed);
-        if now - prev < FORCE_COOLDOWN_MS {
-            return;
-        }
-        match LAST_FORCE_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(_) => continue,
-        }
+    if !claim_force_refresh(&LAST_PRICING_FORCE_MS, now_ms()) {
+        return;
     }
     let handle = app.clone();
     std::thread::spawn(move || {
         pricing::Pricing::reload_shared(true);
         refresh(&handle);
+    });
+}
+
+/// Reload provider quota without blocking the tray menu. Manual refreshes have
+/// their own cooldown, while the in-flight guard is shared with the automatic
+/// 60-second poll so two `hu` processes cannot race and overwrite the snapshot.
+fn refresh_quota_bg(app: &tauri::AppHandle, forced: bool) {
+    if forced && !claim_force_refresh(&LAST_QUOTA_FORCE_MS, now_ms()) {
+        return;
+    }
+    if QUOTA_REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        if quota_api::reload() {
+            refresh(&handle);
+        }
+        QUOTA_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
     });
 }
 
@@ -1606,6 +1635,7 @@ pub fn run() {
                     "refresh" => {
                         refresh(app);
                         refresh_pricing_bg(app);
+                        refresh_quota_bg(app, true);
                     }
                     "check-updates" => {
                         show_popover(app);
@@ -1723,9 +1753,7 @@ pub fn run() {
             // itself lags, so 30s buys little extra accuracy.
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
-                if quota_api::reload() {
-                    refresh(&handle);
-                }
+                refresh_quota_bg(&handle, false);
                 std::thread::sleep(Duration::from_secs(QUOTA_REFRESH_SECS));
             });
 
@@ -1790,6 +1818,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_refresh_cooldown_uses_a_fixed_window() {
+        let last_force_ms = AtomicI64::new(0);
+
+        assert!(claim_force_refresh(&last_force_ms, 100_000));
+        assert!(!claim_force_refresh(&last_force_ms, 129_999));
+        assert!(claim_force_refresh(&last_force_ms, 130_000));
+        // A wall-clock correction must not suppress refreshes indefinitely.
+        assert!(claim_force_refresh(&last_force_ms, 90_000));
+    }
 
     #[test]
     fn provider_summaries_use_left_percentages() {
