@@ -22,6 +22,8 @@ refresh thread (every 60 s)
             ├─ claude ProviderLimit
             └─ codex ProviderLimit
        └─ failed fetch ⇒ that provider is None (unavailable)
+tray Refresh (manual, 30 s cooldown)
+  └─ the same quota reload path, off the UI thread
 parser::build_dashboard()
   └─ quota_api::shared() → provider_limits (dashboard + tray)
        └─ trend: live points only, carried across refreshes in memory
