@@ -26,6 +26,14 @@ brew install --cask sunchj/tokenscope/tokenscope
 
 DMG downloads and update details: see [Releases](https://github.com/SunChJ/tokenscope-remix/releases).
 
+For daily use, launch the installed `/Applications/Tokenscope.app`, not the copy
+inside `src-tauri/target`. Login startup uses macOS LaunchServices (`open -g`)
+and migrates older direct-binary registrations on the next app launch; the new
+registration takes effect at the next login. This does not confer Developer ID
+trust or bypass system security policy. Debug builds and bundles outside
+`/Applications` or `~/Applications` leave login settings untouched and disable
+the **Launch at Login** menu item.
+
 ## Quick start
 
 1. Launch — an icon with today's token count appears in the menu bar / tray

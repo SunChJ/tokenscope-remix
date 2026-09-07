@@ -1,5 +1,7 @@
 mod codex_adapter;
 mod config;
+#[cfg(target_os = "macos")]
+mod login_startup;
 mod model;
 mod parser;
 mod pricing;
@@ -18,6 +20,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
+#[cfg(not(target_os = "macos"))]
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 // Positioner is only used for the non-macOS fallback; macOS positions the
@@ -609,26 +612,68 @@ fn save_tray_preferences(preferences: &TrayPreferences) {
     }
 }
 
-/// Bring the OS launch-at-login registration in line with the saved preference,
-/// returning the effective preference (used to seed the menu checkbox). First
-/// run (no saved pref) defaults to on and records it; thereafter we honor the
-/// user's choice and only touch the registration when it actually differs.
-fn reconcile_autostart(app: &tauri::AppHandle) -> bool {
-    let pref = match load_autostart_pref() {
-        Some(p) => p,
-        None => {
-            save_autostart_pref(true);
-            true
-        }
-    };
-    let mgr = app.autolaunch();
-    let cur = mgr.is_enabled().unwrap_or(false);
-    if pref && !cur {
-        let _ = mgr.enable();
-    } else if !pref && cur {
-        let _ = mgr.disable();
+fn autostart_available(_app: &tauri::AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        login_startup::available()
     }
-    pref
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+fn autostart_enabled(_app: &tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        login_startup::is_enabled().map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        _app.autolaunch()
+            .is_enabled()
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn set_autostart(_app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        login_startup::set_enabled(enabled).map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let manager = _app.autolaunch();
+        if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        }
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Repair legacy registrations without changing a saved opt-out. Uninstalled
+/// and debug builds must not touch the production preference or login entry.
+fn reconcile_autostart(app: &tauri::AppHandle) -> bool {
+    if !autostart_available(app) {
+        return false;
+    }
+    let pref = load_autostart_pref().unwrap_or(true);
+    if let Err(error) = set_autostart(app, pref) {
+        eprintln!("Failed to reconcile Launch at Login: {error}");
+        return false;
+    }
+    match autostart_enabled(app) {
+        Ok(enabled) if enabled == pref => {
+            save_autostart_pref(pref);
+            enabled
+        }
+        result => {
+            eprintln!("Failed to verify Launch at Login: {result:?}");
+            false
+        }
+    }
 }
 
 /// Last tray-icon rectangle (physical px: x, y, width, height), captured on tray
@@ -1244,15 +1289,18 @@ pub fn run() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
         // In-app updates: checks the GitHub release feed (latest.json) and
         // installs signed update packages; process plugin provides the
         // relaunch after install. Both driven from the frontend UpdateBanner.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init());
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ));
+    }
     // Registers the WebviewPanelManager state used by `to_panel`/`get_webview_panel`.
     #[cfg(target_os = "macos")]
     {
@@ -1506,7 +1554,7 @@ pub fn run() {
                 app,
                 "autostart",
                 copy.autostart,
-                true,
+                autostart_available(app.handle()),
                 autostart_on,
                 None::<&str>,
             )?;
@@ -1708,14 +1756,22 @@ pub fn run() {
                         let _ = app.emit("configure-dashboard-shortcut", shortcut);
                     }
                     "autostart" => {
-                        // Flip the OS registration, re-read the real state, mirror
-                        // it into the checkbox, and persist the user's choice.
-                        let mgr = app.autolaunch();
-                        let enabled = mgr.is_enabled().unwrap_or(false);
-                        let _ = if enabled { mgr.disable() } else { mgr.enable() };
-                        let now_on = mgr.is_enabled().unwrap_or(!enabled);
-                        let _ = autostart_i.set_checked(now_on);
-                        save_autostart_pref(now_on);
+                        let result = (|| -> Result<bool, String> {
+                            let desired = !autostart_enabled(app)?;
+                            set_autostart(app, desired)?;
+                            let actual = autostart_enabled(app)?;
+                            if actual != desired {
+                                return Err("Login registration did not match the requested state".into());
+                            }
+                            Ok(actual)
+                        })();
+                        match result {
+                            Ok(enabled) => {
+                                let _ = autostart_i.set_checked(enabled);
+                                save_autostart_pref(enabled);
+                            }
+                            Err(error) => eprintln!("Failed to change Launch at Login: {error}"),
+                        }
                     }
                     "language-en" | "language-zh" => {
                         let language = if event.id.as_ref() == "language-zh" {

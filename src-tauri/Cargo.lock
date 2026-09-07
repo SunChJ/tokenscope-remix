@@ -4267,12 +4267,13 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenscope"
-version = "1.6.7"
+version = "1.6.8"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
  "notify",
+ "plist",
  "serde",
  "serde_json",
  "tauri",
@@ -4284,6 +4285,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tempfile",
  "ureq",
  "walkdir",
 ]
