@@ -56,3 +56,9 @@ malformed entries, write failures, idempotence, and development isolation. Run
 Rust tests and frontend build, check version consistency, then verify CI assets,
 the Homebrew cask, installed version, and a LaunchAgent bootstrap. A bootstrap is
 not a full logout/login test and does not establish Gatekeeper trust.
+
+## Amendments
+
+- Updated 2026-09-07: CI must prepare the bundled helper before running Rust
+  tests; recovery builds use the existing version tag. See
+  [002-release-verification.md](002-release-verification.md).
