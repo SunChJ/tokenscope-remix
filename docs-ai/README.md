@@ -5,4 +5,4 @@ in `docs/`; machine-specific diagnostics do not belong here.
 
 | ID | Topic | Anchor date | Summary |
 | --- | --- | --- | --- |
-| 001 | [LaunchServices login startup](001-login-launch-services/000-plan.md) | 2026-09-07 | Use the installed app bundle rather than direct binary execution for macOS login startup. |
+| 001 | [LaunchServices login startup](001-login-launch-services/000-plan.md) | 2026-09-07 | Released in 1.6.8; installed-app migration and LaunchServices bootstrap verified on macOS 26.6. |

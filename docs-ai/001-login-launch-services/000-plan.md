@@ -1,8 +1,9 @@
 # 001 — LaunchServices Login Startup: Plan
 
-- Status: Implemented (release verification pending)
+- Status: Implemented
 - Anchor date: 2026-09-07
 - Release: 1.6.8
+- Primary refs: #38, #39; release validation in [002-release-verification.md](002-release-verification.md)
 
 ## Background
 

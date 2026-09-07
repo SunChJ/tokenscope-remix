@@ -5,7 +5,9 @@
 | Date | Change | Ref |
 | --- | --- | --- |
 | 2026-09-07 | Confirmed direct LaunchAgent failure and successful LaunchServices bootstrap on macOS 26.6. | Local diagnostics, not committed |
-| 2026-09-07 | Added macOS registration management, regression tests, and version 1.6.8. | Release PR pending |
+| 2026-09-07 | Added macOS registration management, regression tests, and version 1.6.8. | #38 |
+| 2026-09-07 | Fixed clean-runner resource preparation and published the existing version tag. | #39 |
+| 2026-09-07 | Upgraded through Homebrew; verified installed-app migration and LaunchAgent startup. | [Release verification](002-release-verification.md) |
 
 ## Implemented behavior
 
@@ -30,8 +32,9 @@
 - `node scripts/version.mjs`: all four version sources agree on 1.6.8.
 - `git diff --check`: passed.
 - The locally modified 1.6.7 LaunchAgent bootstrapped through `/usr/bin/open`,
-  returned zero, and launched the installed app. Published 1.6.8 validation is
-  pending release CI and Homebrew upgrade.
+  returned zero, and launched the installed app. The published 1.6.8 app later
+  repaired a deliberately stale registration and passed the same bootstrap check;
+  see [release verification](002-release-verification.md).
 
 ## Boundaries and deviations
 
@@ -40,7 +43,10 @@ the plan. No global security policy was modified. No full logout/login or
 non-macOS runtime test was performed. Existing `block` dependency emits a Rust
 future-incompatibility warning. Quota-helper signing is not addressed here.
 
-## Remaining release verification
+## Release state
 
-Confirm both architecture packages, updater metadata/signatures, Homebrew cask,
-and an installed 1.6.8 launch through the migrated LaunchAgent.
+Version 1.6.8 is public, both platform jobs and the cask update succeeded, and the
+Homebrew-installed Apple Silicon app passed migration and startup checks.
+Updater metadata was checked against both signature assets; this was not an
+independent cryptographic verification. Full logout/login and Intel runtime
+validation remain unperformed.
