@@ -26,6 +26,12 @@ brew install --cask sunchj/tokenscope/tokenscope
 
 DMG 直接下载与更新方式见 [Releases](https://github.com/SunChJ/tokenscope-remix/releases)。
 
+日常使用请启动已安装的 `/Applications/Tokenscope.app`，不要直接使用
+`src-tauri/target` 内的构建副本。登录启动通过系统应用启动服务（`open -g`）
+打开应用；新版启动时会迁移旧的直接执行启动项，下次登录时生效。这不会让应用
+获得开发者签名信任，也不会绕过系统安全策略。调试版，以及位于 `/Applications`
+或 `~/Applications` 之外的应用副本，不修改登录设置，并禁用「登录时启动」菜单项。
+
 ## 快速上手
 
 1. 启动后，菜单栏 / 托盘出现图标和当日 Token 数

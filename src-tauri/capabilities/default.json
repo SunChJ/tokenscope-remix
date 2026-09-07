@@ -13,9 +13,6 @@
     "core:tray:default",
     "core:window:allow-set-position",
     "positioner:default",
-    "autostart:allow-enable",
-    "autostart:allow-disable",
-    "autostart:allow-is-enabled",
     "updater:default",
     "process:allow-restart"
   ]

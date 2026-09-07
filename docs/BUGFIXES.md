@@ -178,6 +178,28 @@ fix. Newest first. Useful as a reference for similar issues.
 
 ## App behavior & packaging
 
+### Login startup rejected an ad-hoc-signed app (1.6.8)
+
+- **Symptom**: On macOS 26.6, a Homebrew-installed 1.6.7 app failed with
+  `CODESIGNING / Launch Constraint Violation` when started by its LaunchAgent,
+  while opening the app bundle through LaunchServices succeeded.
+- **Cause**: The plugin registered the inner executable directly and considered
+  any existing plist enabled, including stale paths. Development builds shared
+  the production login registration and preference.
+- **Fix**: macOS now writes the existing `Tokenscope` LaunchAgent atomically with
+  `/usr/bin/open -g <installed bundle>`. Startup repairs stale/legacy entries and
+  honors saved opt-out. Debug or uninstalled builds do not alter login settings.
+  Registration errors are logged rather than persisted as successful toggles.
+  Other platforms keep the existing backend; unused webview autostart permissions
+  were removed so the native tray remains the only setting interface.
+- **Boundary**: Changes apply at the next login; the app does not unload a legacy
+  job that might own its running process. No signature, notarization, or global
+  security policy is changed. Quota-helper signing is outside this fix.
+- **Verification**: Regression tests cover path eligibility, argument escaping,
+  migration, opt-out, idempotence, and filesystem failures. The LaunchServices
+  agent was bootstrapped successfully on macOS 26.6; a full logout/login was not
+  performed.
+
 ### 10. Two menu-bar icons after reinstall
 
 - **Symptom**: Reinstalling/relaunching left two Tokenscope icons in the menu
